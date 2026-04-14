@@ -3,15 +3,20 @@ Auth repository — IMPROVED VERSION using ORM models instead of raw SQL
 This replaces the old repository.py that used text() queries everywhere
 """
 
-import uuid
+import base64
+import binascii
 import logging
+import re
+import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from pathlib import Path
+from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text, or_
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile, Request
 
 from .models import IdentityUser, UserRole
+from app.people.models import People
 from .security import (
     verify_password, generate_sha256_hash_with_salt,
     _get_password_cipher, _aspnet_hash_password, _decrypt_client_password,
@@ -22,11 +27,145 @@ from .schemas import RegisterUserRequest
 logger = logging.getLogger(__name__)
 
 PEOPLE_SEQ = 'twam."People_PersonalId_seq"'
+# Resolve uploads dir relative to this file so it works regardless of cwd
+_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent  # project root
+PROFILE_IMAGE_DIR = _REPO_ROOT / "uploads" / "profile-images"
+PROFILE_IMAGE_PREFIX = "/uploads/profile-images/"
+MAX_PROFILE_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_PROFILE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+PROFILE_IMAGE_MIME_TO_EXTENSION = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+PROFILE_IMAGE_DATA_URL_PATTERN = re.compile(
+    r"^data:(?P<mime>image/[a-zA-Z0-9.+-]+);base64,(?P<data>[A-Za-z0-9+/=\s]+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+PROFILE_IMAGE_FILE_FIELDS = (
+    "profileImage",
+    "profile_image",
+    "image",
+    "file",
+    "avatar",
+)
+EMAIL_FIELDS = ("emailId", "EmailId")
+FIRST_NAME_FIELDS = ("firstName", "FirstName")
+MIDDLE_NAME_FIELDS = ("middleName", "MiddleName")
+LAST_NAME_FIELDS = ("lastName", "LastName")
+PHONE_FIELDS = ("phoneNumber", "PhoneNumber")
+PROFILE_IMAGE_DATA_FIELDS = (
+    "profileImageUrl",
+    "ProfileImageUrl",
+    "profileImageData",
+    "croppedImage",
+    "editedImage",
+    "imageData",
+    "avatarData",
+)
+REMOVE_PROFILE_IMAGE_FIELDS = (
+    "removeProfileImage",
+    "RemoveProfileImage",
+    "deleteProfileImage",
+    "clearProfileImage",
+)
 
 
 # ============================================================================
 # HELPER FUNCTIONS - Now using ORM instead of raw SQL
 # ============================================================================
+
+def _first_present(container: Any, keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in container:
+            value = container.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_profile_image_file(form: Any) -> Optional[UploadFile]:
+    for key in PROFILE_IMAGE_FILE_FIELDS:
+        file_obj = form.get(key)
+        if getattr(file_obj, "filename", ""):
+            return file_obj
+    return None
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    return None
+
+
+def _normalize_profile_update_payload_dict(raw: dict) -> dict:
+    normalized = dict(raw)
+
+    if "profileImageUrl" not in normalized:
+        fallback_image_data = _first_present(normalized, PROFILE_IMAGE_DATA_FIELDS[1:])
+        if fallback_image_data is not None:
+            normalized["profileImageUrl"] = fallback_image_data
+
+    if "removeProfileImage" not in normalized:
+        remove_flag = _first_present(normalized, REMOVE_PROFILE_IMAGE_FIELDS[1:])
+        coerced_remove_flag = _coerce_optional_bool(remove_flag)
+        if coerced_remove_flag is not None:
+            normalized["removeProfileImage"] = coerced_remove_flag
+
+    return normalized
+
+
+async def parse_profile_update_payload(
+    request: Request,
+) -> tuple[RegisterUserRequest, Optional[UploadFile]]:
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    def _from_form(form: Any) -> tuple[RegisterUserRequest, Optional[UploadFile]]:
+        profile_image_url = _first_present(form, PROFILE_IMAGE_DATA_FIELDS)
+        remove_profile_image = _coerce_optional_bool(_first_present(form, REMOVE_PROFILE_IMAGE_FIELDS))
+        payload = RegisterUserRequest.model_validate(
+            {
+                "emailId": _first_present(form, EMAIL_FIELDS),
+                "firstName": _first_present(form, FIRST_NAME_FIELDS),
+                "middleName": _first_present(form, MIDDLE_NAME_FIELDS),
+                "lastName": _first_present(form, LAST_NAME_FIELDS),
+                "phoneNumber": _first_present(form, PHONE_FIELDS),
+                "profileImageUrl": profile_image_url,
+                "removeProfileImage": remove_profile_image,
+            }
+        )
+        profile_image = _extract_profile_image_file(form)
+        return payload, profile_image
+
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        return _from_form(form)
+
+    try:
+        body = await request.json()
+    except Exception:
+        # Fallback for clients that send FormData but accidentally keep
+        # Content-Type as application/json.
+        try:
+            form = await request.form()
+            if form and len(form.keys()) > 0:
+                return _from_form(form)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Invalid profile update payload.")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid profile update payload.")
+
+    return RegisterUserRequest.model_validate(_normalize_profile_update_payload_dict(body)), None
 
 def _get_identity_user_by_username(db: Session, username: str) -> Optional[IdentityUser]:
     """
@@ -143,6 +282,7 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
         "FirstName": user.FirstName or "",
         "MiddleName": user.MiddleName or "",
         "LastName": user.LastName or "",
+        "ProfileImageUrl": _normalize_profile_image_url(user.ProfileImageUrl) or "",
         "RoleId": str(user.UserRoleId or 2),
         "RoleName": role_name,
         "role": role_name,
@@ -164,6 +304,376 @@ def _next_people_id(db: Session) -> Optional[int]:
     except Exception as e:
         logger.error(f"Sequence error: {e}", exc_info=True)
         return None
+
+
+def _normalize_profile_image_url(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+
+    normalized = str(path).strip().replace("\\", "/")
+    if not normalized:
+        return None
+
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+
+    return normalized
+
+
+def _delete_profile_image_file(path: Optional[str]) -> None:
+    """
+    Hard-delete the profile image file from disk.
+    Uses absolute path so it works regardless of cwd.
+    DB is cleared by the caller before this is called.
+    """
+    normalized = _normalize_profile_image_url(path)
+    if not normalized or not normalized.startswith(PROFILE_IMAGE_PREFIX):
+        return
+
+    # Extract just the filename and build absolute path from PROFILE_IMAGE_DIR
+    filename     = normalized.replace(PROFILE_IMAGE_PREFIX, "", 1)
+    absolute_path = PROFILE_IMAGE_DIR / filename
+
+    try:
+        if absolute_path.exists() and absolute_path.is_file():
+            absolute_path.unlink()
+            print(f"[ProfileImage] Deleted file: {absolute_path}")
+        else:
+            print(f"[ProfileImage] File not found on disk (already gone?): {absolute_path}")
+    except OSError as e:
+        logger.warning("Could not delete profile image file %s: %s", absolute_path, e, exc_info=True)
+
+
+def _profile_image_paths_for_extension(user_id: str, extension: str) -> tuple[Path, str]:
+    safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"})
+    if not safe_user_id:
+        safe_user_id = uuid.uuid4().hex
+
+    file_name = f"{safe_user_id}-{uuid.uuid4().hex}{extension}"
+    absolute_path = PROFILE_IMAGE_DIR / file_name
+    relative_path = f"{PROFILE_IMAGE_PREFIX}{file_name}"
+    return absolute_path, relative_path
+
+
+def _detect_profile_image_extension(image_bytes: bytes) -> Optional[str]:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _is_likely_base64_profile_image_payload(raw_payload: str) -> bool:
+    payload = (raw_payload or "").strip()
+    if not payload:
+        return False
+
+    if PROFILE_IMAGE_DATA_URL_PATTERN.match(payload):
+        return True
+
+    if payload.startswith("http://") or payload.startswith("https://") or payload.startswith("/"):
+        return False
+
+    compact_payload = payload.replace("\n", "").replace("\r", "").strip()
+    if len(compact_payload) < 128:
+        return False
+
+    return bool(re.fullmatch(r"[A-Za-z0-9+/=]+", compact_payload))
+
+
+def _decode_base64_profile_image_payload(image_payload: str) -> tuple[bytes, str]:
+    raw_payload = (image_payload or "").strip()
+    if not raw_payload:
+        raise HTTPException(status_code=400, detail="Profile image data is empty.")
+
+    mime_extension: Optional[str] = None
+    base64_data = raw_payload
+
+    data_url_match = PROFILE_IMAGE_DATA_URL_PATTERN.match(raw_payload)
+    if data_url_match:
+        mime_type = data_url_match.group("mime").lower()
+        mime_extension = PROFILE_IMAGE_MIME_TO_EXTENSION.get(mime_type)
+        base64_data = data_url_match.group("data")
+
+    try:
+        image_bytes = base64.b64decode(base64_data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 image payload.") from exc
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Profile image data is empty.")
+
+    if len(image_bytes) > MAX_PROFILE_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Profile image must be 5MB or smaller.")
+
+    detected_extension = _detect_profile_image_extension(image_bytes)
+    extension = detected_extension or mime_extension
+
+    if not extension or extension not in ALLOWED_PROFILE_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Profile image must be JPG, JPEG, PNG, or WEBP.",
+        )
+
+    return image_bytes, extension
+
+
+def _save_profile_image_file(upload: UploadFile, user_id: str) -> str:
+    original_name = (upload.filename or "").strip()
+    extension = Path(original_name).suffix.lower()
+    if extension not in ALLOWED_PROFILE_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Profile image must be JPG, JPEG, PNG, or WEBP.",
+        )
+
+    content_type = (upload.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid profile image file type.")
+
+    PROFILE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    absolute_path, relative_path = _profile_image_paths_for_extension(user_id, extension)
+
+    total_size = 0
+    try:
+        with absolute_path.open("wb") as output_file:
+            while True:
+                chunk = upload.file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+                if total_size > MAX_PROFILE_IMAGE_BYTES:
+                    raise HTTPException(status_code=400, detail="Profile image must be 5MB or smaller.")
+
+                output_file.write(chunk)
+    except HTTPException:
+        if absolute_path.exists():
+            absolute_path.unlink()
+        raise
+    except Exception as exc:
+        if absolute_path.exists():
+            absolute_path.unlink()
+        raise HTTPException(status_code=500, detail="Failed to save profile image.") from exc
+    finally:
+        try:
+            upload.file.close()
+        except Exception:
+            pass
+
+    return relative_path
+
+
+def _save_profile_image_data(image_payload: str, user_id: str) -> str:
+    PROFILE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    image_bytes, extension = _decode_base64_profile_image_payload(image_payload)
+    absolute_path, relative_path = _profile_image_paths_for_extension(user_id, extension)
+
+    try:
+        absolute_path.write_bytes(image_bytes)
+    except Exception as exc:
+        if absolute_path.exists():
+            absolute_path.unlink()
+        raise HTTPException(status_code=500, detail="Failed to save profile image.") from exc
+
+    return relative_path
+
+
+def update_identity_user_profile(
+    db: Session,
+    user_id: str,
+    request: RegisterUserRequest,
+    profile_image: Optional[UploadFile] = None,
+) -> dict:
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    user = get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    next_email = (request.EmailId or user.Email or "").strip().lower()
+    next_first_name = (request.FirstName or "").strip()
+    next_middle_name = (request.MiddleName or "").strip()
+    next_last_name = (request.LastName or "").strip()
+    next_phone = (request.PhoneNumber or "").strip()
+
+    if not next_email:
+        raise HTTPException(status_code=400, detail="EmailId is required.")
+
+    if next_email.upper() != (user.NormalizedEmail or ""):
+        existing_email_user = db.query(IdentityUser).filter(
+            IdentityUser.NormalizedEmail == next_email.upper(),
+            IdentityUser.Id != user.Id,
+        ).first()
+        if existing_email_user:
+            raise HTTPException(status_code=400, detail="Email is already taken.")
+
+    if next_phone and next_phone != (user.PhoneNumber or ""):
+        existing_phone_user = db.query(IdentityUser).filter(
+            IdentityUser.PhoneNumber == next_phone,
+            IdentityUser.Id != user.Id,
+        ).first()
+        if existing_phone_user:
+            raise HTTPException(status_code=400, detail="Phone number is already taken.")
+
+    existing_image = _normalize_profile_image_url(user.ProfileImageUrl)
+    incoming_profile_image_value = request.ProfileImageUrl
+    has_profile_image_value = incoming_profile_image_value is not None
+    incoming_profile_image_value = (
+        str(incoming_profile_image_value).strip() if incoming_profile_image_value is not None else None
+    )
+    remove_profile_image = bool(request.RemoveProfileImage)
+    incoming_profile_image_is_edited_payload = bool(
+        incoming_profile_image_value and _is_likely_base64_profile_image_payload(incoming_profile_image_value)
+    )
+
+    has_new_image = bool(profile_image and getattr(profile_image, "filename", ""))
+    if has_new_image and remove_profile_image:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot upload a profile image and remove it in the same request.",
+        )
+
+    image_will_change = has_new_image or remove_profile_image
+    if has_profile_image_value:
+        if not incoming_profile_image_value:
+            image_will_change = True
+        elif incoming_profile_image_is_edited_payload:
+            image_will_change = True
+        else:
+            requested_profile_image = _normalize_profile_image_url(incoming_profile_image_value)
+            image_will_change = image_will_change or requested_profile_image != existing_image
+
+    no_change = (
+        next_email.upper() == (user.NormalizedEmail or "") and
+        next_first_name == (user.FirstName or "") and
+        next_middle_name == (user.MiddleName or "") and
+        next_last_name == (user.LastName or "") and
+        next_phone == (user.PhoneNumber or "") and
+        not image_will_change
+    )
+    if no_change:
+        raise HTTPException(status_code=400, detail="No changes detected. Profile is already up to date.")
+
+    saved_image_path: Optional[str] = None
+    saved_original_image_path: Optional[str] = None
+    original_profile_image_path: Optional[str] = None
+    next_profile_image = existing_image
+    preserve_existing_image = False
+
+    try:
+        if has_new_image and profile_image is not None:
+            # Keep the original uploaded image.
+            saved_original_image_path = _save_profile_image_file(profile_image, user.Id)
+            original_profile_image_path = saved_original_image_path
+
+            # If client also sends cropped/edited output, use it as display image.
+            if incoming_profile_image_is_edited_payload and incoming_profile_image_value:
+                saved_image_path = _save_profile_image_data(incoming_profile_image_value, user.Id)
+                next_profile_image = saved_image_path
+            else:
+                next_profile_image = saved_original_image_path
+        elif remove_profile_image:
+            next_profile_image = None
+        elif has_profile_image_value:
+            if not incoming_profile_image_value:
+                next_profile_image = None
+            elif incoming_profile_image_is_edited_payload:
+                saved_image_path = _save_profile_image_data(incoming_profile_image_value, user.Id)
+                next_profile_image = saved_image_path
+                original_profile_image_path = existing_image
+                preserve_existing_image = bool(existing_image)
+            else:
+                next_profile_image = _normalize_profile_image_url(incoming_profile_image_value)
+
+        user.UserName = next_email
+        user.NormalizedUserName = next_email.upper()
+        user.Email = next_email
+        user.NormalizedEmail = next_email.upper()
+        user.FirstName = next_first_name
+        user.MiddleName = next_middle_name
+        user.LastName = next_last_name
+        user.PhoneNumber = next_phone
+        user.ProfileImageUrl = next_profile_image
+        user.ModifiedDate = datetime.now(timezone.utc)
+        user.ModifiedBy = user_id
+
+        db.flush()
+
+        people_profile = db.query(People).filter(People.userProfileId == user.Id).first()
+        if people_profile is None:
+            people_profile = People(
+                personalId=_next_people_id(db),
+                firstName=next_first_name,
+                middleName=next_middle_name,
+                lastName=next_last_name,
+                emailId=next_email,
+                phoneNumber=next_phone,
+                profileImageUrl=next_profile_image,
+                userProfileId=user.Id,
+                isActive=user.IsActive,
+                roleId=user.UserRoleId,
+                createdDate=datetime.now(timezone.utc),
+                modifiedDate=datetime.now(timezone.utc),
+                deletedInd=False,
+                createdBy=user.Email,
+                modifiedBy=user_id,
+                organizationId=user.OrganizationId,
+            )
+            db.add(people_profile)
+        else:
+            people_profile.firstName = next_first_name
+            people_profile.middleName = next_middle_name
+            people_profile.lastName = next_last_name
+            people_profile.emailId = next_email
+            people_profile.phoneNumber = next_phone
+            people_profile.profileImageUrl = next_profile_image
+            people_profile.isActive = user.IsActive
+            people_profile.roleId = user.UserRoleId
+            people_profile.modifiedDate = datetime.now(timezone.utc)
+            people_profile.modifiedBy = user_id
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        if saved_image_path:
+            _delete_profile_image_file(saved_image_path)
+        if saved_original_image_path and saved_original_image_path != saved_image_path:
+            _delete_profile_image_file(saved_original_image_path)
+        raise
+    except Exception as exc:
+        db.rollback()
+        if saved_image_path:
+            _delete_profile_image_file(saved_image_path)
+        if saved_original_image_path and saved_original_image_path != saved_image_path:
+            _delete_profile_image_file(saved_original_image_path)
+        logger.error("Failed to update user profile: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update profile.") from exc
+
+    if existing_image and existing_image != next_profile_image and not preserve_existing_image:
+        _delete_profile_image_file(existing_image)
+
+    response = {
+        "message": "User updated successfully.",
+        "userId": user.Id,
+        "emailId": next_email,
+        "firstName": next_first_name,
+        "middleName": next_middle_name,
+        "lastName": next_last_name,
+        "phoneNumber": next_phone,
+        "profileImageUrl": next_profile_image,
+    }
+    if original_profile_image_path:
+        response["profileImageOriginalUrl"] = original_profile_image_path
+
+    return response
 
 
 def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
@@ -227,6 +737,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             FirstName=request.FirstName or "",
             MiddleName=request.MiddleName or "",
             LastName=request.LastName or "",
+            ProfileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
             IsActive=True,
             UserRoleId=request.RoleId if request.RoleId else 2,
             CreatedDate=datetime.now(timezone.utc),
@@ -240,34 +751,38 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
         db.add(new_user)
         db.flush()  # Get the ID without committing
         
-        # Insert into twam.People (still using raw SQL since People model may not exist)
+        # Insert into twam.People
         people_id = _next_people_id(db)
         if people_id:
-            db.execute(
-                text("""
-                    INSERT INTO twam."People"
-                    ("PersonalId", "FirstName", "MiddleName", "LastName", "UserProfileId",
-                     "RoleId", "EmailId", "PhoneNumber",
-                     "IsActive", "CreatedDate", "DeletedInd")
-                    VALUES
-                    (:pid, :first, :middle, :last, :uid,
-                     :role, :email, :phone,
-                     true, :now, false)
-                """),
-                {
-                    "pid": people_id,
-                    "first": request.FirstName or "",
-                    "middle": request.MiddleName or "",
-                    "last": request.LastName or "",
-                    "uid": new_user.Id,
-                    "role": new_user.UserRoleId,
-                    "email": request.EmailId or "",
-                    "phone": request.PhoneNumber or "",
-                    "now": datetime.now(timezone.utc),
-                },
+            db.add(
+                People(
+                    personalId=people_id,
+                    firstName=request.FirstName or "",
+                    middleName=request.MiddleName or "",
+                    lastName=request.LastName or "",
+                    emailId=request.EmailId or "",
+                    phoneNumber=request.PhoneNumber or "",
+                    profileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
+                    userProfileId=new_user.Id,
+                    isActive=True,
+                    roleId=new_user.UserRoleId,
+                    createdDate=datetime.now(timezone.utc),
+                    deletedInd=False,
+                    createdBy=request.EmailId,
+                    organizationId=1,
+                )
             )
-        
+
         db.commit()
+
+        # ── Welcome notifications (fire-and-forget, never block registration) ──
+        _send_welcome_notifications(
+            db          = db,
+            email       = request.EmailId,
+            phone       = request.PhoneNumber,
+            first_name  = request.FirstName or "",
+        )
+
         return {
             "succeeded": True,
             "errors": [],
@@ -281,6 +796,88 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             status_code=500,
             detail=f"Failed to create user: {str(e)}"
         )
+
+
+def _send_welcome_notifications(
+    db:         "Session",
+    email:      Optional[str],
+    phone:      Optional[str],
+    first_name: str = "",
+) -> None:
+    """
+    Send welcome email and/or WhatsApp to a newly registered user.
+    Rules:
+      - Email given  → send welcome email
+      - Phone given  → send welcome WhatsApp
+      - Both given   → send both
+      - Neither      → skip silently
+    Never raises — registration must not fail because of notification errors.
+    """
+    from app.ekart.notifications import MT_WELCOME, _send_sms
+    from app.whatsapp.service import send_whatsapp
+    from app.sendemail.repository import send_email
+    from app.sendemail.schemas import EmailCreate
+
+    name = first_name.strip() or "Valued Customer"
+
+    # ── Welcome Email ─────────────────────────────────────────────────────────
+    if email and "@" in email:
+        try:
+            body = f"""
+            <div style="max-width:600px;margin:0 auto;font-family:'Trebuchet MS',Arial,sans-serif;">
+              <div style="background:#6B0F2A;padding:24px 32px;text-align:center;">
+                <h2 style="color:#F5F0E6;margin:0;font-size:24px;letter-spacing:2px;">TWAM</h2>
+              </div>
+              <div style="padding:32px 24px;">
+                <h2 style="color:#6B0F2A;">Welcome, {name}! 🎉</h2>
+                <p style="color:#444;line-height:1.7;">
+                  We're thrilled to have you at <strong>Only TWAM</strong> — your destination
+                  for premium and elegant lingerie crafted with love.
+                </p>
+                <p style="color:#444;line-height:1.7;">
+                  Explore styles that celebrate you and discover comfort that fits perfectly.
+                </p>
+                <div style="text-align:center;margin:28px 0;">
+                  <a href="https://onlytwam.com/user-products/product-list"
+                     style="background:#6B0F2A;color:#fff;padding:13px 32px;
+                            border-radius:8px;text-decoration:none;font-weight:600;font-size:15px;">
+                    Start Shopping →
+                  </a>
+                </div>
+                <p style="color:#888;font-size:13px;text-align:center;">
+                  Questions? Reach us at
+                  <a href="mailto:support@onlytwam.com" style="color:#6B0F2A;">support@onlytwam.com</a>
+                </p>
+              </div>
+              <div style="background:#f9f3f5;padding:16px;text-align:center;font-size:12px;color:#aaa;">
+                © 2025 TWAM · GSM Mall, Miyapur Main Rd, Hyderabad 500050
+              </div>
+            </div>"""
+            send_email(db, EmailCreate(
+                name    = name,
+                email   = email,
+                subject = f"Welcome to TWAM, {name}! 🎉",
+                message = body,
+            ))
+            print(f"[Welcome] Email sent to {email}")
+        except Exception as e:
+            print(f"[Welcome] Email failed for {email}: {e}")
+
+    # ── Welcome WhatsApp ──────────────────────────────────────────────────────
+    if phone and phone.strip():
+        try:
+            wa_msg = (
+                "Hi " + name + "! \n\n"
+                "Welcome to *TWAM* - your destination for premium & elegant lingerie!\n\n"
+                "Explore styles that celebrate you:\n"
+                "https://onlytwam.com/user-products/product-list\n\n"
+                "Need help? Email support@onlytwam.com\n\n"
+                "- TWAM Team"
+            )
+            send_whatsapp(db, phone, wa_msg, "WELCOME")
+            print(f"[Welcome] WhatsApp sent to {phone}")
+        except Exception as e:
+            print(f"[Welcome] WhatsApp failed for {phone}: {e}")
 
 
 # ============================================================================

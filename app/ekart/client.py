@@ -11,6 +11,8 @@ Covers every endpoint from the Ekart Elite API spec:
   Label:             POST /api/v1/package/label
   Manifest:          POST /data/v2/generate/manifest
   NDR action:        POST /api/v2/package/ndr
+  Address V2:        POST /api/v2/address  (register pickup/return warehouse)
+                     GET  /api/v2/addresses (list registered addresses)
   Serviceability v2: GET  /api/v2/serviceability/{pincode}
   Serviceability v3: POST /data/v3/serviceability
   Shipping estimate: POST /data/pricing/estimate
@@ -66,12 +68,22 @@ def _get_cached_token(client_id: str) -> Optional[str]:
 def load_ekart_config_from_db(db) -> Optional["EkartDbConfig"]:
     try:
         from app.shipment.config_model import ShipmentConfigurations
+        from sqlalchemy import or_, func as sa_func
+        # FIX Bug 3: stateId column is nullable and case-sensitive in PostgreSQL.
+        # Original filter `stateId == "Active"` fails when:
+        #   - stateId is NULL  (not yet set in DB row)
+        #   - stateId is "active" (lowercase) or "ACTIVE"
+        # This caused the entire Ekart integration to fall back to MOCK MODE,
+        # returning fake AWB numbers instead of real ones.
         row = (
             db.query(ShipmentConfigurations)
             .filter(
                 ShipmentConfigurations.deliveryAgent.ilike("EKart%"),
                 ShipmentConfigurations.deletedInd == False,
-                ShipmentConfigurations.stateId == "Active",
+                or_(
+                    ShipmentConfigurations.stateId == None,  # noqa: E711
+                    sa_func.lower(ShipmentConfigurations.stateId) == "active",
+                ),
             )
             .first()
         )
@@ -95,6 +107,7 @@ def load_ekart_config_from_db(db) -> Optional["EkartDbConfig"]:
             return_state=row.returnState or "",
             return_pincode=row.returnPinCode or "",
             return_country=row.returnCountry or "India",
+            pickup_alias=row.pickupAlias or "",  # alias registered via POST /api/v2/address
         )
     except Exception as e:
         print(f"[EkartClient] DB config load failed: {e}")
@@ -198,7 +211,7 @@ class EkartClient:
                 tracking_url=f"{EKART_BASE_URL}/track/{awb}" if awb else None,
                 courier_name=data.get("vendor") or "Ekart",
                 estimated_delivery=None,
-                raw_response=data,
+                # raw_response removed — not in EkartShipmentResponse schema
             )
 
         except Exception as e:
@@ -215,8 +228,14 @@ class EkartClient:
         cfg = self.db_config
 
         def _phone_int(phone: str) -> int:
+            # Used for locationV1.phone — spec type: integer (min 1000000000)
             digits = "".join(c for c in (phone or "") if c.isdigit())
             return int(digits[-10:]) if len(digits) >= 10 else int(digits or "0")
+
+        def _phone_str(phone: str) -> str:
+            # Used for consignee_alternate_phone — spec type: string, minLength: 10
+            digits = "".join(c for c in (phone or "") if c.isdigit())
+            return digits[-10:] if len(digits) >= 10 else digits.zfill(10)
 
         def _pin_int(pin: str) -> int:
             digits = "".join(c for c in (pin or "") if c.isdigit())
@@ -224,15 +243,24 @@ class EkartClient:
 
         ekart_payment_mode = "COD" if req.payment_mode == "COD" else "Prepaid"
 
-        pickup_location = {
-            "name":    cfg.return_name or "Warehouse",
-            "phone":   _phone_int(cfg.return_phone),
-            "address": cfg.return_address_line1 or "",
-            "city":    cfg.return_city or "",
-            "state":   cfg.return_state or "",
-            "country": cfg.return_country or "India",
-            "pin":     _pin_int(cfg.return_pincode),
-        }
+        # ── Pickup / Return location ──────────────────────────────────────────
+        # If a pickup alias is registered with Ekart (via POST /api/v2/address),
+        # send just {"name": alias} — Ekart autofills the rest from their records.
+        # This avoids SWIFT_RESOURCE_NOT_FOUND_EXCEPTION which occurs when sending
+        # a full address object that Ekart has not seen during onboarding.
+        # The alias is stored in ShipmentConfigurations.PickupAlias after registration.
+        if cfg.pickup_alias:
+            pickup_location = {"name": cfg.pickup_alias}
+        else:
+            pickup_location = {
+                "name":    cfg.return_name or "Warehouse",
+                "phone":   _phone_int(cfg.return_phone),
+                "address": cfg.return_address_line1 or "",
+                "city":    cfg.return_city or "",
+                "state":   cfg.return_state or "",
+                "country": cfg.return_country or "India",
+                "pin":     _pin_int(cfg.return_pincode),
+            }
 
         addr = req.consignee_address
         drop_location = {
@@ -245,21 +273,33 @@ class EkartClient:
             "pin":     _pin_int(addr.pincode),
         }
 
-        weight_grams = max(1, int((req.weight or 0.5) * 1000))
+        # spec: weight is integer in grams (minimum: 1)
+        # CreateShipmentRequest.weight field is already in grams (default=500g)
+        weight_grams = max(1, int(req.weight or 500))
 
-        return {
+        # Tax note: price is MRP-inclusive (tax already embedded in price).
+        # No separate tax is charged at checkout. Per Ekart spec:
+        #   tax_value = 0  (minimum: 0 — valid)
+        #   taxable_amount = total_amount  (since total = taxable + 0)
+        #   commodity_value = str(taxable_amount)
+        #   consignee_gst_amount = 0
+        total_amt    = float(req.total_amount or 0)
+        tax_val      = 0.0
+        taxable_amt  = max(1.0, total_amt)   # spec minimum: 1
+
+        payload = {
             "order_number":              req.order_number or str(req.order_id),
             "invoice_number":            req.invoice_number or req.order_number or str(req.order_id),
             "invoice_date":              req.invoice_date.strftime("%d-%m-%Y") if req.invoice_date else datetime.now().strftime("%d-%m-%Y"),
             "consignee_name":            req.consignee_name or addr.name,
-            "consignee_alternate_phone": _phone_int(req.consignee_phone),
+            "consignee_alternate_phone": _phone_str(req.consignee_phone),  # spec: string minLength:10
             "payment_mode":              ekart_payment_mode,
-            "cod_amount":                float(req.cod_amount or 0) if ekart_payment_mode == "COD" else 0,
-            "total_amount":              float(req.total_amount or 0),
-            "tax_value":                 float(req.tax_value or 0),
-            "taxable_amount":            float(req.taxable_amount or req.total_amount or 0),
-            "commodity_value":           str(int(req.taxable_amount or req.total_amount or 0)),
-            "consignee_gst_amount":      float(req.tax_value or 0),
+            "cod_amount":                total_amt if ekart_payment_mode == "COD" else 0,
+            "total_amount":              total_amt,
+            "tax_value":                 tax_val,
+            "taxable_amount":            taxable_amt,
+            "commodity_value":           str(int(taxable_amt)),
+            "consignee_gst_amount":      tax_val,
             "seller_name":               cfg.return_name or "Seller",
             "seller_address":            cfg.return_address_line1 or "",
             "seller_gst_tin":            "",
@@ -276,6 +316,22 @@ class EkartClient:
             "return_location":           pickup_location,
             "return_reason":             "",
         }
+
+        # ── preferred_dispatch_date ───────────────────────────────────────────
+        # Express and Same Day → request immediate pickup (today's date).
+        # Normal and Free     → omit field (Ekart picks up on their schedule).
+        # Ekart has NO serviceType on /api/v1/package/create — delivery speed is
+        # determined by your account contract, not this field.
+        dispatch_date = req.preferred_dispatch_date  # explicit override wins
+        if not dispatch_date and req.shipping_type_name:
+            name_lower = req.shipping_type_name.strip().lower()
+            if name_lower in ("express", "same day", "sameday", "same-day"):
+                dispatch_date = datetime.now().strftime("%Y-%m-%d")
+        if dispatch_date:
+            payload["preferred_dispatch_date"] = dispatch_date
+            print(f"[EkartClient] shipping_type={req.shipping_type_name!r} → preferred_dispatch_date={dispatch_date}")
+
+        return payload
 
     # ── Bulk Shipment Creation ────────────────────────────────────────────────
     # Sends multiple concurrent PUT /api/v1/package/create requests.
@@ -585,32 +641,70 @@ class EkartClient:
     # NDR = Non-Delivery Report
     # ndrAction values: "RE_ATTEMPT", "RTO", "CONFIRM_DELIVERY"
 
+    # ── NDR action enum mapping ──────────────────────────────────────────────
+    # Spec ndr_action_enum_v2: ["Re-Attempt", "RTO"]
+    # Old internal codes mapped here for backwards compatibility:
+    _NDR_ACTION_MAP = {
+        "RE_ATTEMPT":        "Re-Attempt",  # old internal code → spec value
+        "Re-Attempt":        "Re-Attempt",  # already correct
+        "RTO":               "RTO",
+        "CONFIRM_DELIVERY":  None,           # NOT in spec — Ekart has no confirm endpoint
+    }
+
     async def action_ndr(
         self,
         tracking_id: str,
         ndr_action: str,
         remarks: str = "",
-        preferred_date: Optional[str] = None,
+        preferred_date: Optional[str] = None,  # "YYYY-MM-DD" for Re-Attempt
     ) -> dict:
         """
         Take action on a Non-Delivery Report shipment.
-        ndr_action: "RE_ATTEMPT" | "RTO" | "CONFIRM_DELIVERY"
-        preferred_date: "YYYY-MM-DD" for RE_ATTEMPT scheduling (optional)
+
+        ndr_action: "RE_ATTEMPT" | "Re-Attempt" | "RTO"
+          ("CONFIRM_DELIVERY" is not in the Ekart spec and will return an error)
+
+        preferred_date: "YYYY-MM-DD" string — converted to ms-epoch int64
+          Required when action is "Re-Attempt" (must be within 7 days, not today)
+
+        Spec: POST /api/v2/package/ndr
+          Required fields: action (enum), wbn
+          Optional fields: date (int64 ms), phone, address, instructions, links[]
         """
+        # Map old internal codes to spec enum values
+        spec_action = self._NDR_ACTION_MAP.get(ndr_action)
+        if spec_action is None:
+            return {
+                "error": f"NDR action '{ndr_action}' is not supported by Ekart spec. "
+                         f"Valid values: 'Re-Attempt', 'RTO'",
+                "tracking_id": tracking_id,
+            }
+
         if self.mock_mode:
-            return {"mock": True, "tracking_id": tracking_id, "action": ndr_action}
+            return {"mock": True, "wbn": tracking_id, "action": spec_action}
 
         try:
             token = await self._get_token()
             url = f"{EKART_BASE_URL}/api/v2/package/ndr"
 
             payload: dict = {
-                "tracking_id": tracking_id,
-                "ndrAction":   ndr_action,
-                "remarks":     remarks,
+                "wbn":    tracking_id,   # spec field name: wbn (not tracking_id)
+                "action": spec_action,   # spec field name: action (not ndrAction)
             }
-            if preferred_date:
-                payload["preferredDate"] = preferred_date
+
+            # optional: instructions (spec), formerly remarks
+            if remarks:
+                payload["instructions"] = remarks
+
+            # Re-Attempt requires date as milliseconds int64, NOT a date string
+            if spec_action == "Re-Attempt" and preferred_date:
+                from datetime import datetime
+                try:
+                    dt = datetime.strptime(preferred_date, "%Y-%m-%d")
+                    # spec: int64 ms epoch
+                    payload["date"] = int(dt.timestamp() * 1000)
+                except ValueError:
+                    pass  # bad date format — omit rather than crash
 
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(
@@ -679,8 +773,13 @@ class EkartClient:
         try:
             token = await self._get_token()
             url = f"{EKART_BASE_URL}/data/v3/serviceability"
-            weight_grams = max(1, int(weight * 1000))
+            # spec: all dimension fields are strings, weight in grams as string
+            # caller passes weight in kg (default 0.5), so multiply by 1000
+            weight_grams_str = str(max(1, int(weight * 1000)))
 
+            # spec serviceability_v3_request required fields:
+            #   pickupPincode, dropPincode, length, width, height, weight (strings)
+            #   paymentType (COD|Prepaid), invoiceAmount (string)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
                     url,
@@ -690,7 +789,9 @@ class EkartClient:
                         "length":        str(int(length)),
                         "width":         str(int(width)),
                         "height":        str(int(height)),
-                        "weight":        weight_grams,
+                        "weight":        weight_grams_str,   # spec: string (not int)
+                        "paymentType":   "Prepaid",          # spec REQUIRED: COD|Prepaid
+                        "invoiceAmount": "1",                # spec REQUIRED: invoice value string
                     },
                     headers=self._auth_headers(token),
                 )
@@ -729,15 +830,26 @@ class EkartClient:
         try:
             token = await self._get_token()
             url = f"{EKART_BASE_URL}/data/pricing/estimate"
+            # spec: weight in grams (integer); caller passes kg so multiply
             weight_grams = max(1, int(weight * 1000))
 
+            # spec estimateRequest required fields (camelCase — NOT snake_case):
+            #   billingClientType, shippingDirection, serviceType,
+            #   pickupPincode, dropPincode, length, weight, height, width
             payload = {
-                "pickup_pincode": pickup_pincode,
-                "drop_pincode":   drop_pincode,
-                "weight":         weight_grams,
-                "payment_mode":   payment_mode,
-                "cod_amount":     cod_amount if payment_mode == "COD" else 0,
+                "pickupPincode":     int(pickup_pincode),
+                "dropPincode":       int(drop_pincode),
+                "weight":            weight_grams,
+                "length":            30,   # default cm; callers can extend this API later
+                "height":            10,
+                "width":             20,
+                "serviceType":       "SURFACE",        # SURFACE | EXPRESS (per account)
+                "billingClientType": "SELLER",         # required by spec
+                "shippingDirection": "FORWARD",        # FORWARD | REVERSE
+                "invoiceAmount":     cod_amount or 0,  # spec: invoice value of goods
             }
+            if payment_mode == "COD":
+                payload["codAmount"] = cod_amount      # spec: codAmount (camelCase)
 
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(
@@ -786,6 +898,94 @@ class EkartClient:
     # Ekart does not expose a dedicated COD report endpoint; we build it from
     # our local DB + live track calls.
 
+    # ── Register Pickup / Return Address ─────────────────────────────────────
+    # POST /api/v2/address
+    # Registers a warehouse address with Ekart so it can be referenced by alias.
+    # Required: alias, phone (int), address_line1, pincode (int)
+    # Response: { status: bool, alias: str, remark: str }
+    # Call this ONCE per warehouse. Store the returned alias in
+    # ShipmentConfigurations.PickupAlias so future shipments use alias-only format.
+
+    async def register_address(
+        self,
+        alias: str,
+        phone: str,
+        address_line1: str,
+        pincode: str,
+        address_line2: Optional[str] = None,
+        city: Optional[str] = None,
+        state: Optional[str] = None,
+        country: str = "India",
+    ) -> dict:
+        """
+        Register a pickup/return warehouse address with Ekart.
+        On success: { "status": true, "alias": "...", "remark": "..." }
+        The alias is what you store in ShipmentConfigurations.PickupAlias.
+        """
+        if self.mock_mode:
+            return {"status": True, "alias": alias, "remark": "Registered (mock mode)"}
+
+        def _phone_int(p: str) -> int:
+            digits = "".join(c for c in (p or "") if c.isdigit())
+            return int(digits[-10:]) if len(digits) >= 10 else int(digits or "0")
+
+        def _pin_int(p: str) -> int:
+            digits = "".join(c for c in (p or "") if c.isdigit())
+            return int(digits[:6]) if digits else 0
+
+        try:
+            token = await self._get_token()
+            payload: dict = {
+                "alias":        alias,
+                "phone":        _phone_int(phone),
+                "address_line1": address_line1,
+                "pincode":      _pin_int(pincode),
+            }
+            if address_line2: payload["address_line2"] = address_line2
+            if city:          payload["city"]          = city
+            if state:         payload["state"]         = state
+            if country:       payload["country"]       = country
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{EKART_BASE_URL}/api/v2/address",
+                    json=payload,
+                    headers=self._auth_headers(token),
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+        except Exception as e:
+            err = self._extract_error(e)
+            print(f"[EkartClient] register_address error: {err}")
+            return {"status": False, "alias": alias, "remark": err}
+
+    # ── List Registered Addresses ─────────────────────────────────────────────
+    # GET /api/v2/addresses
+    # Returns all addresses registered against your Ekart account.
+
+    async def list_addresses(self) -> list:
+        """
+        Returns all registered pickup/return addresses for this Ekart account.
+        Each address has an alias that can be used in shipment creation.
+        """
+        if self.mock_mode:
+            return [{"alias": "mock-warehouse", "mock": True}]
+
+        try:
+            token = await self._get_token()
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{EKART_BASE_URL}/api/v2/addresses",
+                    headers=self._auth_headers(token),
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+        except Exception as e:
+            print(f"[EkartClient] list_addresses error: {e}")
+            return []
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -793,9 +993,18 @@ class EkartClient:
         if httpx and isinstance(e, httpx.HTTPStatusError):
             try:
                 body = e.response.json()
-                return body.get("message") or body.get("description") or str(e)
+                # Ekart error schema: {statusCode, code, message, description, severity}
+                # Log the full body so we can diagnose SWIFT_VALIDATION_EXCEPTION etc.
+                print(f"[EkartClient] Full error response (HTTP {e.response.status_code}): {body}")
+                # Return combined message + description for maximum detail
+                msg  = body.get("message") or ""
+                desc = body.get("description") or ""
+                code = body.get("code") or ""
+                return " | ".join(filter(None, [msg, desc, code])) or str(e)
             except Exception:
-                return f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+                raw = e.response.text[:500]
+                print(f"[EkartClient] Raw error body: {raw}")
+                return f"HTTP {e.response.status_code}: {raw}"
         return str(e)
 
     # ── Mock Responses ────────────────────────────────────────────────────────

@@ -72,9 +72,9 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
                         oi."UnitPrice"                                AS "unitPrice",
                         oi."Quantity"                                 AS "quantity",
                         oi."Price"                                    AS "netAmount",
-                        oi."TaxAmount"                                AS "taxRate",
-                        'GST'                                         AS "taxType",
-                        oi."TaxAmount"                                AS "taxAmount",
+                        0                                             AS "taxRate",
+                        NULL                                          AS "taxType",
+                        0                                             AS "taxAmount",
                         oi."Price"                                    AS "totalAmount"
                     FROM twam."OrderItems" oi
                     LEFT JOIN twam."ProductVariants"      pv  ON pv."ProductVariantId"        = oi."ProductVariantId"
@@ -114,9 +114,9 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
                 "unitPrice":   float(item["unitPrice"])   if item.get("unitPrice")   else None,
                 "quantity":    item.get("quantity"),
                 "netAmount":   float(item["netAmount"])   if item.get("netAmount")   else None,
-                "taxRate":     float(item["taxRate"])     if item.get("taxRate")     else None,
-                "taxType":     item.get("taxType"),
-                "taxAmount":   float(item["taxAmount"])   if item.get("taxAmount")   else None,
+                "taxRate":     0.0,  # tax inclusive in MRP
+                "taxType":     None,
+                "taxAmount":   0.0,  # tax inclusive in MRP
                 "totalAmount": float(item["totalAmount"]) if item.get("totalAmount") else None,
             })
 
@@ -149,7 +149,7 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
         "billingStateName":        row[25],
         "billingPinCode":          row[26],
         "billingPhone":            row[27],
-        "taxAmount":               float(row[28]) if row[28] else None,
+        "taxAmount":               0.0,  # tax inclusive in MRP, not charged separately
         "totalAmount":             float(row[29]) if row[29] else None,
         "subTotal":                float(row[30]) if row[30] else None,
         "paymentTransactionRefNo": row[31],

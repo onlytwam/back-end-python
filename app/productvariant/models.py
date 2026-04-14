@@ -18,7 +18,6 @@ class ProductVariant(Base):
     fabricId            = Column("FabricId",            BigInteger, nullable=True)
     color               = Column("Color",               String,     nullable=True)
     isBestSeller        = Column("IsBestSeller",        Boolean,    nullable=True)
-    taxHSNCodeId        = Column("TaxHSNCodeId",        BigInteger, nullable=True)
     isReturnAvailable   = Column("IsReturnAvailable",   Boolean,    nullable=True)
     isCupSize           = Column("IsCupSize",           Boolean,    nullable=True)
     createdBy           = Column("CreatedBy",           String,     nullable=True)

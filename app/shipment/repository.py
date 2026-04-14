@@ -92,12 +92,13 @@ def _get_user_full_name(db: Session, user_profile_id: str) -> str:
 
 
 def _get_hsn_codes_for_order(db: Session, order_id: int) -> str:
+    # TaxHSNCodeId is on Products (product-level) — HSN does not vary by colour/size.
     try:
         rows = db.execute(text("""
             SELECT DISTINCT h."HSNCode"
             FROM twam."OrderItems" oi
-            JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
-            JOIN twam."TaxHSNCode" h ON h."TaxHSNCodeId" = pv."TaxHSNCodeId"
+            JOIN twam."Products" p ON p."ProductId" = oi."ProductId"
+            JOIN mdm."TaxHSNCode" h ON h."TaxHSNCodeId" = p."TaxHSNCodeId"
             WHERE oi."OrderId" = :oid AND oi."DeletedInd" = false AND h."HSNCode" IS NOT NULL
         """), {"oid": order_id}).fetchall()
         return ",".join(r[0] for r in rows if r[0])
@@ -132,14 +133,14 @@ def _get_order_items_for_ekart(db: Session, order_id: int) -> list[EkartShipment
     rows = db.execute(text("""
         SELECT
             p."Name",
-            COALESCE(pv."SKU", p."SKU"),
+            COALESCE(pv."ProductCode", p."ProductCode"),
             oi."Quantity",
             oi."Price",
             thc."HSNCode"
         FROM twam."OrderItems" oi
         LEFT JOIN twam."Products" p ON p."ProductId" = oi."ProductId"
         LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
-        LEFT JOIN twam."TaxHSNCode" thc ON thc."TaxHSNCodeId" = COALESCE(pv."TaxHSNCodeId", p."TaxHSNCodeId")
+        LEFT JOIN mdm."TaxHSNCode" thc ON thc."TaxHSNCodeId" = p."TaxHSNCodeId"
         WHERE oi."OrderId" = :order_id AND oi."DeletedInd" = false
     """), {"order_id": order_id}).fetchall()
 
@@ -238,8 +239,9 @@ def _create_ekart_forward_shipment(db: Session, data, order: dict) -> tuple[Opti
         height=getattr(data, "height", None) or 10,
         items=items,
         product_description=getattr(data, "productDescription", None),
-        tax_value=getattr(data, "taxValue", None),
-        taxable_amount=getattr(data, "taxableAmount", None),
+        # Tax is inclusive in MRP — zero out tax fields always
+        tax_value=0.0,
+        taxable_amount=None,  # client.py will set max(1, total_amount)
     )
 
     # ← Use DB-configured client
@@ -552,7 +554,7 @@ def get_shipment_data(db: Session, order_id: int) -> dict:
     full_name = _get_user_full_name(db, order["userProfileId"] or "")
     total_qty = _get_order_item_count(db, order_id)
     total     = float(order["totalAmount"] or 0)
-    tax       = float(order["taxAmount"] or 0)
+    # Tax is inclusive in MRP — no separate tax is charged at checkout.
 
     return {
         "consigneeName":     full_name,
@@ -560,11 +562,11 @@ def get_shipment_data(db: Session, order_id: int) -> dict:
         "invoiceNumber":     invoice["invoiceNumber"] if invoice else "",
         "invoiceDate":       invoice["createdDate"]   if invoice else datetime.now(timezone.utc),
         "totalAmount":       total,
-        "taxableAmount":     tax,
-        "taxValue":          total - tax,
-        "consigneeGSTAmount": tax,
+        "taxableAmount":     max(1.0, total),
+        "taxValue":          0.0,
+        "consigneeGSTAmount": 0.0,
         "quantity":          total_qty,
-        "commodityValue":    _number_to_words(tax),
+        "commodityValue":    _number_to_words(max(1.0, total)),
         "productDescription": None,
         "paymentMode":       None,
         "goodsCategory":     None,
@@ -623,7 +625,7 @@ def get_return_shipment_data(db: Session, order_id: int) -> dict:
     full_name = _get_user_full_name(db, ref_order["userProfileId"] or "")
     total_qty = _get_order_item_count(db, order_id)
     total     = float(ref_order["totalAmount"] or 0)
-    tax       = float(ref_order["taxAmount"] or 0)
+    # Tax is inclusive in MRP — no separate tax is charged at checkout.
 
     return {
         "consigneeName":     full_name,
@@ -631,11 +633,11 @@ def get_return_shipment_data(db: Session, order_id: int) -> dict:
         "invoiceNumber":     invoice["invoiceNumber"] if invoice else "",
         "invoiceDate":       invoice["createdDate"]   if invoice else datetime.now(timezone.utc),
         "totalAmount":       total,
-        "taxableAmount":     tax,
-        "taxValue":          total - tax,
-        "consigneeGSTAmount": tax,
+        "taxableAmount":     max(1.0, total),
+        "taxValue":          0.0,
+        "consigneeGSTAmount": 0.0,
         "quantity":          total_qty,
-        "commodityValue":    _number_to_words(tax),
+        "commodityValue":    _number_to_words(max(1.0, total)),
         "returnReason":      return_reason,
         "productDescription": None,
         "paymentMode":       None,

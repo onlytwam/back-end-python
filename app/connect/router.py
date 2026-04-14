@@ -38,7 +38,10 @@ from app.auth.repository import (
     authenticate_user, build_token_claims,
     create_identity_user, change_password,
     _get_identity_user_by_username,
+    get_user_by_id,
+    parse_profile_update_payload,
     reset_password_with_token,
+    update_identity_user_profile,
 )
 from app.auth.security import create_access_token, EXPIRES_MINUTES, decode_token, decode_reset_token
 from app.auth.schemas import (
@@ -226,15 +229,23 @@ async def connect_token(
 @router.get("/connect/userinfo")
 async def connect_userinfo(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+    db: Session = Depends(get_db),
 ):
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing token")
     try:
-        return decode_token(credentials.credentials)
+        payload = decode_token(credentials.credentials)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = str(payload.get("sub") or payload.get("UserId") or "").strip()
+    user = get_user_by_id(db, user_id) if user_id else None
+    if user:
+        return build_token_claims(db, user)
+
+    return payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -457,47 +468,17 @@ async def register_confirm_reset(
 
 @router.post("/api/register/update")
 async def register_update(
-    request: RegisterUserRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not request.EmailId:
-        raise HTTPException(status_code=400, detail="EmailId is required.")
-
-    user = _get_identity_user_by_username(db, request.EmailId)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    no_change = (
-        (request.FirstName   or "") == (user.FirstName   or "") and
-        (request.MiddleName  or "") == (user.MiddleName  or "") and
-        (request.LastName    or "") == (user.LastName    or "") and
-        (request.PhoneNumber or "") == (user.PhoneNumber or "")
+    payload, profile_image = await parse_profile_update_payload(request)
+    return update_identity_user_profile(
+        db=db,
+        user_id=current_user.user_id,
+        request=payload,
+        profile_image=profile_image,
     )
-    if no_change:
-        raise HTTPException(status_code=400, detail="No changes detected. Profile is already up to date.")
-
-    # Update IdentityUser via ORM
-    user.FirstName   = request.FirstName   or ""
-    user.MiddleName  = request.MiddleName  or ""
-    user.LastName    = request.LastName    or ""
-    user.PhoneNumber = request.PhoneNumber or ""
-    db.flush()
-
-    # Update People table (no ORM model for this table yet)
-    db.execute(
-        text("""
-            UPDATE twam."People"
-            SET "FirstName"=:first,"MiddleName"=:middle,"LastName"=:last,
-                "PhoneNumber"=:phone,"ModifiedDate"=NOW()
-            WHERE "UserProfileId"=:uid
-        """),
-        {"first": request.FirstName or "", "middle": request.MiddleName or "",
-         "last": request.LastName or "", "phone": request.PhoneNumber or "",
-         "uid": user.Id},
-    )
-    db.commit()
-    return {"message": "User updated successfully."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

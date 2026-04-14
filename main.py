@@ -39,7 +39,6 @@ from app.integrationlocation.models  import IntegrationLocation
 from app.invoice.models              import Invoice, InvoiceItem
 from app.menu.models                 import Menu
 from app.menuroleclaim.models        import MenuRoleClaim
-from app.messagetemplate.models      import MessageTemplate
 from app.orderitems.models           import OrderItems
 from app.orders.models               import Orders, OrderTrackingStatus, OrderReturnInfo, OrderRefund
 from app.packagingtemplates.models   import PackagingTemplates
@@ -61,6 +60,9 @@ from app.userrole.models             import UserRole
 from app.userreview.models           import UserReview
 from app.wishlist.models             import Wishlist
 from app.newsletter.models           import Newsletter
+from app.sms.models                  import SmsCredential, SmsMessageTemplate, SmsLog
+from app.whatsapp.models             import WhatsAppLog, WhatsAppCredential
+from app.auth.models                 import OtpStore
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -76,6 +78,7 @@ async def lifespan(app: FastAPI):
 
     # 3. Uploads directory
     os.makedirs("uploads", exist_ok=True)
+    os.makedirs(os.path.join("uploads", "profile-images"), exist_ok=True)
 
     from database import SessionLocal
     db = SessionLocal()
@@ -171,7 +174,6 @@ from app.integrationlocation.router  import router as integrationlocation_router
 from app.invoice.router              import router as invoice_router
 from app.menu.router                 import router as menu_router
 from app.menuroleclaim.router        import router as menuroleclaim_router
-from app.messagetemplate.router      import router as messagetemplate_router
 from app.notification.router         import router as notification_router
 from app.orderitems.router           import router as orderitems_router
 from app.orders.router               import router as orders_router
@@ -191,6 +193,9 @@ from app.taxhsncode.router           import router as taxhsncode_router
 from app.userrole.router             import router as userrole_router
 from app.wishlist.router             import router as wishlist_router
 from app.bulkimport.router           import router as bulkimport_router
+from app.sms.router                  import template_router as sms_template_router
+from app.sms.router                  import credential_router as sms_credential_router
+ 
 
 # ── Ekart Logistics Integration ───────────────────────────────────────────────
 from app.ekart.router                import router as ekart_router
@@ -206,7 +211,7 @@ for _router in (
     pvd_router, userdashboard_router, userreview_router, email_router,
     address_router, cart_router, common_router, country_router, cupsize_router,
     fabric_router, fileupload_router, integrationlocation_router, invoice_router,
-    menu_router, menuroleclaim_router, messagetemplate_router, notification_router,
+    menu_router, menuroleclaim_router, notification_router,
     orderitems_router, orders_router, packagingtemplates_router, people_router,
     productreview_router, products_router, report_router, shipment_router,
     shippingtype_router, size_router, state_router, stores_router,
@@ -214,7 +219,7 @@ for _router in (
     userrole_router, wishlist_router, bulkimport_router,
     newsletter_router,
     ekart_router, ekart_webhook_router,
-    payment_router,
+    payment_router,sms_template_router, sms_credential_router,
 ):
     app.include_router(_router)
 
