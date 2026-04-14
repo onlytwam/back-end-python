@@ -292,7 +292,10 @@ class EkartClient:
             "invoice_number":            req.invoice_number or req.order_number or str(req.order_id),
             "invoice_date":              req.invoice_date.strftime("%d-%m-%Y") if req.invoice_date else datetime.now().strftime("%d-%m-%Y"),
             "consignee_name":            req.consignee_name or addr.name,
-            "consignee_alternate_phone": _phone_str(req.consignee_phone),  # spec: string minLength:10
+            # FIX: Use warehouse/return phone as alternate — NOT the customer's own phone.
+            # Ekart's SWIFT validation rejects if drop_location.phone == consignee_alternate_phone.
+            # drop_location.phone is already set to the customer phone above.
+            "consignee_alternate_phone": _phone_str(cfg.return_phone or ""),
             "payment_mode":              ekart_payment_mode,
             "cod_amount":                total_amt if ekart_payment_mode == "COD" else 0,
             "total_amount":              total_amt,
