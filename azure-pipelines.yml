@@ -1,7 +1,7 @@
 trigger:
   branches:
     include:
-       - backend-setup/Vishnu
+      - backend-setup/Vishnu
 
 pool:
   vmImage: ubuntu-latest
@@ -9,7 +9,6 @@ pool:
 variables:
   imageRepository: 'twam-backend'
   containerRegistry: 'twamregistry.azurecr.io'
-  tag: 'latest'
 
 steps:
   - task: Docker@2
@@ -19,11 +18,13 @@ steps:
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
-      tags: $(tag)
+      tags: |
+        latest
+        $(Build.BuildId)
       arguments: '--no-cache'
 
   - task: AzureCLI@2
-    displayName: Deploy to Container Apps
+    displayName: Deploy to Container Apps (force new revision)
     inputs:
       azureSubscription: twam-azure-connection
       scriptType: bash
@@ -32,4 +33,5 @@ steps:
         az containerapp update \
           --name twam-backend \
           --resource-group twam-production \
-          --image twamregistry.azurecr.io/twam-backend:latest
+          --image twamregistry.azurecr.io/twam-backend:$(Build.BuildId) \
+          --revision-suffix build$(Build.BuildId)
