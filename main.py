@@ -140,7 +140,14 @@ All protected endpoints require a Bearer JWT token.
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,
+    allow_origins=[
+        "https://localhost",        # ← Capacitor Android
+        "capacitor://localhost",    # ← Capacitor iOS  
+        "http://localhost",
+        "http://localhost:5173",    # ← Vite dev
+        "https://twam.in",
+        "https://*.twam.in",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
