@@ -1,10 +1,11 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from datetime import datetime
 
 
 class NewsletterSubscribe(BaseModel):
-    email: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
 
 
 class NewsletterUnsubscribe(BaseModel):
@@ -12,9 +13,11 @@ class NewsletterUnsubscribe(BaseModel):
 
 
 class NewsletterBlast(BaseModel):
-    subject:   str
-    body_html: str
-    sent_by:   Optional[str] = None
+    subject:    Optional[str] = ""   # Optional for WhatsApp-only blast
+    body_html:  str
+    sent_by:    Optional[str] = None
+    media_url:  Optional[str] = None          # WhatsApp image URL
+    channels:   Optional[str] = "both"       # "email" | "whatsapp" | "both"
 
 
 class NewsletterResponse(BaseModel):

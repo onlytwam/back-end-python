@@ -132,12 +132,26 @@ async def ekart_webhook(
         order.modifiedDate = datetime.now(timezone.utc)
         if new_state == "Delivered" and not order.deliveredDate:
             order.deliveredDate = event_time
+        if new_state in ("Processing", "Shipped") and not order.isShipped:
+            order.isShipped = True
 
+    # Write the raw Ekart status (e.g. "Picked Up", "In Transit") — preserved for audit
     db.add(OrderTrackingStatus(
         orderId     = order.orderId,
         status      = payload.status,
         createdDate = event_time,
     ))
+
+    # Also write the mapped order state string when it changes, so get_order_tracking()
+    # can find "Processing", "Shipped", "Out for Delivery", "Delivered" in the DB.
+    # The tracking page queries OrderTrackingStatus by exact state name.
+    if new_state != old_state and new_state != payload.status:
+        db.add(OrderTrackingStatus(
+            orderId     = order.orderId,
+            status      = new_state,
+            createdDate = event_time,
+        ))
+
     db.commit()
 
     # ── Background notifications ──────────────────────────────────────────────
@@ -196,12 +210,21 @@ async def ekart_bulk_webhook(
             order.modifiedDate = datetime.now(timezone.utc)
             if new_state == "Delivered" and not order.deliveredDate:
                 order.deliveredDate = event_time
+            if new_state in ("Processing", "Shipped") and not order.isShipped:
+                order.isShipped = True
 
         db.add(OrderTrackingStatus(
             orderId     = order.orderId,
             status      = item.status,
             createdDate = event_time,
         ))
+        # Also write mapped state for profile tracking page
+        if new_state != old_state and new_state != item.status:
+            db.add(OrderTrackingStatus(
+                orderId     = order.orderId,
+                status      = new_state,
+                createdDate = event_time,
+            ))
 
         results.append({
             "wbn":       item.wbn,

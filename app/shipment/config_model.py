@@ -34,6 +34,10 @@ class ShipmentConfigurations(Base):
     returnState             = Column("ReturnState",             String,  nullable=True)
     returnPinCode           = Column("ReturnPinCode",           String,  nullable=True)
     returnCountry           = Column("ReturnCountry",           String,  default="India")
+    # Ekart registered pickup alias — set after calling POST /api/Ekart/RegisterAddress.
+    # Once set, shipment creation sends {"name": alias} instead of the full address object,
+    # which resolves SWIFT_RESOURCE_NOT_FOUND_EXCEPTION from Ekart.
+    pickupAlias             = Column("PickupAlias",             String,  nullable=True)
     # Audit
     createdDate             = Column("CreatedDate",             DateTime(timezone=True), server_default=func.now())
     modifiedDate            = Column("ModifiedDate",            DateTime(timezone=True), nullable=True)

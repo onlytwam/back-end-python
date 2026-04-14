@@ -8,7 +8,8 @@ class Newsletter(Base):
     __table_args__ = {"schema": "twam"}
 
     NewsletterId   = Column("NewsletterId",   Integer,  primary_key=True, autoincrement=True)
-    email          = Column("Email",          String,   nullable=False, unique=True)
+    email          = Column("Email",          String,   nullable=True,  index=True)
+    phone          = Column("Phone",          String,   nullable=True,  index=True)
     isActive       = Column("IsActive",       Boolean,  default=True)
     createdDate    = Column("CreatedDate",    DateTime(timezone=True),
                             default=lambda: datetime.now(timezone.utc))

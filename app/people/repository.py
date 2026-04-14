@@ -28,6 +28,7 @@ def _to_response(db: Session, p: People) -> dict:
         "lastName": p.lastName,
         "emailId": p.emailId,
         "phoneNumber": p.phoneNumber,
+        "profileImageUrl": p.profileImageUrl,
         "userProfileId": p.userProfileId,
         "isActive": p.isActive,
         "roleId": p.roleId,

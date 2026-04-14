@@ -268,12 +268,82 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
     return items
 
 
+def _get_buynow_checkout_items(db: Session, order_items: list) -> List[dict]:
+    """
+    Fetch live prices from DB for Buy Now inline items.
+    This ensures prices shown in the checkout summary match the DB, not stale
+    values that may have been passed from the client.
+    Returns items in the same shape as _get_cart_checkout_items, but cartId=None.
+    """
+    if not order_items:
+        return []
+
+    pvd_ids = [i.productVariantDetailId for i in order_items if i.productVariantDetailId]
+    if not pvd_ids:
+        raise ValueError("Buy Now items must include productVariantDetailId.")
+
+    ids_str = ",".join(str(i) for i in pvd_ids)
+    rows = db.execute(text(f"""
+        SELECT
+            pvd."ProductVariantDetailId",
+            pv."ProductId",
+            pvd."ProductVariantId",
+            p."Name",
+            pvd."FinalPrice",
+            pvd."TaxAmount",
+            (
+                SELECT CONCAT('{BASE_URL}', pi2."FilePath")
+                FROM twam."ProductImage" pi2
+                WHERE pi2."ProductVariantId" = pvd."ProductVariantId"
+                  AND pi2."DeletedInd" = false
+                  AND pi2."FilePath" IS NOT NULL
+                  AND pi2."FilePath" != ''
+                LIMIT 1
+            ) AS image
+        FROM twam."ProductVariantDetail" pvd
+        LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
+        LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
+        WHERE pvd."ProductVariantDetailId" IN ({ids_str})
+          AND pvd."DeletedInd" = false
+    """)).fetchall()
+
+    # Build a lookup keyed by PVD ID
+    db_map = {row[0]: row for row in rows}
+
+    items = []
+    for item in order_items:
+        pvd_id = item.productVariantDetailId
+        if pvd_id not in db_map:
+            raise ValueError(f"Product variant detail {pvd_id} not found or unavailable.")
+        row = db_map[pvd_id]
+        quantity = int(item.quantity or 1)
+        unit_price = float(row[4]) if row[4] is not None else 0.0
+        unit_tax = float(row[5]) if row[5] is not None else 0.0
+        items.append({
+            "cartId": None,          # No cart record for Buy Now
+            "productId": row[1],
+            "productVariantId": row[2],
+            "productVariantDetailId": pvd_id,
+            "quantity": quantity,
+            "productName": row[3],
+            "unitPrice": unit_price,
+            "taxAmount": round(unit_tax * quantity, 2),
+            "lineTotal": round(unit_price * quantity, 2),
+            "productImage": row[6] or "",
+        })
+    return items
+
+
 def get_checkout_summary(db: Session, user_profile_id: str, data) -> dict:
     if not user_profile_id:
         raise ValueError("User profile is required.")
 
-    cart_ids = list(dict.fromkeys(data.cartIds or []))
-    if not cart_ids:
+    # ── Determine mode: Buy Now (inline items) vs regular cart ──────────────
+    inline_items = getattr(data, "orderItems", None) or []
+    cart_ids = list(dict.fromkeys(getattr(data, "cartIds", None) or []))
+    is_buy_now = bool(inline_items)
+
+    if not is_buy_now and not cart_ids:
         raise ValueError("At least one cart item is required.")
 
     shipping_address = _get_owned_address(db, data.shippingAddressId, user_profile_id) if data.shippingAddressId else None
@@ -285,9 +355,14 @@ def get_checkout_summary(db: Session, user_profile_id: str, data) -> dict:
     if billing_source_id and not billing_address:
         raise ValueError("Billing address not found for this user.")
 
-    cart_items = _get_cart_checkout_items(db, cart_ids, user_profile_id)
-    if len(cart_items) != len(cart_ids):
-        raise ValueError("Some cart items were not found for this user.")
+    if is_buy_now:
+        # Buy Now path: fetch live prices from DB, no cart lookup
+        cart_items = _get_buynow_checkout_items(db, inline_items)
+    else:
+        # Regular cart path
+        cart_items = _get_cart_checkout_items(db, cart_ids, user_profile_id)
+        if len(cart_items) != len(cart_ids):
+            raise ValueError("Some cart items were not found for this user.")
 
     sub_total = round(sum(item["lineTotal"] for item in cart_items), 2)
     tax_amount = round(sum(item["taxAmount"] for item in cart_items), 2)
@@ -312,6 +387,7 @@ def get_checkout_summary(db: Session, user_profile_id: str, data) -> dict:
         "deliveryCharge": delivery_charge,
         "couponAmount": coupon_amount,
         "totalAmount": total_amount,
+        "isBuyNow": is_buy_now,
     }
 
 
@@ -536,15 +612,10 @@ def create_order(db: Session, data) -> dict:
     db.add(order)
     db.commit()
 
-    # Mark cart items as ordered (separate commit after the order is persisted)
-    cart_ids = getattr(data, "cartId", None) or []
-    user_profile_id = getattr(data, "userProfileId", None) or ""
-    if cart_ids:
-        ids_str = ",".join(str(i) for i in cart_ids)
-        db.execute(text(
-            f"UPDATE twam.\"Cart\" SET \"IsOrdered\" = true WHERE \"UserProfileId\" = '{user_profile_id}' AND \"CartId\" IN ({ids_str}) AND \"DeletedInd\" = false"
-        ))
-        db.commit()
+    # NOTE: Cart items are marked IsOrdered=true ONLY after payment is confirmed
+    # successful in app/payment/router.py (payment_callback success path).
+    # Marking them here would hide items from the cart even if payment fails,
+    # preventing the user from retrying with those same products.
 
     return {"orderId": order_id, "paymentProcessUrl": payment_url}
 
@@ -941,26 +1012,39 @@ def get_order_details(db: Session, order_id: int) -> Optional[dict]:
 
     items = _get_order_items_with_details(db, [order_id])
 
+    tracking_base = get_setting("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track")
+    tracking_url  = f"{tracking_base}/{order.trackingId}" if order.trackingId else None
+
     return {
-        "orderId": order.orderId,
-        "totalAmount": float(order.totalAmount) if order.totalAmount else None,
-        "orderDate": order.orderDate,
-        "userProfileId": order.userProfileId,
-        "state": order.state,
-        "orderNumber": order.orderNumber,
-        "shippingAddressId": order.shippingAddressId,
-        "billingAddressId": order.billingAddressId,
-        "paymentAccount": order.paymentAccount,
+        "orderId":               order.orderId,
+        "totalAmount":           float(order.totalAmount) if order.totalAmount else None,
+        "orderDate":             order.orderDate,
+        "userProfileId":         order.userProfileId,
+        "state":                 order.state,
+        "orderNumber":           order.orderNumber,
+        "shippingAddressId":     order.shippingAddressId,
+        "billingAddressId":      order.billingAddressId,
+        "paymentAccount":        order.paymentAccount,
         "paymentTransactionRefNo": order.paymentTransactionRefNo,
-        "paymentStatus": None,
-        "paymentReasonCode": None,
-        "subTotal": float(order.subTotal) if order.subTotal else None,
-        "taxAmount": float(order.taxAmount) if order.taxAmount else None,
-        "deliveryCharge": float(order.deliveryCharge) if order.deliveryCharge else None,
-        "shippingAddress": _get_address(db, order.shippingAddressId),
-        "billingAddress": _get_address(db, order.billingAddressId),
-        "deliveryInfo": _get_delivery_info(db, order.shippingTypeId),
-        "orderItems": items,
+        "paymentMethod":         order.paymentMethod,
+        "paymentStatus":         None,
+        "paymentReasonCode":     None,
+        "subTotal":              float(order.subTotal) if order.subTotal else None,
+        "taxAmount":             float(order.taxAmount) if order.taxAmount else None,
+        "deliveryCharge":        float(order.deliveryCharge) if order.deliveryCharge else None,
+        "couponAmount":          float(order.couponAmount) if order.couponAmount else None,
+        # ── Shipping & tracking fields (used by profile tracking page) ────────
+        "trackingId":            order.trackingId,
+        "trackingUrl":           tracking_url,
+        "isShipped":             order.isShipped or False,
+        "deliveryAgent":         order.deliveryAgent,
+        "deliveredDate":         order.deliveredDate,
+        "shippingTypeId":        order.shippingTypeId,
+        # ── Addresses ─────────────────────────────────────────────────────────
+        "shippingAddress":       _get_address(db, order.shippingAddressId),
+        "billingAddress":        _get_address(db, order.billingAddressId),
+        "deliveryInfo":          _get_delivery_info(db, order.shippingTypeId),
+        "orderItems":            items,
     }
 
 
@@ -979,54 +1063,68 @@ def get_order_tracking(db: Session, order_id: int) -> dict:
         return s.createdDate.strftime("%Y-%m-%d %H:%M:%S") if s and s.createdDate else None
 
     steps = []
-    if "Pending"          in status_map:
-        steps.append({"title": "Order Pending",   "description": "Awaiting payment confirmation", "date": _fmt("Pending"),          "status": "done"})
-    if "Failed"           in status_map:
-        steps.append({"title": "Order Failed",    "description": f"Order {order.orderNumber} failed.", "date": _fmt("Failed"),      "status": "done"})
-    if "Confirmed"        in status_map:
-        steps.append({"title": "Order Confirmed", "description": "Your order has been placed.",  "date": _fmt("Confirmed"),         "status": "done"})
 
-    # Shipped / in-transit / delivered — derived from Orders table directly
-    if order.isShipped and order.state not in ("Cancelled", "Returned"):
-        tracking_note = f"Tracking ID: {order.trackingId}" if order.trackingId else "Your order is on its way."
-        if order.state == "Delivered":
-            steps.append({
-                "title": "Shipped",
-                "description": tracking_note,
-                "date": None,
-                "status": "done"
-            })
-            delivered_date = (
-                order.deliveredDate.strftime("%Y-%m-%d %H:%M:%S")
-                if order.deliveredDate else None
-            )
-            steps.append({
-                "title": "Delivered",
-                "description": "Your order has been delivered.",
-                "date": delivered_date,
-                "status": "done"
-            })
-        else:
-            steps.append({
-                "title": "Shipped",
-                "description": tracking_note,
-                "date": None,
-                "status": "done"
-            })
-            steps.append({
-                "title": "Out for delivery",
-                "description": "Your order is on its way.",
-                "date": None,
-                "status": "active"
-            })
+    # ── Step 1: Payment / Order state ──────────────────────────────────────
+    if "Pending" in status_map:
+        steps.append({"title": "Order placed", "description": "Awaiting payment confirmation.",
+                      "date": _fmt("Pending"), "status": "done"})
 
+    if "Failed" in status_map or "Payment Failed" in status_map:
+        key = "Payment Failed" if "Payment Failed" in status_map else "Failed"
+        steps.append({"title": "Payment failed", "description": f"Order {order.orderNumber} payment failed.",
+                      "date": _fmt(key), "status": "done"})
+
+    if "Confirmed" in status_map:
+        steps.append({"title": "Order confirmed", "description": "Payment received. Order confirmed.",
+                      "date": _fmt("Confirmed"), "status": "done"})
+
+    # ── Step 2: Pickup / Processing (Ekart picked up parcel) ──────────────
+    # Ekart webhook writes both raw "Picked Up" and mapped "Processing" status.
+    processing_date = _fmt("Processing") or _fmt("Picked Up") or _fmt("Out for Pickup")
+    if processing_date or order.isShipped:
+        tracking_base = get_setting("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track")
+        tracking_url  = f"{tracking_base}/{order.trackingId}" if order.trackingId else None
+        tracking_note = f"Tracking ID: {order.trackingId}" if order.trackingId else "Shipment created."
+        steps.append({"title": "Shipment created", "description": tracking_note,
+                      "trackingUrl": tracking_url,
+                      "date": processing_date, "status": "done"})
+
+    # ── Step 3: In transit / Shipped ───────────────────────────────────────
+    shipped_date = _fmt("Shipped") or _fmt("In Transit")
+    if shipped_date and order.isShipped:
+        steps.append({"title": "In transit", "description": "Your order is on its way.",
+                      "date": shipped_date, "status": "done"})
+
+    # ── Step 4: Out for delivery ───────────────────────────────────────────
+    ofd_date = _fmt("Out for Delivery") or _fmt("Out for delivery")
+    if ofd_date:
+        steps.append({"title": "Out for delivery", "description": "Order is out for delivery today.",
+                      "date": ofd_date, "status": "done"})
+    elif order.isShipped and order.state not in ("Delivered", "Cancelled", "Returned",
+                                                  "Return Initiated", "Returned"):
+        # Shipment created but not yet out — show as pending next step
+        steps.append({"title": "Out for delivery", "description": "Your order is on its way.",
+                      "date": None, "status": "active"})
+
+    # ── Step 5: Delivered ──────────────────────────────────────────────────
+    delivered_date = (
+        order.deliveredDate.strftime("%Y-%m-%d %H:%M:%S") if order.deliveredDate
+        else _fmt("Delivered")
+    )
+    if delivered_date or order.state == "Delivered":
+        steps.append({"title": "Delivered", "description": "Your order has been delivered.",
+                      "date": delivered_date, "status": "done"})
+
+    # ── Return / Cancel ────────────────────────────────────────────────────
     if "Return Initiated" in status_map:
-        steps.append({"title": "Return Initiated","description": "Order return initiated.",      "date": _fmt("Return Initiated"),  "status": "done"})
+        steps.append({"title": "Return initiated", "description": "Return pickup scheduled.",
+                      "date": _fmt("Return Initiated"), "status": "done"})
     if order.state == "Cancelled":
-        steps.append({"title": "Order Cancelled", "description": "Order was cancelled.",         "date": _fmt("Cancelled"),         "status": "done"})
+        steps.append({"title": "Order cancelled", "description": "Order was cancelled.",
+                      "date": _fmt("Cancelled"), "status": "done"})
     if order.state == "Returned":
-        steps.append({"title": "Order Returned",  "description": "Order returned and refunded.", "date": _fmt("Returned"),          "status": "done"})
-
+        steps.append({"title": "Order returned", "description": "Order returned successfully.",
+                      "date": _fmt("Returned"), "status": "done"})
     refund = db.query(OrderRefund).filter(OrderRefund.orderId == order_id).first()
     if refund and refund.refundDateTime:
         steps.append({"title": "Refund Initiated", "description": "Refund initiated.",

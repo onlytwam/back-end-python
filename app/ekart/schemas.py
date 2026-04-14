@@ -80,6 +80,23 @@ class CreateShipmentRequest(BaseModel):
     tax_value: Optional[float] = None
     taxable_amount: Optional[float] = None
 
+    # ── Shipping speed ────────────────────────────────────────────────────────
+    # Comes from mdm.ShippingType.ShippingTypeName for the order.
+    # Values your system uses: "Normal", "Express", "Free", "Same Day"
+    #
+    # How this maps to Ekart API preferred_dispatch_date:
+    #   "Normal"   → not sent  (Ekart picks up on their standard schedule)
+    #   "Free"     → not sent  (same speed as Normal, just Rs.0 charge)
+    #   "Express"  → today's date  (requests same-day pickup)
+    #   "Same Day" → today's date  (requires Same Day enabled on your Ekart account)
+    #
+    # NOTE: Ekart's /api/v1/package/create has NO serviceType field.
+    # serviceType (SURFACE/EXPRESS) only exists in Estimate + Serviceability V3 APIs.
+    shipping_type_name: Optional[str] = None
+
+    # Override: explicit dispatch date "YYYY-MM-DD". If None, computed from shipping_type_name.
+    preferred_dispatch_date: Optional[str] = None
+
 
 class CreateReturnShipmentRequest(BaseModel):
     """Request to create a return/reverse shipment."""

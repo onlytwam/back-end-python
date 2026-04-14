@@ -29,7 +29,10 @@ class OrderResponse(BaseModel):
 
 
 class CheckoutSummaryRequest(BaseModel):
-    cartIds: List[int]
+    # Cart-based checkout: pass cartIds (regular flow)
+    cartIds: Optional[List[int]] = None
+    # Buy Now checkout: pass inline items directly (skips cart, no cartId stored)
+    orderItems: Optional[List[OrderItemInput]] = None
     shippingAddressId: Optional[int] = None
     billingAddressId: Optional[int] = None
     shippingTypeId: Optional[int] = None
@@ -37,7 +40,7 @@ class CheckoutSummaryRequest(BaseModel):
 
 
 class CheckoutSummaryItem(BaseModel):
-    cartId: int
+    cartId: Optional[int] = None  # None for Buy Now items (no cart record)
     productId: Optional[int] = None
     productVariantId: Optional[int] = None
     productVariantDetailId: Optional[int] = None

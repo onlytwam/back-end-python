@@ -28,6 +28,8 @@ class RegisterUserRequest(BaseModel):
     EmailId:     Optional[str]  = Field(None, alias="emailId")
     Password:    Optional[str]  = Field(None, alias="password")
     PhoneNumber: Optional[str]  = Field(None, alias="phoneNumber")
+    ProfileImageUrl: Optional[str] = Field(None, alias="profileImageUrl")
+    RemoveProfileImage: Optional[bool] = Field(False, alias="removeProfileImage")
     IsActive:    Optional[bool] = Field(True,  alias="isActive")
     RoleId:      int            = Field(2,      alias="roleId")
 
@@ -84,4 +86,5 @@ class CurrentUser(BaseModel):
     first_name: str = ""
     last_name:  str = ""
     full_name:  str = ""
+    profile_image_url: str = ""
     tenant_id:  str = "1"
