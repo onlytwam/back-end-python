@@ -141,12 +141,23 @@ All protected endpoints require a Bearer JWT token.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://localhost",        # ← Capacitor Android
-        "capacitor://localhost",    # ← Capacitor iOS  
+        # ── Android APK (Capacitor) ──────────────────
         "http://localhost",
-        "http://localhost:5173",    # ← Vite dev
+        "https://localhost",
+        "capacitor://localhost",    # iOS Capacitor
+
+        # ── Local Dev ────────────────────────────────
+        "http://localhost:5173",    # Vite dev server
+        "http://localhost:3000",
+
+        # ── Azure Frontend (ADD THIS!) ────────────────
+        "https://lemon-ground-09a562900.7.azurestaticapps.net",
+
+        # ── Production Domain (list each explicitly) ──
         "https://twam.in",
-        "https://*.twam.in",
+        "https://www.twam.in",
+        "https://admin.twam.in",    # add any other subdomains
+        "https://app.twam.in",
     ],
     allow_credentials=True,
     allow_methods=["*"],
