@@ -4,3 +4,6 @@ __pycache__/
 uploads/
 venv/
 .env.production
+.env
+.env.*
+uploads/
