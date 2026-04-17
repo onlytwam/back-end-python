@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # ── CORS ──────────────────────────────────────────────────────────────────
     # Comma-separated origins.
     # Example: "https://app.twam.in,https://admin.twam.in,capacitor://localhost"
-    cors_origins: str = "http://localhost:5173,http://localhost:3000,capacitor://localhost,http://localhost"
+    cors_origins: str = "http://localhost:5173,http://localhost:3000,capacitor://localhost,http://localhost,https://localhost,"
 
     # ── File Storage ─────────────────────────────────────────────────────────
     base_url: str = ""

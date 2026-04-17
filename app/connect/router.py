@@ -37,8 +37,11 @@ from database import get_db
 from app.auth.repository import (
     authenticate_user, build_token_claims,
     create_identity_user, change_password,
-    _get_identity_user_by_username, IDENTITY_USER_TABLE,
+    _get_identity_user_by_username,
+    get_user_by_id,
+    parse_profile_update_payload,
     reset_password_with_token,
+    update_identity_user_profile,
 )
 from app.auth.security import create_access_token, EXPIRES_MINUTES, decode_token, decode_reset_token
 from app.auth.schemas import (
@@ -226,15 +229,23 @@ async def connect_token(
 @router.get("/connect/userinfo")
 async def connect_userinfo(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+    db: Session = Depends(get_db),
 ):
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing token")
     try:
-        return decode_token(credentials.credentials)
+        payload = decode_token(credentials.credentials)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = str(payload.get("sub") or payload.get("UserId") or "").strip()
+    user = get_user_by_id(db, user_id) if user_id else None
+    if user:
+        return build_token_claims(db, user)
+
+    return payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,15 +311,15 @@ async def register_reset_password(request: ResetPasswordRequest, db: Session = D
         return generic_response
 
     reset_token = create_access_token(
-        user_claims={"sub": user["email"], "purpose": "password_reset", "email": user["email"]},
+        user_claims={"sub": user.Email, "purpose": "password_reset", "email": user.Email},
         expires_minutes=15,
     )
     reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
 
-    full_name = f"{user['first_name']} {user['last_name']}".strip() or user["email"]
+    full_name = f"{user.FirstName} {user.LastName}".strip() or user.Email
     sent = send_email(db, EmailCreate(
         name    = full_name,
-        email   = user["email"],
+        email   = user.Email,
         subject = "Reset Your Password — Only TWAM",
         message = (
             f"Hello {full_name},\n\n"
@@ -345,12 +356,12 @@ async def send_forgot_password_otp(request: OtpRequest, db: Session = Depends(ge
         "attempts":   0,
     }
 
-    full_name  = f"{user['first_name']} {user['last_name']}".strip() or user["email"]
+    full_name  = f"{user.FirstName} {user.LastName}".strip() or user.Email
     html_body  = _otp_email_html(full_name, otp)
 
     sent = send_email(db, EmailCreate(
         name    = full_name,
-        email   = user["email"],
+        email   = user.Email,
         subject = f"Your TWAM Password Reset OTP — {otp}",
         message = html_body,
         filename=None, isFile=False, data=None,
@@ -409,8 +420,8 @@ async def verify_forgot_password_otp(request: OtpVerifyRequest, db: Session = De
 
     reset_token = create_access_token(
         user_claims={
-            "sub":     user["email"],
-            "email":   user["email"],
+            "sub":     user.Email,
+            "email":   user.Email,
             "purpose": "password_reset",
         },
         expires_minutes=15,
@@ -419,7 +430,7 @@ async def verify_forgot_password_otp(request: OtpVerifyRequest, db: Session = De
     return {
         "message": "OTP verified successfully.",
         "token":   reset_token,
-        "email":   user["email"],
+        "email":   user.Email,
     }
 
 
@@ -457,52 +468,17 @@ async def register_confirm_reset(
 
 @router.post("/api/register/update")
 async def register_update(
-    request: RegisterUserRequest,
+    request: Request,
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not request.EmailId:
-        raise HTTPException(status_code=400, detail="EmailId is required.")
-
-    user = _get_identity_user_by_username(db, request.EmailId)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    no_change = (
-        (request.FirstName   or "") == (user["first_name"]   or "") and
-        (request.MiddleName  or "") == (user["middle_name"]  or "") and
-        (request.LastName    or "") == (user["last_name"]    or "") and
-        (request.PhoneNumber or "") == (user["phone_number"] or "")
+    payload, profile_image = await parse_profile_update_payload(request)
+    return update_identity_user_profile(
+        db=db,
+        user_id=current_user.user_id,
+        request=payload,
+        profile_image=profile_image,
     )
-    if no_change:
-        raise HTTPException(status_code=400, detail="No changes detected. Profile is already up to date.")
-
-    db.execute(
-        text(f"""
-            UPDATE {IDENTITY_USER_TABLE}
-            SET "FirstName"   = :first,
-                "MiddleName"  = :middle,
-                "LastName"    = :last,
-                "PhoneNumber" = :phone
-            WHERE "Id" = :uid
-        """),
-        {"first": request.FirstName or "", "middle": request.MiddleName or "",
-         "last": request.LastName or "", "phone": request.PhoneNumber or "",
-         "uid": user["id"]},
-    )
-    db.execute(
-        text("""
-            UPDATE twam."People"
-            SET "FirstName"=:first,"MiddleName"=:middle,"LastName"=:last,
-                "PhoneNumber"=:phone,"ModifiedDate"=NOW()
-            WHERE "UserProfileId"=:uid
-        """),
-        {"first": request.FirstName or "", "middle": request.MiddleName or "",
-         "last": request.LastName or "", "phone": request.PhoneNumber or "",
-         "uid": user["id"]},
-    )
-    db.commit()
-    return {"message": "User updated successfully."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ class PeopleResponse(BaseModel):
     lastName: Optional[str] = None
     emailId: Optional[str] = None
     phoneNumber: Optional[str] = None
+    profileImageUrl: Optional[str] = None
     userProfileId: Optional[str] = None
     isActive: Optional[bool] = None
     roleId: Optional[int] = None

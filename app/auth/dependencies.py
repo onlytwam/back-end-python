@@ -99,6 +99,7 @@ async def get_current_user(
         first_name = payload.get("FirstName") or payload.get("given_name") or "",
         last_name  = payload.get("LastName")  or payload.get("family_name") or "",
         full_name  = payload.get("name") or "",
+        profile_image_url = payload.get("ProfileImageUrl") or payload.get("profile_image_url") or "",
         tenant_id  = str(payload.get("TenantId") or "1"),
     )
 

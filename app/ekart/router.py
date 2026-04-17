@@ -19,13 +19,21 @@ All Ekart API features exposed as REST endpoints:
   GET    /api/Ekart/Config                  — view ShipmentConfigurations
   PUT    /api/Ekart/Config/{id}             — update ShipmentConfigurations
   GET    /api/Ekart/Readiness               — check live-readiness
+
+FIXES APPLIED:
+  1. _get_order_items_for_shipment: p."SKU" → COALESCE(pv."SKU", ProductId)
+     p."SKU" does not exist on twam.Products — SKU is on ProductVariants.
+     This caused admin manual shipment creation to crash with a DB column error.
+  2. _build_return_address_from_db: stateId == "Active" → case-insensitive + NULL-safe
+     Same bug as in client.py — exact string match fails when value is NULL or wrong case.
+  3. ekart_readiness endpoint: same stateId fix so Readiness check returns correct status.
 """
 
 from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, or_, func as sa_func
 from pydantic import BaseModel
 
 from database import get_db
@@ -133,6 +141,8 @@ class ShipmentConfigUpdate(BaseModel):
     returnState: Optional[str] = None
     returnPinCode: Optional[str] = None
     returnCountry: Optional[str] = None
+    # Set after calling /api/Ekart/RegisterAddress — enables alias-only pickup mode
+    pickupAlias: Optional[str] = None
 
 
 class ShipmentResponse(BaseModel):
@@ -153,12 +163,15 @@ def _get_order_with_address(db: Session, order_id: int) -> Optional[dict]:
             o."TrackingId", o."PaymentMethod", o."DeliveryCharge",
             a."Name", a."Phone", a."AddressLine", a."City",
             a."PinCode", s."StateName", c."CountryName",
-            p."Email"
+            p."Email",
+            o."ShippingTypeId", st."ShippingTypeName"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
         LEFT JOIN mdm."State" s ON s."StateId" = a."StateId"
         LEFT JOIN mdm."Country" c ON c."CountryId" = a."CountryId"
         LEFT JOIN twam."People" p ON p."UserProfileId" = o."UserProfileId"
+        LEFT JOIN mdm."ShippingType" st ON st."ShippingTypeId" = o."ShippingTypeId"
+            AND st."DeletedInd" = false
         WHERE o."OrderId" = :order_id AND o."DeletedInd" = false
     """), {"order_id": order_id}).fetchone()
 
@@ -166,32 +179,40 @@ def _get_order_with_address(db: Session, order_id: int) -> Optional[dict]:
         return None
 
     return {
-        "order_id":      row[0],
-        "order_number":  row[1] or str(row[0]),
-        "total_amount":  float(row[2]) if row[2] else 0,
-        "state":         row[3],
-        "tracking_id":   row[4],
-        "payment_mode":  row[5] or "PREPAID",
-        "delivery_charge": float(row[6]) if row[6] else 0,
-        "name":          row[7],
-        "phone":         row[8],
-        "address_line":  row[9],
-        "city":          row[10],
-        "pincode":       row[11],
-        "state_name":    row[12] or "",
-        "country":       row[13] or "India",
-        "email":         row[14],
+        "order_id":           row[0],
+        "order_number":       row[1] or str(row[0]),
+        "total_amount":       float(row[2]) if row[2] else 0,
+        "state":              row[3],
+        "tracking_id":        row[4],
+        "payment_mode":       row[5] or "PREPAID",
+        "delivery_charge":    float(row[6]) if row[6] else 0,
+        "name":               row[7],
+        "phone":              row[8],
+        "address_line":       row[9],
+        "city":               row[10],
+        "pincode":            row[11],
+        "state_name":         row[12] or "",
+        "country":            row[13] or "India",
+        "email":              row[14],
+        "shipping_type_id":   row[15],
+        "shipping_type_name": row[16] or "Normal",
     }
 
 
 def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
+    # TaxHSNCodeId is on twam.Products (product-level GST classification).
+    # HSN does not change per colour/size — product level is the correct source.
+    # TaxHSNCode lookup table is in mdm schema.
     rows = db.execute(text("""
         SELECT
-            p."Name", p."SKU", oi."Quantity", oi."Price",
+            p."Name",
+            COALESCE(pv."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
+            oi."Quantity", oi."Price",
             thc."HSNCode"
         FROM twam."OrderItems" oi
-        LEFT JOIN twam."Products" p ON p."ProductId" = oi."ProductId"
-        LEFT JOIN twam."TaxHSNCode" thc ON thc."TaxHSNCodeId" = p."TaxHSNCodeId"
+        LEFT JOIN twam."Products" p         ON p."ProductId"         = oi."ProductId"
+        LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
+        LEFT JOIN mdm."TaxHSNCode" thc      ON thc."TaxHSNCodeId"    = p."TaxHSNCodeId"
         WHERE oi."OrderId" = :order_id AND oi."DeletedInd" = false
     """), {"order_id": order_id}).fetchall()
 
@@ -210,12 +231,18 @@ def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
 def _build_return_address_from_db(db: Session) -> EkartAddress:
     try:
         from app.shipment.config_model import ShipmentConfigurations
+        # FIX 2: stateId == "Active" is exact-match case-sensitive.
+        # Fails when stateId is NULL, "active", or "ACTIVE".
+        # Use case-insensitive OR NULL-safe filter.
         row = (
             db.query(ShipmentConfigurations)
             .filter(
                 ShipmentConfigurations.deliveryAgent.ilike("EKart%"),
                 ShipmentConfigurations.deletedInd == False,
-                ShipmentConfigurations.stateId == "Active",
+                or_(
+                    ShipmentConfigurations.stateId == None,  # noqa: E711
+                    sa_func.lower(ShipmentConfigurations.stateId) == "active",
+                ),
             )
             .first()
         )
@@ -243,10 +270,10 @@ def _build_return_address_from_db(db: Session) -> EkartAddress:
 
 def _build_shipment_request(order: dict, items: list) -> CreateShipmentRequest:
     return CreateShipmentRequest(
-        order_id=       order["order_id"],
-        order_number=   order["order_number"],
-        consignee_name= order["name"],
-        consignee_phone=order["phone"] or "",
+        order_id=           order["order_id"],
+        order_number=       order["order_number"],
+        consignee_name=     order["name"],
+        consignee_phone=    order["phone"] or "",
         consignee_address=EkartAddress(
             name=          order["name"] or "Customer",
             phone=         order["phone"] or "",
@@ -256,10 +283,11 @@ def _build_shipment_request(order: dict, items: list) -> CreateShipmentRequest:
             pincode=       order["pincode"] or "",
             country=       order["country"],
         ),
-        payment_mode="COD" if order["payment_mode"] == "COD" else "PREPAID",
-        cod_amount=order["total_amount"] if order["payment_mode"] == "COD" else None,
-        total_amount=order["total_amount"],
-        items=items,
+        payment_mode=       "COD" if order["payment_mode"] == "COD" else "Prepaid",
+        cod_amount=         order["total_amount"] if order["payment_mode"] == "COD" else None,
+        total_amount=       order["total_amount"],
+        items=              items,
+        shipping_type_name= order.get("shipping_type_name", "Normal"),
     )
 
 
@@ -347,7 +375,6 @@ async def create_bulk_shipments(
     if len(inp.order_ids) > 50:
         raise HTTPException(400, "Maximum 50 orders per bulk request")
 
-    # Build Ekart requests for all eligible orders
     shipment_requests = []
     skipped = []
 
@@ -373,11 +400,9 @@ async def create_bulk_shipments(
     if not shipment_requests:
         return {"success": False, "processed": 0, "skipped": skipped, "results": []}
 
-    # Bulk create on Ekart (concurrent)
     client  = get_ekart_client_for_db(db)
     results = await client.create_bulk_shipments(shipment_requests)
 
-    # Persist successful shipments
     success_count = 0
     for r in results:
         if r["success"] and r["awb_number"]:
@@ -588,13 +613,8 @@ async def download_label(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
-    """
-    Download shipping label(s) as PDF (or JSON if json_only=true).
-    Up to 100 AWB numbers per request.
-    """
     if not inp.awb_numbers:
         raise HTTPException(400, "No AWB numbers provided")
-
     if len(inp.awb_numbers) > 100:
         raise HTTPException(400, "Maximum 100 AWB numbers per label request")
 
@@ -602,7 +622,6 @@ async def download_label(
     result = await client.download_label(inp.awb_numbers, json_only=inp.json_only)
 
     if isinstance(result, bytes):
-        # Return raw PDF
         return Response(
             content=result,
             media_type="application/pdf",
@@ -620,14 +639,8 @@ async def download_manifest(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
-    """
-    Generate manifest for a list of AWB numbers.
-    A manifest is needed before handover to Ekart courier.
-    Up to 100 AWB numbers per request.
-    """
     if not inp.awb_numbers:
         raise HTTPException(400, "No AWB numbers provided")
-
     if len(inp.awb_numbers) > 100:
         raise HTTPException(400, "Maximum 100 AWB numbers per manifest")
 
@@ -644,14 +657,6 @@ async def ndr_action(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
-    """
-    Take action on a Non-Delivery Report (NDR) shipment.
-
-    ndr_action values:
-      - RE_ATTEMPT    → schedule re-delivery (provide preferred_date: YYYY-MM-DD)
-      - RTO           → initiate Return to Origin
-      - CONFIRM_DELIVERY → mark as customer confirmed delivery
-    """
     valid_actions = ["RE_ATTEMPT", "RTO", "CONFIRM_DELIVERY"]
     if inp.action not in valid_actions:
         raise HTTPException(400, f"Invalid NDR action. Must be one of: {', '.join(valid_actions)}")
@@ -664,7 +669,6 @@ async def ndr_action(
         preferred_date=inp.preferred_date,
     )
 
-    # If RTO, update order state in DB
     if inp.action == "RTO" and not result.get("error"):
         row = db.execute(
             text('SELECT "OrderId" FROM twam."Orders" WHERE "TrackingId" = :tid AND "DeletedInd" = false LIMIT 1'),
@@ -692,10 +696,6 @@ async def check_serviceability(
     pincode: str,
     db: Session = Depends(get_db),
 ):
-    """
-    Check if a pincode is serviceable by Ekart (v2 API).
-    Returns COD availability and forward/reverse serviceability.
-    """
     if len(pincode) != 6 or not pincode.isdigit():
         return {"serviceable": False, "pincode": pincode, "message": "Invalid pincode (must be 6 digits)"}
 
@@ -711,10 +711,6 @@ async def check_serviceability_v3(
     inp: ServiceabilityV3Input,
     db: Session = Depends(get_db),
 ):
-    """
-    Check available courier partners for a pickup→drop pincode pair (v3 API).
-    Returns list of courier options with estimated delivery days.
-    """
     client = get_ekart_client_for_db(db)
     result = await client.check_serviceability_v3(
         pickup_pincode=inp.pickup_pincode,
@@ -734,10 +730,6 @@ async def get_shipping_estimate(
     inp: ShippingEstimateInput,
     db: Session = Depends(get_db),
 ):
-    """
-    Get estimated shipping charges for a shipment.
-    Useful for showing shipping costs at checkout.
-    """
     client = get_ekart_client_for_db(db)
     result = await client.get_shipping_estimate(
         pickup_pincode=inp.pickup_pincode,
@@ -757,10 +749,6 @@ async def set_dispatch_date(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
-    """
-    Set preferred pickup/dispatch date for delayed-dispatch shipments.
-    dispatch_date format: YYYY-MM-DD
-    """
     if not inp.awb_numbers:
         raise HTTPException(400, "No AWB numbers provided")
 
@@ -773,15 +761,11 @@ async def set_dispatch_date(
 
 @router.get("/CODReport")
 def get_cod_report(
-    start_date: Optional[str] = None,  # YYYY-MM-DD
+    start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
-    """
-    COD (Cash on Delivery) collection report.
-    Shows delivered COD orders with amounts, from our DB + Ekart tracking data.
-    """
     date_filter = ""
     params: dict = {}
 
@@ -794,16 +778,10 @@ def get_cod_report(
 
     rows = db.execute(text(f"""
         SELECT
-            o."OrderId",
-            o."OrderNumber",
-            o."TrackingId",
-            o."TotalAmount",
-            o."PaymentMethod",
-            o."DeliveredDate",
-            o."State",
-            a."Name" AS customer_name,
-            a."Phone" AS customer_phone,
-            a."City"
+            o."OrderId", o."OrderNumber", o."TrackingId",
+            o."TotalAmount", o."PaymentMethod", o."DeliveredDate",
+            o."State", a."Name" AS customer_name,
+            a."Phone" AS customer_phone, a."City"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
         WHERE o."PaymentMethod" = 'COD'
@@ -830,15 +808,113 @@ def get_cod_report(
         for r in rows
     ]
 
-    total_cod = sum(i["codAmount"] for i in items)
+    return {
+        "count":     len(items),
+        "totalCOD":  sum(i["codAmount"] for i in items),
+        "currency":  "INR",
+        "startDate": start_date,
+        "endDate":   end_date,
+        "orders":    items,
+    }
+
+
+# ── Register Pickup Address with Ekart ───────────────────────────────────────
+
+class RegisterAddressInput(BaseModel):
+    alias: str                        # Short name to identify this warehouse e.g. "TWAM-HYD"
+    phone: str
+    address_line1: str
+    pincode: str
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    country: str = "India"
+
+
+@router.post("/RegisterAddress")
+async def register_ekart_address(
+    inp: RegisterAddressInput,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_admin_user),
+):
+    """
+    Register your warehouse pickup/return address with Ekart (POST /api/v2/address).
+
+    Call this ONCE after setting up ShipmentConfigurations. On success,
+    Ekart registers the address under the given alias. The alias is then
+    automatically saved to ShipmentConfigurations.PickupAlias so all future
+    shipments send {"name": alias} instead of the full address object —
+    resolving SWIFT_RESOURCE_NOT_FOUND_EXCEPTION.
+
+    Use a meaningful alias like "TWAM-HYD-WH" (brand + city + warehouse).
+    """
+    client = get_ekart_client_for_db(db)
+    result = await client.register_address(
+        alias=inp.alias,
+        phone=inp.phone,
+        address_line1=inp.address_line1,
+        pincode=inp.pincode,
+        address_line2=inp.address_line2,
+        city=inp.city,
+        state=inp.state,
+        country=inp.country,
+    )
+
+    if result.get("status"):
+        # Save alias to ShipmentConfigurations so shipments use it automatically
+        from app.shipment.config_model import ShipmentConfigurations
+        from sqlalchemy import or_, func as sa_func
+        row = db.query(ShipmentConfigurations).filter(
+            ShipmentConfigurations.deliveryAgent.ilike("EKart%"),
+            ShipmentConfigurations.deletedInd == False,
+            or_(
+                ShipmentConfigurations.stateId == None,  # noqa: E711
+                sa_func.lower(ShipmentConfigurations.stateId) == "active",
+            ),
+        ).first()
+        if row:
+            row.pickupAlias = result.get("alias") or inp.alias
+            row.modifiedDate = datetime.now(timezone.utc)
+            db.commit()
+            print(f"[Ekart] Pickup alias '{row.pickupAlias}' saved to ShipmentConfigurations")
 
     return {
-        "count":       len(items),
-        "totalCOD":    total_cod,
-        "currency":    "INR",
-        "startDate":   start_date,
-        "endDate":     end_date,
-        "orders":      items,
+        "success": result.get("status", False),
+        "alias":   result.get("alias", inp.alias),
+        "remark":  result.get("remark", ""),
+        "alias_saved_to_config": result.get("status", False),
+    }
+
+
+@router.get("/RegisteredAddresses")
+async def list_registered_addresses(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_admin_user),
+):
+    """
+    List all pickup/return addresses registered with your Ekart account.
+    Shows alias names you can use in shipment creation.
+    Also shows the currently configured alias from ShipmentConfigurations.
+    """
+    client = get_ekart_client_for_db(db)
+    addresses = await client.list_addresses()
+
+    # Also show current alias from DB config
+    from app.shipment.config_model import ShipmentConfigurations
+    from sqlalchemy import or_, func as sa_func
+    row = db.query(ShipmentConfigurations).filter(
+        ShipmentConfigurations.deliveryAgent.ilike("EKart%"),
+        ShipmentConfigurations.deletedInd == False,
+        or_(
+            ShipmentConfigurations.stateId == None,  # noqa: E711
+            sa_func.lower(ShipmentConfigurations.stateId) == "active",
+        ),
+    ).first()
+
+    return {
+        "current_alias_in_config": row.pickupAlias if row else None,
+        "alias_mode_active": bool(row and row.pickupAlias),
+        "registered_addresses": addresses,
     }
 
 
@@ -906,7 +982,6 @@ def update_shipment_config(
     row.modifiedDate = datetime.now(timezone.utc)
     db.commit()
 
-    # Bust token cache so next call re-authenticates with new credentials
     from app.ekart.client import _token_cache
     _token_cache.pop(row.clientId, None)
 
@@ -925,12 +1000,17 @@ async def ekart_readiness(
     Also checks SMS and SMTP configuration.
     """
     from app.shipment.config_model import ShipmentConfigurations
-    from sqlalchemy import text
 
+    # FIX 3: same stateId bug as _build_return_address_from_db — use NULL-safe filter.
+    # Original stateId == "Active" caused Readiness to always report mock_mode=True
+    # even when config was correctly set up with a different case or NULL StateId.
     row = db.query(ShipmentConfigurations).filter(
         ShipmentConfigurations.deliveryAgent.ilike("EKart%"),
         ShipmentConfigurations.deletedInd == False,
-        ShipmentConfigurations.stateId == "Active",
+        or_(
+            ShipmentConfigurations.stateId == None,  # noqa: E711
+            sa_func.lower(ShipmentConfigurations.stateId) == "active",
+        ),
     ).first()
 
     if not row:
@@ -940,7 +1020,6 @@ async def ekart_readiness(
             "missing_required": ["No active EKart config in ShipmentConfigurations — run ekart_setup.sql"],
         }
 
-    # Check Ekart config completeness
     ekart_missing = []
     if not row.accessTokenURL:    ekart_missing.append("AccessTokenURL")
     if not row.createShipmentURL: ekart_missing.append("CreateShipmentURL")
@@ -953,23 +1032,21 @@ async def ekart_readiness(
     if not row.returnPinCode:      ekart_missing.append("ReturnPinCode")
     if not row.returnPhone:        ekart_missing.append("ReturnPhone")
 
-    # Check SMS config
-    sms_settings = {}
-    try:
-        sms_rows = db.execute(text(
-            'SELECT "Key","Value" FROM twam."AppSettings" WHERE "Key" ILIKE \'SMS_%\' AND "DeletedInd"=false'
-        )).fetchall()
-        sms_settings = {r[0]: r[1] for r in sms_rows}
-    except Exception:
-        pass
-
     sms_missing = []
-    if not sms_settings.get("SMS_API_URL") or "YOUR_SMS_DOMAIN" in (sms_settings.get("SMS_API_URL") or ""):
-        sms_missing.append("SMS_API_URL")
-    if not sms_settings.get("SMS_API_USERNAME") or sms_settings.get("SMS_API_USERNAME") == "YOUR_SMS_USERNAME":
-        sms_missing.append("SMS_API_USERNAME")
-    if not sms_settings.get("SMS_API_PASSWORD") or sms_settings.get("SMS_API_PASSWORD") == "YOUR_SMS_PASSWORD":
-        sms_missing.append("SMS_API_PASSWORD")
+    try:
+        from app.sms.models import SmsCredential
+        sms_cred = db.query(SmsCredential).filter(
+            SmsCredential.isActive   == True,
+            SmsCredential.deletedInd == False,
+        ).first()
+        if not sms_cred or not sms_cred.apiUrl:
+            sms_missing.append("ApiUrl")
+        if not sms_cred or not sms_cred.username:
+            sms_missing.append("Username")
+        if not sms_cred or not sms_cred.password:
+            sms_missing.append("Password")
+    except Exception:
+        sms_missing.append("SmsCredential (table not found)")
 
     client = get_ekart_client_for_db(db)
 

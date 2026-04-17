@@ -12,6 +12,7 @@ class People(Base):
     lastName = Column("LastName", String, nullable=True)
     emailId = Column("EmailId", String, nullable=True)
     phoneNumber = Column("PhoneNumber", String, nullable=True)
+    profileImageUrl = Column("ProfileImageUrl", String, nullable=True)
     userProfileId = Column("UserProfileId", String, nullable=True)
     isActive = Column("IsActive", Boolean, nullable=True)
     roleId = Column("RoleId", Integer, nullable=True)
