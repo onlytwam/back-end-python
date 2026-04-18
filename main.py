@@ -15,6 +15,10 @@ Changes vs previous version:
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -229,3 +233,8 @@ def root():
 
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    print("VALIDATION ERROR:", exc.errors())  # ← shows exact field + reason
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
