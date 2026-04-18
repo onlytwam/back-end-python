@@ -2,15 +2,6 @@
 app/auth/security.py
 ─────────────────────
 JWT creation/verification and password utilities.
-
-Changes vs original:
-  - PASSWORD_CIPHER and CLIENT_ENCRYPT_KEY are no longer hardcoded.
-    They are loaded at runtime from the AppSettings DB cache
-    (app/shared/app_settings.py).  On first boot seed_defaults() inserts
-    the original values so existing data stays compatible.
-  - JWT config (SECRET_KEY, ALGORITHM, etc.) still comes from config.py /
-    environment variables — those are infrastructure-level secrets that
-    belong in .env, not in user-editable DB rows.
 """
 import os
 import base64
@@ -25,39 +16,28 @@ from cryptography.hazmat.primitives import padding
 
 from config import settings
 
-# ── JWT Config (from .env via config.py — no hardcoded defaults) ─────────────
+# ── JWT Config ────────────────────────────────────────────────────────────────
 SECRET_KEY      = settings.secret_key
 ALGORITHM       = settings.jwt_algorithm
 ISSUER          = settings.jwt_issuer
 AUDIENCE        = settings.jwt_audience
-EXPIRES_MINUTES = settings.jwt_expires_minutes
+EXPIRES_MINUTES = settings.jwt_expires_minutes   # now 525600 = 1 year
 
 
-# ── Runtime secret accessors (read from AppSettings cache) ───────────────────
+# ── Runtime secret accessors ──────────────────────────────────────────────────
 
 def _get_password_cipher() -> str:
-    """
-    TWAM server-side password hash cipher.
-    Loaded from AppSettings key 'password_cipher'.
-    Falls back to the original hardcoded value so existing password hashes
-    remain valid before the first DB migration.
-    """
     from app.shared.app_settings import get_setting
     return get_setting("password_cipher", "TWAM@D&E*V@Tr@d@1#2$30%")
 
 
 def _get_client_encrypt_key() -> bytes:
-    """
-    AES-CBC key Angular uses to pre-encrypt passwords before sending.
-    Loaded from AppSettings key 'client_encrypt_key'.
-    """
     from app.shared.app_settings import get_setting
     raw = get_setting("client_encrypt_key", "8080808080808080")
     return raw.encode("utf-8")
 
 
 # ── Client password decryption ────────────────────────────────────────────────
-# Angular CryptoService.encryptData() uses AES-CBC with the client_encrypt_key.
 
 def _decrypt_client_password(cipher_text: str) -> str:
     key       = _get_client_encrypt_key()
@@ -130,11 +110,6 @@ def verify_password(
     stored_hash: str,
     is_client_encrypted: bool = True,
 ) -> bool:
-    """
-    Full TWAM verification pipeline.
-    is_client_encrypted=True  → AES-decrypt first (Angular login flow)
-    is_client_encrypted=False → use plain text directly (admin/testing)
-    """
     try:
         plain        = _decrypt_client_password(encrypted_password) if is_client_encrypted else encrypted_password
         intermediate = generate_sha256_hash_with_salt(plain, _get_password_cipher())
@@ -176,18 +151,43 @@ def create_access_token(user_claims: dict, expires_minutes: int = EXPIRES_MINUTE
 
 
 def decode_token(token: str) -> dict:
-    """Decode a regular login/access token — requires email_id claim."""
-    return jwt.decode(
+    """Decode and validate token. Also checks blacklist."""
+    payload = jwt.decode(
         token, SECRET_KEY, algorithms=[ALGORITHM],
         audience=AUDIENCE, issuer=ISSUER,
         options={"require": ["exp", "iss", "aud", "email_id"]},
     )
+    return payload
 
 
 def decode_reset_token(token: str) -> dict:
-    """Decode a password-reset token — only requires exp, iss, aud (no email_id)."""
+    """Decode a password-reset token — only requires exp, iss, aud."""
     return jwt.decode(
         token, SECRET_KEY, algorithms=[ALGORITHM],
         audience=AUDIENCE, issuer=ISSUER,
         options={"require": ["exp", "iss", "aud"]},
     )
+
+
+# ── Blacklist helpers (used by dependencies.py & logout router) ───────────────
+
+def is_token_blacklisted(token: str, db) -> bool:
+    """Returns True if this token has been logged out."""
+    from app.auth.models import TokenBlacklist
+    return db.query(TokenBlacklist).filter(TokenBlacklist.token == token).first() is not None
+
+
+def blacklist_token(token: str, email: str, db) -> None:
+    """Add token to blacklist (called on logout)."""
+    from app.auth.models import TokenBlacklist
+    from datetime import timezone
+    # Avoid duplicate entries
+    exists = db.query(TokenBlacklist).filter(TokenBlacklist.token == token).first()
+    if not exists:
+        entry = TokenBlacklist(
+            token=token,
+            email=email,
+            blacklisted_at=datetime.now(timezone.utc),
+        )
+        db.add(entry)
+        db.commit()

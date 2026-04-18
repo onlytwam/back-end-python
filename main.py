@@ -137,28 +137,9 @@ All protected endpoints require a Bearer JWT token.
     lifespan=lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        # ── Android APK (Capacitor) ──────────────────
-        "http://localhost",
-        "https://localhost",
-        "capacitor://localhost",    # iOS Capacitor
-
-        # ── Local Dev ────────────────────────────────
-        "http://localhost:5173",    # Vite dev server
-        "http://localhost:3000",
-
-        # ── Azure Frontend (ADD THIS!) ────────────────
-        "https://lemon-ground-09a562900.7.azurestaticapps.net",
-
-        # ── Production Domain (list each explicitly) ──
-        "https://twam.in",
-        "https://www.twam.in",
-        "https://admin.twam.in",    # add any other subdomains
-        "https://app.twam.in",
-    ],
+    allow_origins=settings.cors_origins_list,   # ← reads from config, not hardcoded
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

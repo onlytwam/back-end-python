@@ -2,16 +2,12 @@
 app/auth/models.py
 ──────────────────
 SQLAlchemy models for the auth schema.
-
-Tables:
-  auth.IdentityUser  — ASP.NET Core Identity user table (unchanged)
-  auth.OtpStore      — short-lived OTPs supporting email and phone identifiers
 """
 
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from database import Base
@@ -70,17 +66,6 @@ class IdentityUser(Base):
 
 
 class OtpStore(Base):
-    """
-    Short-lived OTP records for all auth flows.
-
-    Identifier     — email address OR 10-digit phone number
-    IdentifierType — 'email' | 'phone'
-    Purpose        — 'guest_checkout' | 'forgot_password' | 'login' | 'verify'
-    UserId         — auth.IdentityUser.Id (set when user exists; used by
-                     forgot_password to resolve the account via phone)
-    ExpiresAt      — UTC expiry; cleaned up inline on every read
-    Unique: one active OTP per (Identifier, Purpose) — re-sending refreshes row.
-    """
     __tablename__ = "OtpStore"
     __table_args__ = (
         UniqueConstraint("Identifier", "Purpose", name="uq_otpstore_identifier_purpose"),
@@ -99,3 +84,21 @@ class OtpStore(Base):
     def __repr__(self):
         return (f"<OtpStore(OtpId={self.OtpId}, Identifier={self.Identifier!r}, "
                 f"Purpose={self.Purpose!r})>")
+
+
+class TokenBlacklist(Base):
+    """
+    Stores logged-out JWT tokens until they are manually cleaned.
+    token column uses Text (not String(255)) because JWTs are 500-1000+ chars.
+    """
+    __tablename__  = "token_blacklist"
+    __table_args__ = {"schema": "auth"}
+
+    id             = Column(Integer,                 primary_key=True, autoincrement=True)
+    token          = Column(Text,                    nullable=False, unique=True, index=True)  # ✅ Text not String(255)
+    email          = Column(String(255),             nullable=True, index=True)
+    blacklisted_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at     = Column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self):
+        return f"<TokenBlacklist(id={self.id}, email={self.email!r})>"

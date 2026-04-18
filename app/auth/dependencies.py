@@ -1,20 +1,19 @@
 """
-app/auth/dependencies.py — Fixed
-Fixes:
-  1. RoleId is stored as string in JWT ("2") but int expected — safe conversion
-  2. 401 response code added (frontend handles 401 redirect); 403 for role failures
-  3. get_current_user returns 401 (not 403) for missing/expired tokens
-     so the frontend axios interceptor can auto-redirect to login
+app/auth/dependencies.py
+─────────────────────────
+Checks JWT validity + token blacklist on every protected request.
 """
 
 from typing import Optional
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import jwt
 
-from .security import decode_token
+from .security import decode_token, is_token_blacklisted
 from .schemas import CurrentUser
+from database import SessionLocal
+
 
 # ── Role constants ─────────────────────────────────────────────────────────────
 
@@ -47,11 +46,13 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 # ── get_current_user ───────────────────────────────────────────────────────────
 
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> CurrentUser:
     """
-    Returns HTTP 401 for missing/expired tokens (triggers frontend redirect).
-    Returns HTTP 403 for invalid tokens or missing claims.
+    Validates JWT and checks the token blacklist.
+    Returns 401 for missing/expired/blacklisted tokens.
+    Returns 403 for invalid tokens.
     """
     if credentials is None or not credentials.credentials:
         raise HTTPException(
@@ -60,8 +61,22 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    token = credentials.credentials
+
+    # ✅ Check blacklist (logged-out tokens)
+    db = SessionLocal()
     try:
-        payload = decode_token(credentials.credentials)
+        if is_token_blacklisted(token, db):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session ended. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    finally:
+        db.close()
+
+    try:
+        payload = decode_token(token)
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -81,38 +96,37 @@ async def get_current_user(
             detail="Token missing required claim: email_id",
         )
 
-    # RoleId is stored as string in JWT ("2") — safely convert
     role_id_raw = payload.get("RoleId") or payload.get("roleId") or 0
     try:
         role_id = int(role_id_raw)
     except (TypeError, ValueError):
         role_id = 0
 
-    # user_id comes from "sub" claim = UserProfileId (GUID)
     user_id = str(payload.get("sub") or payload.get("UserId") or "")
 
     return CurrentUser(
-        user_id    = user_id,
-        email      = email_id,
-        role_id    = role_id,
-        role_name  = payload.get("RoleName") or payload.get("role") or "",
-        first_name = payload.get("FirstName") or payload.get("given_name") or "",
-        last_name  = payload.get("LastName")  or payload.get("family_name") or "",
-        full_name  = payload.get("name") or "",
+        user_id           = user_id,
+        email             = email_id,
+        role_id           = role_id,
+        role_name         = payload.get("RoleName") or payload.get("role") or "",
+        first_name        = payload.get("FirstName") or payload.get("given_name") or "",
+        last_name         = payload.get("LastName")  or payload.get("family_name") or "",
+        full_name         = payload.get("name") or "",
         profile_image_url = payload.get("ProfileImageUrl") or payload.get("profile_image_url") or "",
-        tenant_id  = str(payload.get("TenantId") or "1"),
+        tenant_id         = str(payload.get("TenantId") or "1"),
     )
 
 
 # ── Optional user ──────────────────────────────────────────────────────────────
 
 async def get_optional_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> Optional[CurrentUser]:
     if credentials is None or not credentials.credentials:
         return None
     try:
-        return await get_current_user(credentials)
+        return await get_current_user(request, credentials)
     except HTTPException:
         return None
 
@@ -141,7 +155,6 @@ def require_roles(*allowed_role_ids: int):
 async def get_current_admin_user(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> CurrentUser:
-    """Requires Super Admin or Order Manager."""
     allowed = {Roles.SUPER_ADMIN, Roles.ORDER_MANAGER}
     if current_user.role_id not in allowed:
         raise HTTPException(

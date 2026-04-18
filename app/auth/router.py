@@ -35,6 +35,10 @@ from .repository import (
 from .security import create_access_token, decode_token, decode_reset_token, EXPIRES_MINUTES
 from .dependencies import get_current_user, require_roles, Roles, CurrentUser
 
+from typing import Optional as _Optional
+from fastapi.security import HTTPBearer as _HTTPBearer, HTTPAuthorizationCredentials as _Creds
+from app.auth.security import blacklist_token as _blacklist_token
+
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
@@ -579,3 +583,25 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
 
     _db_otp_delete(db, email, purpose="guest_checkout")
     return {"success": True, "message": "OTP verified. You may now reset your password."}
+
+_bearer_scheme = _HTTPBearer(auto_error=False)
+
+
+@router.post("/logout", summary="Logout — invalidate JWT token")
+async def logout(
+    credentials: _Optional[_Creds] = Depends(_bearer_scheme),
+    current_user: CurrentUser      = Depends(get_current_user),
+    db: Session                    = Depends(get_db),
+):
+    """
+    Adds the current token to the blacklist table.
+    After this, the token returns 401 on every subsequent request.
+    The frontend/mobile app should delete the token from local storage after calling this.
+    """
+    if credentials and credentials.credentials:
+        _blacklist_token(
+            token=credentials.credentials,
+            email=current_user.email,
+            db=db,
+        )
+    return {"success": True, "message": "Logged out successfully."}
