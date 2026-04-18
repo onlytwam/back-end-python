@@ -1,18 +1,15 @@
 """
 config.py
 ──────────
-Centralised configuration using pydantic-settings.
-All environment variables are validated at startup — missing required
-vars raise a clear RuntimeError instead of failing silently later.
+Reads ALL values from environment variables.
+  Local dev  → .env file
+  Production → Azure App Settings
 
-Usage:
-    from config import settings
-    print(settings.database_url)
+No hardcoded defaults. If a value is missing the app fails fast on startup.
 """
 
 from typing import List
-from pydantic import field_validator
-from pydantic import ConfigDict
+from pydantic import field_validator, ConfigDict
 from pydantic_settings import BaseSettings
 
 
@@ -24,42 +21,22 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Database ──────────────────────────────────────────────────────────────
-    database_url: str
-
-    # ── JWT ───────────────────────────────────────────────────────────────────
+    # Values come entirely from .env or Azure App Settings
+    database_url:        str
     secret_key:          str
-    jwt_algorithm:       str = "HS512"
-    jwt_issuer:          str = "http://127.0.0.1:8000"
-    jwt_audience:        str = "twam-web-portal"
-    jwt_expires_minutes: int = 60
-
-    # ── CORS ──────────────────────────────────────────────────────────────────
-    # Comma-separated origins.
-    # Example: "https://app.twam.in,https://admin.twam.in,capacitor://localhost"
-    cors_origins: str = "http://localhost:5173,http://localhost:3000,capacitor://localhost,http://localhost,https://localhost,"
-
-    # ── File Storage ─────────────────────────────────────────────────────────
-    base_url: str = ""
-
-    # ── App ───────────────────────────────────────────────────────────────────
-    app_env: str = "development"
+    jwt_algorithm:       str
+    jwt_issuer:          str
+    jwt_audience:        str
+    jwt_expires_minutes: int
+    cors_origins:        str
+    base_url:            str
+    app_env:             str
 
     @field_validator("secret_key")
     @classmethod
     def secret_key_must_exist(cls, v: str) -> str:
         if not v or len(v) < 32:
-            raise ValueError(
-                "SECRET_KEY must be set in .env and be at least 32 characters. "
-                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
-            )
-        return v
-
-    @field_validator("database_url")
-    @classmethod
-    def database_url_must_exist(cls, v: str) -> str:
-        if not v:
-            raise ValueError("DATABASE_URL must be set in .env")
+            raise ValueError("SECRET_KEY must be at least 32 characters.")
         return v
 
     @property
@@ -71,5 +48,4 @@ class Settings(BaseSettings):
         return self.app_env.lower() == "production"
 
 
-# ── Singleton instance ────────────────────────────────────────────────────────
 settings = Settings()
