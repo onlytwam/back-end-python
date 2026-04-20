@@ -1,30 +1,33 @@
 import os
 import json
 import shutil
+from uuid import uuid4
+from typing import Optional, Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Form, UploadFile, File
 from sqlalchemy.orm import Session
-from typing import Optional
+
 from database import get_db
 from . import models, schemas, repository
-from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
+from app.auth.dependencies import get_current_user
 
 router = APIRouter(
-    prefix="/api/Brand",
+    prefix="/api/Brand",   # Keep this as it is (matches your frontend)
     tags=["Brand"],
 )
 
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = "uploads/brand"   # Better to separate brand uploads
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# ── PUBLIC: list / fetch brands (guests can browse) ───────────────────────────
-
+# ── GET ALL BRANDS ─────────────────────────────
 @router.get("", response_model=schemas.BrandListResponse)
 def get_brands(
     Filters:         Optional[str]  = Query(None, alias="Filters"),
     Order_Ascending: Optional[bool] = Query(None, alias="Order.Ascending"),
     Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
-    Page_Index:      Optional[int]  = Query(None, alias="Page.Index", ge=1),
-    Page_Size:       Optional[int]  = Query(None, alias="Page.Size", ge=1),
+    Page_Index:      Optional[int]  = Query(1, alias="Page.Index", ge=1),
+    Page_Size:       Optional[int]  = Query(20, alias="Page.Size", ge=1),
     db: Session = Depends(get_db),
 ):
     parsed_filters = None
@@ -33,13 +36,10 @@ def get_brands(
             parsed_filters = json.loads(Filters)
             if isinstance(parsed_filters, dict):
                 parsed_filters = [parsed_filters]
-        except (json.JSONDecodeError, ValueError):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid Filters format. Expected JSON array of {property, comparison, value}.",
-            )
+        except:
+            raise HTTPException(status_code=400, detail="Invalid Filters format.")
 
-    brands = repository.get_all_brands(
+    result = repository.get_all_brands(
         db=db,
         filters=parsed_filters,
         order_ascending=Order_Ascending,
@@ -48,26 +48,13 @@ def get_brands(
         page_size=Page_Size,
     )
 
-    response_list = [
-        {
-            "brandId":          brand.brandId,
-            "brandName":        brand.brandName,
-            "brandDescription": brand.brandDescription,
-            "brandImage":       brand.brandImage,
-            "brandLogo":        brand.brandLogo,
-            "userProfileId":    brand.userProfileId,
-            "state":            brand.state,
-            "isActive":         brand.isActive,
-            "filters":          None,
-            "order":            None,
-            "page":             None,
-        }
-        for brand in brands
-    ]
-
-    return {"count": len(response_list), "list": response_list, "parameters": None}
-
-
+    #  Correct handling
+    return {
+        "count": result["count"],
+        "list": result["list"],
+        "parameters": None
+    }
+# ── GET SINGLE BRAND ─────────────────────────────
 @router.get("/{brand_id}", response_model=schemas.BrandResponse)
 def get_brand(brand_id: int, db: Session = Depends(get_db)):
     brand = repository.get_brand_by_id(db, brand_id)
@@ -76,101 +63,80 @@ def get_brand(brand_id: int, db: Session = Depends(get_db)):
     return brand
 
 
-# ── PROTECTED: create / update / delete (admin only) ─────────────────────────
-
-@router.post(
-    "/",
-    response_model=schemas.BrandResponse,
-    status_code=201,
-    dependencies=[Depends(get_current_user)],
-)
+# ── CREATE BRAND ─────────────────────────────
+@router.post("/", response_model=schemas.BrandResponse, status_code=201)
 def create_brand(
-    brandName:        str                  = Form(...),
-    brandDescription: Optional[str]        = Form(None),
-    userProfileId:    Optional[str]        = Form(None),
-    state:            Optional[str]        = Form(None),
-    isActive:         bool                 = Form(True),
-    brandLogo:        Optional[UploadFile] = File(None),
-    brandImage:       Optional[UploadFile] = File(None),
+    brandName:        Annotated[str, Form(...)],
+    brandDescription: Annotated[Optional[str], Form()] = None,
+    websiteUrl:       Annotated[Optional[str], Form()] = None,
+    isActive:         Annotated[bool, Form()] = True,
+    brandLogo:        Annotated[Optional[UploadFile], File()] = None,
     db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),   # Keep auth
 ):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    brand_data: dict = {
+    brand_data = {
         "brandName":        brandName,
         "brandDescription": brandDescription,
-        "userProfileId":    userProfileId,
-        "state":            state,
+        "websiteUrl":       websiteUrl,
         "isActive":         isActive,
-        "brandLogo":        None,
-        "brandImage":       None,
     }
 
+    # Handle Logo Upload with unique filename
     if brandLogo and brandLogo.filename:
-        logo_path = os.path.join(UPLOAD_DIR, brandLogo.filename)
-        with open(logo_path, "wb") as f:
+        ext = brandLogo.filename.split(".")[-1].lower()
+        filename = f"{uuid4()}.{ext}"
+        file_path = os.path.join(UPLOAD_DIR, filename)
+
+        with open(file_path, "wb") as f:
             shutil.copyfileobj(brandLogo.file, f)
-        brand_data["brandLogo"] = logo_path
 
-    if brandImage and brandImage.filename:
-        image_path = os.path.join(UPLOAD_DIR, brandImage.filename)
-        with open(image_path, "wb") as f:
-            shutil.copyfileobj(brandImage.file, f)
-        brand_data["brandImage"] = image_path
+        brand_data["brandLogo"] = f"/uploads/brand/{filename}"   # Store relative path
 
-    return repository.create_brand(db, brand_data)
+    created_brand = repository.create_brand(db, brand_data)
+    return created_brand
 
 
-@router.put(
-    "/{brand_id}",
-    response_model=schemas.BrandResponse,
-    dependencies=[Depends(get_current_user)],
-)
+# ── UPDATE BRAND ─────────────────────────────
+@router.put("/{brand_id}", response_model=schemas.BrandResponse)
 def update_brand(
     brand_id:         int,
-    brandName:        Optional[str]        = Form(None),
-    brandDescription: Optional[str]        = Form(None),
-    userProfileId:    Optional[str]        = Form(None),
-    state:            Optional[str]        = Form(None),
-    isActive:         Optional[bool]       = Form(None),
-    brandLogo:        Optional[UploadFile] = File(None),
-    brandImage:       Optional[UploadFile] = File(None),
+    brandName:        Annotated[Optional[str], Form()] = None,
+    brandDescription: Annotated[Optional[str], Form()] = None,
+    websiteUrl:       Annotated[Optional[str], Form()] = None,
+    isActive:         Annotated[Optional[bool], Form()] = None,
+    brandLogo:        Annotated[Optional[UploadFile], File()] = None,
     db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
 ):
     existing = repository.get_brand_by_id(db, brand_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Brand not found")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    update_data: dict = {}
+    if brandName is not None:        update_data["brandName"] = brandName
+    if brandDescription is not None: update_data["brandDescription"] = brandDescription
+    if websiteUrl is not None:       update_data["websiteUrl"] = websiteUrl
+    if isActive is not None:         update_data["isActive"] = isActive
 
-    brand_data: dict = {}
-    if brandName        is not None: brand_data["brandName"]        = brandName
-    if brandDescription is not None: brand_data["brandDescription"] = brandDescription
-    if userProfileId    is not None: brand_data["userProfileId"]    = userProfileId
-    if state            is not None: brand_data["state"]            = state
-    if isActive         is not None: brand_data["isActive"]         = isActive
-
+    # Handle new Logo upload (optional)
     if brandLogo and brandLogo.filename:
-        logo_path = os.path.join(UPLOAD_DIR, brandLogo.filename)
-        with open(logo_path, "wb") as f:
+        ext = brandLogo.filename.split(".")[-1].lower()
+        filename = f"{uuid4()}.{ext}"
+        file_path = os.path.join(UPLOAD_DIR, filename)
+
+        with open(file_path, "wb") as f:
             shutil.copyfileobj(brandLogo.file, f)
-        brand_data["brandLogo"] = logo_path
 
-    if brandImage and brandImage.filename:
-        image_path = os.path.join(UPLOAD_DIR, brandImage.filename)
-        with open(image_path, "wb") as f:
-            shutil.copyfileobj(brandImage.file, f)
-        brand_data["brandImage"] = image_path
+        update_data["brandLogo"] = f"/uploads/brand/{filename}"
 
-    return repository.update_brand(db, brand_id, brand_data)
+    updated_brand = repository.update_brand(db, brand_id, update_data)
+    return updated_brand
 
 
-@router.delete(
-    "/{brand_id}",
-    status_code=204,
-    dependencies=[Depends(get_current_user)],
-)
-def delete_brand(brand_id: int, db: Session = Depends(get_db)):
+# ── DELETE BRAND ─────────────────────────────
+@router.delete("/{brand_id}", status_code=204)
+def delete_brand(brand_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     result = repository.delete_brand(db, brand_id)
     if not result:
         raise HTTPException(status_code=404, detail="Brand not found")
+    return None
