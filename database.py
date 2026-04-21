@@ -25,6 +25,6 @@ def get_db():
 
 def create_schemas():
     with engine.connect() as conn:
-        for schema in ("mdm", "twam", "payment", "shipment", "auth", "email", "sms"):
+        for schema in ("mdm", "twam", "payment", "shipment", "auth", "email", "sms", "speech"):
             conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
         conn.commit()

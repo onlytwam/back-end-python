@@ -65,8 +65,7 @@ from app.newsletter.models           import Newsletter
 from app.sms.models                  import SmsCredential, SmsMessageTemplate, SmsLog
 from app.whatsapp.models             import WhatsAppLog, WhatsAppCredential
 from app.auth.models                 import OtpStore
-
-
+from app.speech.models               import AzureSpeechConfig
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -162,7 +161,7 @@ from app.userdashboard.router        import router as userdashboard_router
 from app.userreview.router           import router as userreview_router
 from app.sendemail.router            import router as email_router
 from app.newsletter.router           import router as newsletter_router
-
+from app.speech.router               import router as speech_router
 # ── Routers — Protected ───────────────────────────────────────────────────────
 from app.address.router              import router as address_router
 from app.cart.router                 import router as cart_router
@@ -220,7 +219,7 @@ for _router in (
     userrole_router, wishlist_router, bulkimport_router,
     newsletter_router,
     ekart_router, ekart_webhook_router,
-    payment_router,sms_template_router, sms_credential_router,
+    payment_router,sms_template_router, sms_credential_router, speech_router,
 ):
     app.include_router(_router)
 
