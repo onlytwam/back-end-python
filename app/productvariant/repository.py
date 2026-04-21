@@ -290,7 +290,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             b."brandName"
         FROM twam."ProductVariants" pv
         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
-        LEFT JOIN mdm.brands b ON b."brandId" = p."BrandId"
+        LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
         WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL) AND {where}
         LIMIT 1
     """
@@ -694,7 +694,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
          AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
         LEFT JOIN mdm."Size" s         ON s."SizeId"      = pvd."Size"
         LEFT JOIN mdm."CupSize" cs     ON cs."CupSizeId"  = pvd."CupSize"
-        LEFT JOIN mdm.brands b         ON b."brandId"     = p."BrandId"
+        LEFT JOIN mdm."Brand" b         ON b."brandId"     = p."BrandId"
         LEFT JOIN twam."Category" pc   ON pc."CategoryId"  = p."CategoryId"
         LEFT JOIN twam."Category" cc   ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE {where}
@@ -772,7 +772,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
              AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
             LEFT JOIN mdm."Size" s         ON s."SizeId"     = pvd."Size"
             LEFT JOIN mdm."CupSize" cs     ON cs."CupSizeId" = pvd."CupSize"
-            LEFT JOIN mdm.brands b         ON b."brandId"    = p."BrandId"
+            LEFT JOIN mdm."Brand" b         ON b."brandId"    = p."BrandId"
             LEFT JOIN twam."Category" pc   ON pc."CategoryId"  = p."CategoryId"
             LEFT JOIN twam."Category" cc   ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
@@ -878,7 +878,7 @@ def get_new_arrivals(
         LEFT JOIN twam."ProductVariantDetail" pvd
           ON pvd."ProductVariantId" = pv."ProductVariantId"
          AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
-        LEFT JOIN mdm.brands b ON b."brandId" = p."BrandId"
+        LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
         WHERE {where}
     """
 
@@ -948,7 +948,7 @@ def get_new_arrivals(
              AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
             LEFT JOIN mdm."Size" s     ON s."SizeId"     = pvd."Size"
             LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
-            LEFT JOIN mdm.brands b     ON b."brandId"    = p."BrandId"
+            LEFT JOIN mdm."Brand" b     ON b."brandId"    = p."BrandId"
             WHERE {where}
             ORDER BY pv."ProductVariantId", pvd."ProductVariantDetailId" ASC NULLS LAST
         ) deduped

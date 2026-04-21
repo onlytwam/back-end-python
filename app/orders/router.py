@@ -21,6 +21,20 @@ def parse_filters(raw):
         return p if isinstance(p, list) else [p]
     except: raise HTTPException(400, "Invalid Filters format.")
 
+def normalize_filters(filters):
+    if not filters:
+        return filters
+
+    for f in filters:
+        if f.get("property"):
+            f["property"] = f["property"].lower()  # 🔥 FIX
+
+        if f.get("comparison") == "==":
+            f["comparison"] = "eq"  
+
+    return filters
+
+
 
 @router.get("", response_model=schemas.OrderListResponse)
 def get_order_list(
@@ -32,7 +46,7 @@ def get_order_list(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    filters = parse_filters(Filters) or []
+    filters = normalize_filters(parse_filters(Filters)) or []
     if current_user.role_id not in Roles.STAFF:
         filters.append({
             "property": "userProfileId",
@@ -57,7 +71,7 @@ def get_admin_order_list(
         Roles.INVENTORY_MANAGER, Roles.PRODUCT_MANAGER,
     )),
 ):
-    filters = parse_filters(Filters)
+    filters = normalize_filters(parse_filters(Filters))
     clean, sd, ed = [], None, None
     if filters:
         for f in filters:
@@ -76,7 +90,7 @@ def get_return_order_items(
     Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
     db: Session = Depends(get_db),
 ):
-    filters = parse_filters(Filters)
+    filters = normalize_filters(parse_filters(Filters))
     order_id, clean = None, []
     if filters:
         for f in filters:
