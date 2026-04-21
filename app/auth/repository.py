@@ -193,19 +193,12 @@ def _get_role_name(db: Session, role_id: int) -> str:
     
     return role.RoleName if role else ""
 
-
 def _increment_access_failed(db: Session, user: IdentityUser):
-    """
-    Increment failed access count and lock account if needed.
-    Uses ORM instead of raw SQL.
-    """
-    user.AccessFailedCount += 1
-    
-    # Lock account after 3 failed attempts
+    user.AccessFailedCount = (user.AccessFailedCount or 0) + 1
     if user.AccessFailedCount >= 3:
         user.IsActive = False
-    
     db.commit()
+    db.refresh(user)
 
 
 def _reset_access_failed(db: Session, user: IdentityUser):
@@ -227,10 +220,6 @@ class AuthResult:
 
 
 def authenticate_user(db: Session, username: str, encrypted_password: str) -> AuthResult:
-    """
-    Authenticate user with username and encrypted password.
-    IMPROVED: Uses ORM models instead of raw SQL and dictionaries.
-    """
     user = _get_identity_user_by_username(db, username)
     
     if not user:
@@ -238,8 +227,11 @@ def authenticate_user(db: Session, username: str, encrypted_password: str) -> Au
     
     if not user.IsActive:
         return AuthResult(False, "locked_out")
+
     
-    # Verify password
+    logger.debug(f"[Auth] stored hash prefix: {user.PasswordHash[:20] if user.PasswordHash else 'NULL'}")
+    logger.debug(f"[Auth] AccessFailedCount: {user.AccessFailedCount}")
+    
     is_valid = verify_password(
         encrypted_password, 
         user.PasswordHash, 
@@ -675,26 +667,17 @@ def update_identity_user_profile(
 
     return response
 
-
 def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
-    """
-    Create a new user account.
-    IMPROVED: Uses ORM model instead of raw INSERT statement.
-    """
     try:
         # Check for duplicate phone number
         if request.PhoneNumber:
             existing = db.query(IdentityUser).filter(
                 IdentityUser.PhoneNumber == request.PhoneNumber
             ).first()
-            
             if existing:
                 return {
                     "succeeded": False,
-                    "errors": [{
-                        "code": "DuplicatePhoneNumber",
-                        "description": "Phone number is already taken."
-                    }]
+                    "errors": [{"code": "DuplicatePhoneNumber", "description": "Phone number is already taken."}]
                 }
         
         # Check for duplicate email
@@ -703,19 +686,20 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             existing = db.query(IdentityUser).filter(
                 IdentityUser.NormalizedEmail == normalized_email
             ).first()
-            
             if existing:
                 return {
                     "succeeded": False,
-                    "errors": [{
-                        "code": "DuplicateEmail",
-                        "description": "Email is already taken."
-                    }]
+                    "errors": [{"code": "DuplicateEmail", "description": "Email is already taken."}]
                 }
         
-        # Hash password
-        plain_password = request.Password or "Admin@12345"
-        twam_hash = generate_sha256_hash_with_salt(plain_password, _get_password_cipher())
+        # ── FIX: Decrypt before hashing (frontend sends encrypted password) ──
+        raw_password = request.Password or "Admin@12345"
+        try:
+            plain_password = _decrypt_client_password(raw_password)
+        except Exception:
+            plain_password = raw_password  # fallback: treat as plain text
+        
+        twam_hash   = generate_sha256_hash_with_salt(plain_password, _get_password_cipher())
         stored_hash = _aspnet_hash_password(twam_hash)
         
         # Create new user using ORM

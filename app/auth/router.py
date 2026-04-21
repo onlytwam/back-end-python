@@ -57,7 +57,7 @@ def _validate_client(client_id: Optional[str], client_secret: Optional[str]) -> 
 # TOKEN — POST /auth/token
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/token", response_model=TokenResponse, summary="Login — get JWT access token")
+@router.post("connect/token", response_model=TokenResponse, summary="Login — get JWT access token")
 async def token(
     grant_type:    str           = Form(...),
     username:      str           = Form(...),
