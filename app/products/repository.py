@@ -5,18 +5,17 @@ from sqlalchemy import asc, desc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import Products
-from app.brand.models import Brand
 
 def _to_response(db: Session, product: Products) -> dict:
-    """Attach brandName from the Brand ORM model."""
+    """Attach brandName from public.Brand join."""
     brand_name = None
     if product.brandId:
-        brand = db.query(Brand).filter(
-            Brand.brandId == product.brandId,
-            Brand.deletedInd == False
-        ).first()
-        if brand:
-            brand_name = brand.brandName
+        row = db.execute(
+            text('SELECT "brandName" FROM mdm."Brand" WHERE "brandId" = :id LIMIT 1'),
+            {"id": product.brandId}
+        ).fetchone()
+        if row:
+            brand_name = row[0]
     return {
         "productId":        product.productId,
         "productCode":      product.productCode,

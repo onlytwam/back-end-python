@@ -16,8 +16,6 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -153,7 +151,7 @@ app.add_middleware(
 from app.auth.router                 import router as auth_router
 from app.connect.router              import router as connect_router
 from app.blog.router                 import router as blog_router
-from app.brand.router                import router as brand_router   # single router, no protected_router split
+from app.brand.router                import router as brand_router   
 from app.category.router             import router as category_router
 from app.coupons.router              import router as coupons_router
 from app.deliverycharge.router       import router as deliverycharge_router

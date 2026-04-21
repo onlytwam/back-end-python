@@ -62,24 +62,40 @@ def _enrich(db: Session, pvd: ProductVariantDetail) -> dict:
 
 def get_all_variant_details(
     db: Session,
-    filters: Optional[List[dict]] = None,
-    order_ascending: Optional[bool] = None,
-    order_property: Optional[str] = None,
-    page_index: Optional[int] = None,
-    page_size: Optional[int] = None,
-) -> dict:
-    query = db.query(ProductVariantDetail).filter(ProductVariantDetail.deletedInd == False)
+    filters=None,
+    order_ascending=True,
+    order_property=None,
+    page_index=1,
+    page_size=100
+):
+    query = db.query(ProductVariantDetail)
 
-    query = apply_filters(query, ProductVariantDetail, filters)
+    #  APPLY FILTERS
+    if filters:
+        for f in filters:
+            prop = f.get("property")
+            value = f.get("value")
 
-    query = apply_ordering(query, ProductVariantDetail, order_property, order_ascending)
+            if prop in ["ProductVariantId", "productVariantId"]:
+                query = query.filter(
+                    ProductVariantDetail.productVariantId == int(value)
+                )
 
-    total = query.count()
+            if prop in ["ProductId", "productId"]:
+                query = query.filter(
+                    ProductVariantDetail.productId == int(value)
+                )
+
+    #  PAGINATION
     if page_index and page_size:
         query = query.offset((page_index - 1) * page_size).limit(page_size)
 
-    rows = query.all()
-    return build_paged_response(total, [_enrich(db, r) for r in rows])
+    results = query.all()
+
+    return {
+        "list": results,
+        "count": len(results)
+    }
 
 
 # ── Get by ID ─────────────────────────────────────────────────────────────────
@@ -208,17 +224,23 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
 
 # ── Delete ────────────────────────────────────────────────────────────────────
 
-def delete_variant_detail(db: Session, pvd_id: int) -> bool:
-    pvd = db.query(ProductVariantDetail).filter(
-        ProductVariantDetail.productVariantDetailId == pvd_id,
-        ProductVariantDetail.deletedInd == False
-    ).first()
-    if not pvd:
-        return False
-    pvd.deletedInd   = True
-    pvd.modifiedDate = datetime.now(timezone.utc)
-    db.commit()
-    return True
+def delete_variant_detail(db: Session, detail_id: int):
+    try:
+        vd = db.query(ProductVariantDetail).filter(
+            ProductVariantDetail.productVariantDetailId == detail_id
+        ).first()
+
+        if not vd:
+            return False
+
+        db.delete(vd)
+        db.commit()
+
+        return True
+
+    except Exception as e:
+        db.rollback()
+        raise e
 
 
 # ── Duplicate Check (GetCheckProductVariantDetailQuery) ───────────────────────

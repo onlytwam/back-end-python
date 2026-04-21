@@ -1,142 +1,237 @@
-import os
-import json
-import shutil
-from uuid import uuid4
-from typing import Optional, Annotated
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Form, UploadFile, File
+from email.mime import text
+import json
+import logging
+import os
+import shutil
+from typing import Optional
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
-from database import get_db
-from . import models, schemas, repository
 from app.auth.dependencies import get_current_user
+from database import get_db
+from . import repository, schemas
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
-    prefix="/api/Brand",   # Keep this as it is (matches your frontend)
+    prefix="/api/Brand",
     tags=["Brand"],
+    redirect_slashes=True,
 )
 
-UPLOAD_DIR = "uploads/brand"   # Better to separate brand uploads
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_DIR = "uploads/brands"
 
 
-# ── GET ALL BRANDS ─────────────────────────────
-@router.get("", response_model=schemas.BrandListResponse)
-def get_brands(
-    Filters:         Optional[str]  = Query(None, alias="Filters"),
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _save_upload(file: UploadFile, subfolder: str = "") -> str:
+    """Persist an uploaded file and return its URL-safe relative path."""
+    dest_dir = os.path.join(UPLOAD_DIR, subfolder)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, file.filename)
+    with open(dest_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    # Return forward-slash URL path
+    return "/" + dest_path.replace("\\", "/")
+
+
+def _to_url(path: Optional[str]) -> Optional[str]:
+    """Convert a stored filesystem path to a URL-safe path."""
+    if not path:
+        return None
+    if path.startswith("/") or path.startswith("http"):
+        return path
+    return "/" + path.replace("\\", "/")
+
+
+def _parse_filters(raw: Optional[str]) -> Optional[list[dict]]:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return [parsed] if isinstance(parsed, dict) else parsed
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Filters JSON. Expected array of {property, comparison, value}.",
+        )
+
+
+def _coerce_bool(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() not in ("false", "0", "no")
+
+
+# ─────────────────────────────────────────────
+# PUBLIC — list / detail
+# ─────────────────────────────────────────────
+@router.get(
+    "/",
+    response_model=schemas.BrandListResponse,
+    summary="List brands (paginated)",
+)
+def list_brands(
+    Filters: Optional[str] = Query(None, alias="Filters"),
+    Order_Property: Optional[str] = Query(None, alias="Order.Property"),
     Order_Ascending: Optional[bool] = Query(None, alias="Order.Ascending"),
-    Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
-    Page_Index:      Optional[int]  = Query(1, alias="Page.Index", ge=1),
-    Page_Size:       Optional[int]  = Query(20, alias="Page.Size", ge=1),
-    db: Session = Depends(get_db),
-):
-    parsed_filters = None
-    if Filters:
-        try:
-            parsed_filters = json.loads(Filters)
-            if isinstance(parsed_filters, dict):
-                parsed_filters = [parsed_filters]
-        except:
-            raise HTTPException(status_code=400, detail="Invalid Filters format.")
-
+    Page_Index: Optional[int] = Query(1, alias="Page.Index", ge=1),
+    Page_Size: Optional[int] = Query(10, alias="Page.Size", ge=1, le=1000),  
+    db: Session = Depends(get_db), 
+) -> schemas.BrandListResponse:
     result = repository.get_all_brands(
-        db=db,
-        filters=parsed_filters,
-        order_ascending=Order_Ascending,
-        order_property=Order_Property,
-        page_index=Page_Index,
-        page_size=Page_Size,
+        db              = db,
+        filters         = _parse_filters(Filters),
+        order_property  = Order_Property,
+        order_ascending = Order_Ascending,
+        page_index      = Page_Index,
+        page_size       = Page_Size,
     )
 
-    #  Correct handling
-    return {
-        "count": result["count"],
-        "list": result["list"],
-        "parameters": None
-    }
-# ── GET SINGLE BRAND ─────────────────────────────
-@router.get("/{brand_id}", response_model=schemas.BrandResponse)
-def get_brand(brand_id: int, db: Session = Depends(get_db)):
+    response_list = [
+        schemas.BrandResponse(
+            brandId          = b.brandId,
+            brandName        = b.brandName,
+            brandDescription = b.brandDescription,
+            brandLogo        = _to_url(b.brandLogo),
+            brandImage       = _to_url(b.brandImage),
+            userProfileId    = b.userProfileId,
+            state            = b.state,
+            isActive         = b.isActive if b.isActive is not None else True,
+        )
+        for b in result["list"]
+    ]
+
+    return schemas.BrandListResponse(
+        count      = result["count"],
+        list       = response_list,
+        parameters = None,
+    )
+
+@router.get(
+    "/{brand_id}",
+    response_model=schemas.BrandResponse,
+    summary="Get a single brand",
+)
+def get_brand(
+    brand_id: int,
+    db: Session = Depends(get_db),
+) -> schemas.BrandResponse:
     brand = repository.get_brand_by_id(db, brand_id)
     if not brand:
-        raise HTTPException(status_code=404, detail="Brand not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
     return brand
 
 
-# ── CREATE BRAND ─────────────────────────────
-@router.post("/", response_model=schemas.BrandResponse, status_code=201)
+# ─────────────────────────────────────────────
+# PROTECTED — create / update / delete
+# ─────────────────────────────────────────────
+
+@router.post(
+    "/",
+    response_model=schemas.BrandResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a brand",
+    dependencies=[Depends(get_current_user)],
+)
 def create_brand(
-    brandName:        Annotated[str, Form(...)],
-    brandDescription: Annotated[Optional[str], Form()] = None,
-    websiteUrl:       Annotated[Optional[str], Form()] = None,
-    isActive:         Annotated[bool, Form()] = True,
-    brandLogo:        Annotated[Optional[UploadFile], File()] = None,
+    brandName:        str                  = Form(...),
+    brandDescription: Optional[str]        = Form(None),
+    userProfileId:    Optional[str]        = Form(None),
+    state:            Optional[str]        = Form(None),
+    isActive:         Optional[str]        = Form("true"),
+    brandLogo:        Optional[UploadFile] = File(None),
+    brandImage:       Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user),   # Keep auth
-):
-    brand_data = {
-        "brandName":        brandName,
-        "brandDescription": brandDescription,
-        "websiteUrl":       websiteUrl,
-        "isActive":         isActive,
-    }
+) -> schemas.BrandResponse:
+    # Validate via schema (raises 422 with clear message on failure)
+    validated = schemas.BrandCreate(
+        brandName        = brandName,
+        brandDescription = brandDescription,
+        userProfileId    = userProfileId,
+        state            = state,
+        isActive         = _coerce_bool(isActive),
+    )
 
-    # Handle Logo Upload with unique filename
+    data = validated.model_dump(exclude={"brandLogoFileModel", "brandImageFileModel"})
+
     if brandLogo and brandLogo.filename:
-        ext = brandLogo.filename.split(".")[-1].lower()
-        filename = f"{uuid4()}.{ext}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        data["brandLogo"] = _save_upload(brandLogo)
+        logger.info("Saved brand logo: %s", data["brandLogo"])
 
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(brandLogo.file, f)
+    if brandImage and brandImage.filename:
+        data["brandImage"] = _save_upload(brandImage)
+        logger.info("Saved brand image: %s", data["brandImage"])
 
-        brand_data["brandLogo"] = f"/uploads/brand/{filename}"   # Store relative path
+    brand = repository.create_brand(db, data)
+    logger.info("Created brand id=%s name=%r", brand.brandId, brand.brandName)
+    return brand
 
-    created_brand = repository.create_brand(db, brand_data)
-    return created_brand
 
-
-# ── UPDATE BRAND ─────────────────────────────
-@router.put("/{brand_id}", response_model=schemas.BrandResponse)
+@router.put(
+    "/{brand_id}",
+    response_model=schemas.BrandResponse,
+    summary="Update a brand",
+    dependencies=[Depends(get_current_user)],
+)
 def update_brand(
     brand_id:         int,
-    brandName:        Annotated[Optional[str], Form()] = None,
-    brandDescription: Annotated[Optional[str], Form()] = None,
-    websiteUrl:       Annotated[Optional[str], Form()] = None,
-    isActive:         Annotated[Optional[bool], Form()] = None,
-    brandLogo:        Annotated[Optional[UploadFile], File()] = None,
+    brandName:        Optional[str]        = Form(None),
+    brandDescription: Optional[str]        = Form(None),
+    userProfileId:    Optional[str]        = Form(None),
+    state:            Optional[str]        = Form(None),
+    isActive:         Optional[str]        = Form(None),
+    brandLogo:        Optional[UploadFile] = File(None),
+    brandImage:       Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user),
-):
-    existing = repository.get_brand_by_id(db, brand_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Brand not found")
+) -> schemas.BrandResponse:
+    if not repository.get_brand_by_id(db, brand_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
-    update_data: dict = {}
-    if brandName is not None:        update_data["brandName"] = brandName
-    if brandDescription is not None: update_data["brandDescription"] = brandDescription
-    if websiteUrl is not None:       update_data["websiteUrl"] = websiteUrl
-    if isActive is not None:         update_data["isActive"] = isActive
+    # Validate supplied fields through schema
+    validated = schemas.BrandUpdate(
+        brandName        = brandName,
+        brandDescription = brandDescription,
+        userProfileId    = userProfileId,
+        state            = state,
+        isActive         = _coerce_bool(isActive) if isActive is not None else None,
+    )
 
-    # Handle new Logo upload (optional)
+    # Only include fields that were actually sent (not None)
+    data = {
+        k: v for k, v in validated.model_dump(
+            exclude={"brandLogoFileModel", "brandImageFileModel"}
+        ).items()
+        if v is not None
+    }
+
     if brandLogo and brandLogo.filename:
-        ext = brandLogo.filename.split(".")[-1].lower()
-        filename = f"{uuid4()}.{ext}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        data["brandLogo"] = _save_upload(brandLogo)
+        logger.info("Updated brand logo: %s", data["brandLogo"])
 
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(brandLogo.file, f)
+    if brandImage and brandImage.filename:
+        data["brandImage"] = _save_upload(brandImage)
+        logger.info("Updated brand image: %s", data["brandImage"])
 
-        update_data["brandLogo"] = f"/uploads/brand/{filename}"
+    logger.info("Updating brand id=%s with fields: %s", brand_id, list(data.keys()))
 
-    updated_brand = repository.update_brand(db, brand_id, update_data)
-    return updated_brand
+    updated = repository.update_brand(db, brand_id, data)
+    return updated
 
 
-# ── DELETE BRAND ─────────────────────────────
-@router.delete("/{brand_id}", status_code=204)
-def delete_brand(brand_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    result = repository.delete_brand(db, brand_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Brand not found")
-    return None
+@router.delete(
+    "/{brand_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a brand",
+    dependencies=[Depends(get_current_user)],
+)
+def delete_brand(
+    brand_id: int,
+    db: Session = Depends(get_db),
+) -> None:
+    if not repository.delete_brand(db, brand_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
