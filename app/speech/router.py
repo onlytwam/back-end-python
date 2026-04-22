@@ -28,7 +28,7 @@ from app.speech.repository import get_speech_credentials, build_phrase_hints
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/Speech", tags=["Speech"])
+router = APIRouter(prefix="/api/Speech", tags=["Speech"])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -180,3 +180,45 @@ async def speech_health():
         }
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+@router.get("/debug")
+async def speech_debug():
+    """Call this from browser to test each layer independently."""
+    results = {}
+
+    # Step 1: Can we read credentials from DB?
+    try:
+        creds = get_speech_credentials()
+        results["db_credentials"] = {
+            "status": "OK",
+            "region": creds["region"],
+            "key_prefix": creds["subscription_key"][:8] + "...",
+        }
+    except Exception as e:
+        results["db_credentials"] = {"status": "FAIL", "error": str(e)}
+        return results  # stop here if DB fails
+
+    # Step 2: Can we reach Azure Speech at all?
+    try:
+        import azure.cognitiveservices.speech as speechsdk
+        speech_config = speechsdk.SpeechConfig(
+            subscription=creds["subscription_key"],
+            region=creds["region"]
+        )
+        results["azure_config"] = {"status": "OK"}
+    except Exception as e:
+        results["azure_config"] = {"status": "FAIL", "error": str(e)}
+        return results
+
+    # Step 3: Can we load phrase hints from DB?
+    try:
+        hints = build_phrase_hints()
+        results["phrase_hints"] = {
+            "status": "OK",
+            "count": len(hints),
+            "sample": hints[:5],
+        }
+    except Exception as e:
+        results["phrase_hints"] = {"status": "FAIL", "error": str(e)}
+
+    return results
