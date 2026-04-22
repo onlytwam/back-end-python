@@ -9,13 +9,15 @@ Flow:
     → Azure Cognitive Services Speech SDK
         - credentials read from speech.azure_speech_config table
         - PhraseListGrammar loaded from live Brand/Category/Product/Color data
-    → {"transcript": "show me black bras"}
-    → Android fires onResult event → JS frontend navigates to /global-search?q=...
+    → post-processing correction pass (maps mishearings → correct brand names)
+    → {"transcript": "show me TWAM black bras"}
+    → Android fires onResult event → JS navigates to /global-search?q=...
 
 No environment variables used — all credentials come from the database.
 """
 
 import io
+import re
 import wave
 import logging
 
@@ -31,7 +33,134 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/Speech", tags=["Speech"])
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Known mishearing corrections ───────────────────────────────────────────────
+# Maps what Azure commonly returns → what the user actually said.
+# Keys are lowercase (matching is case-insensitive).
+# This catches cases where even with phrase hints Azure's acoustic model wins.
+#
+# Add new entries whenever logcat shows a wrong word for a known brand/product.
+#
+_WORD_CORRECTIONS: dict[str, str] = {
+    # TWAM mishearings
+    "tom":      "TWAM",
+    "tram":     "TWAM",
+    "team":     "TWAM",
+    "trim":     "TWAM",
+    "twam":     "TWAM",
+    "thwam":    "TWAM",
+    "teem":     "TWAM",
+    "twee":     "TWAM",
+    "twem":     "TWAM",
+
+    # Amante mishearings
+    "amanda":   "Amante",
+    "amount":   "Amante",
+    "armante":  "Amante",
+    "amantay":  "Amante",
+
+    # Enamor mishearings
+    "enamour":  "Enamor",
+    "inamore":  "Enamor",
+
+    # Soie mishearings
+    "soy":      "Soie",
+    "soya":     "Soie",
+    "swah":     "Soie",
+    "swoi":     "Soie",
+    "swoy":     "Soie",
+
+    # Blossoms mishearings
+    "blossem":  "Blossoms",
+    "blossom":  "Blossoms",
+
+    # Triumph mishearings
+    "tri":      "Triumph",
+
+    # Bra mishearings — the most common one
+    "bro":      "bra",
+    "braw":     "bra",
+    "brus":     "bras",
+    "broz":     "bras",
+    "braz":     "bras",
+
+    # Panty mishearings
+    "pantie":   "panty",
+    "panties":  "panties",
+
+    # Balconette mishearings
+    "balcony":  "balconette",
+
+    # Bandeau mishearings
+    "bando":    "bandeau",
+    "bandu":    "bandeau",
+
+    # Camisole mishearings
+    "camise":   "camisole",
+    "cami":     "camisole",
+
+    # Color mishearings
+    "bej":      "beige",
+    "choco":    "chocolate",
+}
+
+# Multi-word phrase corrections (checked before word-level)
+_PHRASE_CORRECTIONS: list[tuple[str, str]] = [
+    # (lowercase pattern, replacement)
+    ("tee wam",     "TWAM"),
+    ("t wam",       "TWAM"),
+    ("twee am",     "TWAM"),
+    ("a mante",     "Amante"),
+    ("ah mante",    "Amante"),
+    ("in amor",     "Enamor"),
+    ("en amor",     "Enamor"),
+    ("in a more",   "Enamor"),
+    ("so way",      "Soie"),
+    ("try umph",    "Triumph"),
+    ("tri umph",    "Triumph"),
+    ("t shirt bra", "T-shirt bra"),
+    ("tee shirt bra","T-shirt bra"),
+    ("push up bra", "push-up bra"),
+    ("non wired",   "non-wired"),
+    ("non padded",  "non-padded"),
+    ("wire free",   "wireless"),
+]
+
+
+def _correct_transcript(transcript: str) -> str:
+    """
+    Two-pass post-processing correction:
+      Pass 1: Multi-word phrase replacements (case-insensitive)
+      Pass 2: Word-level replacements (case-insensitive, strips punctuation)
+    """
+    if not transcript:
+        return transcript
+
+    # Pass 1 — phrase level
+    result = transcript
+    lower = result.lower()
+    for wrong, right in _PHRASE_CORRECTIONS:
+        if wrong in lower:
+            # Replace case-insensitively, preserving surrounding text
+            pattern = re.compile(re.escape(wrong), re.IGNORECASE)
+            result = pattern.sub(right, result)
+            lower = result.lower()
+
+    # Pass 2 — word level
+    words = result.split()
+    corrected = []
+    for word in words:
+        m = re.match(r"^([a-zA-Z''\-]+)([.,!?]*)$", word)
+        if m:
+            core, punct = m.group(1), m.group(2)
+            replacement = _WORD_CORRECTIONS.get(core.lower())
+            corrected.append((replacement if replacement else core) + punct)
+        else:
+            corrected.append(word)
+
+    return " ".join(corrected)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _pcm_to_wav(pcm_bytes: bytes,
                 sample_rate: int  = 16000,
@@ -50,45 +179,37 @@ def _pcm_to_wav(pcm_bytes: bytes,
 def _transcribe(pcm_bytes: bytes, subscription_key: str, region: str) -> str:
     """
     Feed raw PCM to Azure Speech SDK with TWAM phrase hints.
-    Returns the recognised transcript string (may be empty on silence).
+    Returns the raw recognised transcript string.
     """
-    # ── Speech config ──────────────────────────────────────────────────────
     speech_config = speechsdk.SpeechConfig(
         subscription=subscription_key,
         region=region
     )
     speech_config.speech_recognition_language = "en-IN"
 
-    # ── Audio config — push raw PCM directly (no file on disk) ────────────
     stream_format = speechsdk.audio.AudioStreamFormat(
         samples_per_second=16000,
         bits_per_sample=16,
         channels=1
     )
-    push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
+    push_stream  = speechsdk.audio.PushAudioInputStream(stream_format)
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
 
-    # ── Recogniser ─────────────────────────────────────────────────────────
     recognizer = speechsdk.SpeechRecognizer(
         speech_config=speech_config,
         audio_config=audio_config
     )
 
-    # ── Phrase hints — boost TWAM vocabulary strongly ──────────────────────
-    # PhraseListGrammar tells Azure to prefer these words/phrases over
-    # acoustically similar general-English alternatives.
-    # e.g. "TWAM" beats "tram/team", "Amante" beats "Amanda/amount".
+    # Boost all TWAM vocabulary — brands repeated 3×, categories 2× in repository
     phrase_list = speechsdk.PhraseListGrammar.from_recognizer(recognizer)
     for phrase in build_phrase_hints():
         phrase_list.addPhrase(phrase)
 
-    # ── Push audio and run recognition ─────────────────────────────────────
     push_stream.write(pcm_bytes)
     push_stream.close()
 
     result = recognizer.recognize_once_async().get()
 
-    # ── Handle result ───────────────────────────────────────────────────────
     if result.reason == speechsdk.ResultReason.RecognizedSpeech:
         return result.text.strip()
 
@@ -107,7 +228,7 @@ def _transcribe(pcm_bytes: bytes, subscription_key: str, region: str) -> str:
     return ""
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.post(
     "/transcribe",
@@ -122,44 +243,44 @@ async def transcribe_audio(
     )
 ):
     """
-    Receive raw PCM audio from the Android APK and return a transcript.
-
-    - **audio**: raw 16 kHz 16-bit mono PCM bytes (multipart field name: `audio`)
-    - Returns: `{"transcript": "show me black bras"}`
-    - Credentials are fetched from `speech.azure_speech_config` in the DB.
-    - Phrase hints are built from the live Brand / Category / Product / Color tables.
+    Receive raw PCM audio from the Android APK and return a corrected transcript.
     """
-    # ── Read audio bytes ───────────────────────────────────────────────────
     raw_bytes = await audio.read()
 
-    if len(raw_bytes) < 3200:           # less than 0.1 s at 16kHz 16-bit mono
+    if len(raw_bytes) < 3200:
         raise HTTPException(
             status_code=400,
             detail="Audio too short — minimum 0.1 seconds required"
         )
 
-    if len(raw_bytes) > 10 * 16000 * 2:   # more than 10 seconds
-        raw_bytes = raw_bytes[:10 * 16000 * 2]   # truncate silently
+    if len(raw_bytes) > 10 * 16000 * 2:
+        raw_bytes = raw_bytes[:10 * 16000 * 2]
 
-    # ── Load credentials ───────────────────────────────────────────────────
     try:
         creds = get_speech_credentials()
     except RuntimeError as e:
         logger.error("Speech config missing: %s", e)
         raise HTTPException(status_code=503, detail=str(e))
 
-    # ── Transcribe ─────────────────────────────────────────────────────────
     try:
-        transcript = _transcribe(
+        raw_transcript = _transcribe(
             pcm_bytes=raw_bytes,
             subscription_key=creds["subscription_key"],
             region=creds["region"],
         )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    except Exception as e:
+    except Exception:
         logger.exception("Unexpected error during transcription")
         raise HTTPException(status_code=500, detail="Transcription failed")
+
+    # ── Post-processing: fix brand/product mishearings ─────────────────────
+    transcript = _correct_transcript(raw_transcript)
+
+    if raw_transcript != transcript:
+        logger.info(
+            "Transcript corrected: %r → %r", raw_transcript, transcript
+        )
 
     return JSONResponse({"transcript": transcript})
 
@@ -170,7 +291,6 @@ async def transcribe_audio(
     include_in_schema=False,
 )
 async def speech_health():
-    """Quick check that the DB has an active Speech config row."""
     try:
         creds = get_speech_credentials()
         return {
@@ -181,12 +301,12 @@ async def speech_health():
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
+
 @router.get("/debug")
 async def speech_debug():
-    """Call this from browser to test each layer independently."""
+    """Test each layer independently."""
     results = {}
 
-    # Step 1: Can we read credentials from DB?
     try:
         creds = get_speech_credentials()
         results["db_credentials"] = {
@@ -196,12 +316,10 @@ async def speech_debug():
         }
     except Exception as e:
         results["db_credentials"] = {"status": "FAIL", "error": str(e)}
-        return results  # stop here if DB fails
+        return results
 
-    # Step 2: Can we reach Azure Speech at all?
     try:
-        import azure.cognitiveservices.speech as speechsdk
-        speech_config = speechsdk.SpeechConfig(
+        speechsdk.SpeechConfig(
             subscription=creds["subscription_key"],
             region=creds["region"]
         )
@@ -210,7 +328,6 @@ async def speech_debug():
         results["azure_config"] = {"status": "FAIL", "error": str(e)}
         return results
 
-    # Step 3: Can we load phrase hints from DB?
     try:
         hints = build_phrase_hints()
         results["phrase_hints"] = {
