@@ -166,6 +166,7 @@ def create_payg_order(
     billing_state: str,
     billing_zip: str,
     redirect_url: str,
+    shipping_state: Optional[str] = None,
 ) -> dict:
     """
     Call PayG /payment/api/order/create and return the full response dict.
@@ -237,7 +238,7 @@ def create_payg_order(
             "ShippingLastName": last,
             "ShippingAddress": billing_address or "",
             "ShippingCity": billing_city or "",
-            "ShippingState": billing_state or "",
+            "ShippingState": shipping_state or billing_state or "",
             "ShippingCountry": "India",
             "ShippingZipCode": billing_zip or "",
             "ShippingMobileNo": clean_phone,

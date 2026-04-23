@@ -25,6 +25,7 @@ class AddressCreate(BaseModel):
     locality:         Optional[str]  = None
     city:             Optional[str]  = None
     stateId:          Optional[int]  = None
+    state:            Optional[str]  = None
     countryId:        Optional[int]  = None
     pinCode:          Optional[str]  = None
     phone:            Optional[str]  = None
@@ -42,6 +43,7 @@ class AddressUpdate(BaseModel):
     locality:         Optional[str]  = None
     city:             Optional[str]  = None
     stateId:          Optional[int]  = None
+    state:            Optional[str]  = None
     countryId:        Optional[int]  = None
     pinCode:          Optional[str]  = None
     phone:            Optional[str]  = None

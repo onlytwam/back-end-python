@@ -83,8 +83,11 @@ def create_address(
     elif not command.userProfileId:
         command.userProfileId = current_user.user_id
 
-    address_id = repository.create_address(db, command)
-    return {"success": True, "addressId": address_id}
+    try:
+        address_id = repository.create_address(db, command)
+        return {"success": True, "addressId": address_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.put("/{address_id}")
@@ -99,13 +102,16 @@ def update_address(
     elif not command.userProfileId:
         command.userProfileId = current_user.user_id
 
-    result = repository.update_address(
-        db,
-        address_id,
-        command,
-        current_user_id=current_user.user_id,
-        is_staff=current_user.role_id in Roles.STAFF,
-    )
+    try:
+        result = repository.update_address(
+            db,
+            address_id,
+            command,
+            current_user_id=current_user.user_id,
+            is_staff=current_user.role_id in Roles.STAFF,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not result:
         raise HTTPException(status_code=404, detail="Address not found.")
     return {"addressId": result}

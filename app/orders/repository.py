@@ -16,6 +16,7 @@ from app.orderitems.models import OrderItems
 from app.people.models import People
 from app.auth.models import IdentityUser
 from app.shared.app_settings import get_setting
+from app.state.repository import resolve_state_id
 
 BASE_URL = os.getenv("BASE_URL", "")
 
@@ -37,6 +38,34 @@ def _parse_min_order_value(order_value_range: Optional[str]) -> Optional[float]:
 
 
 # apply_filters, apply_ordering, apply_pagination imported from app.shared.filters
+
+
+def _get_state_name(db: Session, state_id) -> Optional[str]:
+    if not state_id:
+        return None
+    row = db.execute(
+        text('SELECT "StateName" FROM mdm."State" WHERE "StateId" = :id LIMIT 1'),
+        {"id": state_id},
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _get_address_state_name(db: Session, address_id: Optional[int]) -> Optional[str]:
+    if not address_id:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT s."StateName"
+            FROM twam."Address" a
+            LEFT JOIN mdm."State" s ON s."StateId" = a."StateId"
+            WHERE a."AddressId" = :id AND a."DeletedInd" = false
+            LIMIT 1
+            """
+        ),
+        {"id": address_id},
+    ).fetchone()
+    return row[0] if row else None
 
 
 def _get_address(db: Session, address_id):
@@ -476,7 +505,7 @@ def create_order(db: Session, data) -> dict:
     if out_of_stock:
         return {"outOfStockProducts": out_of_stock}
 
-    _normalize_order_addresses_and_delivery(db, data)
+    shipping_address, billing_address = _normalize_order_addresses_and_delivery(db, data)
 
     order = Orders(
         orderNumber=generate_order_number(),
@@ -573,7 +602,25 @@ def create_order(db: Session, data) -> dict:
         .first()
     )
 
-    _addr = _get_address(db, getattr(data, "shippingAddressId", None))
+    payg_address = billing_address or shipping_address or _get_address(db, getattr(data, "shippingAddressId", None))
+    payg_billing_state = str(getattr(data, "billingState", "") or "").strip()
+    if not payg_billing_state:
+        payg_billing_state = str(
+            _get_address_state_name(
+                db,
+                getattr(data, "billingAddressId", None) or getattr(data, "shippingAddressId", None),
+            )
+            or ""
+        ).strip()
+
+    payg_shipping_state = str(getattr(data, "shippingState", "") or "").strip()
+    if not payg_shipping_state:
+        payg_shipping_state = str(
+            _get_address_state_name(db, getattr(data, "shippingAddressId", None))
+            or ""
+        ).strip()
+    if not payg_shipping_state:
+        payg_shipping_state = payg_billing_state
 
     try:
         _payg = create_payg_order(
@@ -586,12 +633,13 @@ def create_order(db: Session, data) -> dict:
             ),
             customer_email = _user[0] if _user else "",
             customer_phone = (
-                (_addr or {}).get("phone") or (_user[3] if _user else "")
+                (payg_address or {}).get("phone") or (_user[3] if _user else "")
             ),
-            billing_address = (_addr or {}).get("addressLine", ""),
-            billing_city    = (_addr or {}).get("city", ""),
-            billing_state   = "",
-            billing_zip     = (_addr or {}).get("pinCode", ""),
+            billing_address = (payg_address or {}).get("addressLine", ""),
+            billing_city    = (payg_address or {}).get("city", ""),
+            billing_state   = payg_billing_state or "",
+            shipping_state  = payg_shipping_state or payg_billing_state or "",
+            billing_zip     = (payg_address or {}).get("pinCode", ""),
             redirect_url    = get_setting(
                 "payg_redirect_url",
                 "http://localhost:8000/api/Payment/Callback",
@@ -648,7 +696,7 @@ def create_guest_order(db: Session, data) -> dict:
     address = {
         "name": f"{data.firstName or ''} {data.lastName or ''}".strip(),
         "addressLine": data.addressLine, "locality": data.locality, "city": data.city,
-        "stateId": data.stateId, "countryId": data.countryId, "pinCode": data.pinCode,
+        "stateId": _state_id, "countryId": data.countryId, "pinCode": data.pinCode,
         "phone": data.phoneNumber, "isDefault": data.isDefault or False,
         "userProfileId": user_profile_id, "typeId": data.typeId,
         "createdDate": datetime.now(timezone.utc), "deletedInd": False,
@@ -741,6 +789,10 @@ def create_guest_order(db: Session, data) -> dict:
     _phone     = getattr(data, "phone", "") or ""
     _email     = getattr(data, "email", "") or ""
     _name      = f"{getattr(data, 'firstName', '') or ''} {getattr(data, 'lastName', '') or ''}".strip()
+    _state_id = resolve_state_id(db, getattr(data, "stateId", None), getattr(data, "state", None))
+    if _state_id is None and getattr(data, "stateId", None) is not None:
+        _state_id = getattr(data, "stateId", None)
+    _state_name = _get_state_name(db, _state_id) or getattr(data, "state", "") or ""
 
     try:
         _payg = create_payg_order(
@@ -752,7 +804,8 @@ def create_guest_order(db: Session, data) -> dict:
             customer_phone  = _phone,
             billing_address = _addr_line,
             billing_city    = _city,
-            billing_state   = "",
+            billing_state   = _state_name,
+            shipping_state  = _state_name,
             billing_zip     = _zip,
             redirect_url    = get_setting(
                 "payg_redirect_url",

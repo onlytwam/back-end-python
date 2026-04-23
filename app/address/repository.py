@@ -3,6 +3,7 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
+from app.state.repository import resolve_state_id
 
 from .models import Address
 
@@ -82,13 +83,16 @@ def create_address(db: Session, data) -> int:
         Address.deletedInd == False
     ).count()
     is_default = True if addr_count == 0 else (data.isDefault or False)
+    resolved_state_id = resolve_state_id(db, data.stateId, getattr(data, "state", None))
+    if resolved_state_id is None and data.stateId is not None:
+        resolved_state_id = data.stateId
 
     addr = Address(
         name             = data.name,
         addressLine      = data.addressLine,
         locality         = data.locality,
         city             = data.city,
-        stateId          = data.stateId,
+        stateId          = resolved_state_id,
         countryId        = data.countryId,
         pinCode          = data.pinCode,
         phone            = data.phone,
@@ -139,6 +143,10 @@ def update_address(
     if not addr:
         return None
 
+    resolved_state_id = resolve_state_id(db, data.stateId, getattr(data, "state", None))
+    if resolved_state_id is None and data.stateId is not None:
+        resolved_state_id = data.stateId
+
     if data.isDefault:
         if not data.userProfileId:
             raise ValueError("userProfileId required when setting a default address.")
@@ -158,7 +166,7 @@ def update_address(
     addr.addressLine      = data.addressLine
     addr.locality         = data.locality
     addr.city             = data.city
-    addr.stateId          = data.stateId
+    addr.stateId          = resolved_state_id
     addr.countryId        = data.countryId
     addr.pinCode          = data.pinCode
     addr.phone            = data.phone

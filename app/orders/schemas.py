@@ -75,6 +75,8 @@ class CreateOrderRequest(BaseModel):
     userProfileId: Optional[str] = None
     shippingAddressId: Optional[int] = None
     billingAddressId: Optional[int] = None
+    shippingState: Optional[str] = None
+    billingState: Optional[str] = None
     couponId: Optional[int] = None
     shippingTypeId: Optional[int] = None
     couponAmount: Optional[float] = None
@@ -118,6 +120,7 @@ class CreateGuestOrderRequest(BaseModel):
     locality: Optional[str] = None
     city: Optional[str] = None
     stateId: Optional[int] = None
+    state: Optional[str] = None
     pinCode: Optional[str] = None
     countryId: Optional[int] = None
     isDefault: Optional[bool] = None
