@@ -22,11 +22,13 @@ from sqlalchemy import text
 from database import get_db
 from .schemas import (
     TokenResponse, RegisterUserRequest,
-    ChangePasswordRequest, ResetPasswordRequest, ResetPasswordConfirmRequest,
+    ResetPasswordRequest, ResetPasswordConfirmRequest,
+    SignedInChangePasswordRequest,
 )
 from .repository import (
     authenticate_user, build_token_claims,
-    create_identity_user, change_password,
+    create_identity_user,
+    change_password_for_authenticated_user,
     _get_identity_user_by_username,
     parse_profile_update_payload,
     update_identity_user_profile,
@@ -170,14 +172,14 @@ async def update_user(
 
 @router.post("/ChangePassword", summary="Change password (requires login)")
 async def change_password_endpoint(
-    request:      ChangePasswordRequest,
+    request:      SignedInChangePasswordRequest,
     current_user: CurrentUser = Depends(get_current_user),
     db:           Session     = Depends(get_db),
 ):
-    if not request.EmailId:
-        raise HTTPException(status_code=400, detail="EmailId is required.")
+    if not current_user.email:
+        raise HTTPException(status_code=400, detail="Authenticated user email is required.")
 
-    result = change_password(db, request.EmailId, request.CurrentPassword, request.NewPassword)
+    result = change_password_for_authenticated_user(db, current_user.email, request.NewPassword)
     if result["succeeded"]:
         return {"message": "Password has been changed successfully."}
     raise HTTPException(status_code=400, detail={"errors": result["errors"]})
@@ -548,6 +550,7 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
                 LastName    = payload.get("lastName") or "",
                 EmailId     = email,
                 Password    = DEFAULT_PASSWORD,
+                TemporaryPassword = DEFAULT_PASSWORD,
                 PhoneNumber = payload.get("phone") or "",
                 IsActive    = True,
                 RoleId      = Roles.USER,
@@ -560,18 +563,6 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
         claims       = build_token_claims(db, user)
         access_token = create_access_token(claims)
         _db_otp_delete(db, email, purpose="guest_checkout")
-
-        # ── Send TEMPORARY_PASSWORD SMS to new accounts that provided a phone ─
-        # SmartPing TEMPORARY_PASSWORD template:
-        #   ${var1} = customer_name  |  ${var2} = password
-        phone = (payload.get("phone") or "").strip()
-        if not existing and phone:
-            try:
-                from app.ekart.notifications import _send_sms
-                customer_name = payload.get("firstName") or email.split("@")[0]
-                _send_sms(db, phone, "TEMPORARY_PASSWORD", [customer_name, DEFAULT_PASSWORD])
-            except Exception as sms_err:
-                print(f"[Auth] TEMPORARY_PASSWORD SMS failed: {sms_err}")
 
         return {
             "success":      True,

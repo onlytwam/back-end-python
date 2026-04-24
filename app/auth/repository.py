@@ -281,6 +281,8 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
         "family_name": user.LastName or "",
         "given_name": user.FirstName or "",
         "phone_number": user.PhoneNumber or "",
+        "IsRandomPassword": bool(user.IsRandomPassword),
+        "is_random_password": bool(user.IsRandomPassword),
     }
 
 
@@ -729,7 +731,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             TenantId="1",
             OrganizationId=1,
             DeletedInd=False,
-            IsRandomPassword=False
+            IsRandomPassword=bool(request.TemporaryPassword)
         )
         
         db.add(new_user)
@@ -761,10 +763,11 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
 
         # ── Welcome notifications (fire-and-forget, never block registration) ──
         _send_welcome_notifications(
-            db          = db,
-            email       = request.EmailId,
-            phone       = request.PhoneNumber,
-            first_name  = request.FirstName or "",
+            db               = db,
+            email            = request.EmailId,
+            phone            = request.PhoneNumber,
+            first_name       = request.FirstName or "",
+            temporary_password = request.TemporaryPassword,
         )
 
         return {
@@ -787,6 +790,7 @@ def _send_welcome_notifications(
     email:      Optional[str],
     phone:      Optional[str],
     first_name: str = "",
+    temporary_password: Optional[str] = None,
 ) -> None:
     """
     Send welcome email and/or WhatsApp to a newly registered user.
@@ -801,8 +805,21 @@ def _send_welcome_notifications(
     from app.whatsapp.service import send_whatsapp
     from app.sendemail.repository import send_email
     from app.sendemail.schemas import EmailCreate
+    from html import escape
 
     name = first_name.strip() or "Valued Customer"
+    temp_password_block = ""
+    if temporary_password:
+        safe_temp_password = escape(temporary_password)
+        temp_password_block = f"""
+                <div style="margin:28px 0;padding:18px;border:1px dashed #6B0F2A;border-radius:12px;background:#fff8f9;">
+                  <p style="margin:0 0 8px;color:#6B0F2A;font-weight:700;">Your temporary password</p>
+                  <div style="font-size:22px;letter-spacing:3px;font-weight:700;color:#222;">{safe_temp_password}</div>
+                  <p style="margin:10px 0 0;color:#444;line-height:1.7;">
+                    Please sign in and change this password after your first login.
+                  </p>
+                </div>
+        """
 
     # ── Welcome Email ─────────────────────────────────────────────────────────
     if email and "@" in email:
@@ -821,6 +838,7 @@ def _send_welcome_notifications(
                 <p style="color:#444;line-height:1.7;">
                   Explore styles that celebrate you and discover comfort that fits perfectly.
                 </p>
+                {temp_password_block}
                 <div style="text-align:center;margin:28px 0;">
                   <a href="https://onlytwam.com/user-products/product-list"
                      style="background:#6B0F2A;color:#fff;padding:13px 32px;
@@ -903,6 +921,7 @@ def reset_password_with_token(db: Session, email: str, new_password: str) -> dic
         user.ModifiedBy = email
         user.AccessFailedCount = 0
         user.IsActive = True
+        user.IsRandomPassword = False
         
         db.commit()
         return {"succeeded": True, "errors": []}
@@ -953,13 +972,56 @@ def change_password(db: Session, email_id: str, current_password: str, new_passw
         user.SecurityStamp = str(uuid.uuid4())
         user.ModifiedDate = datetime.now(timezone.utc)
         user.ModifiedBy = email_id
-        
+        user.IsRandomPassword = False
+
         db.commit()
         return {"succeeded": True, "errors": []}
         
     except Exception as e:
         db.rollback()
         logger.error(f"Failed to change password: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to change password: {str(e)}"
+        )
+
+
+def change_password_for_authenticated_user(db: Session, email_id: str, new_password: str) -> dict:
+    """
+    Change password for an authenticated user.
+    The caller is already authenticated via the session/JWT, so this path
+    only updates the password hash for the current account.
+    """
+    try:
+        user = _get_identity_user_by_username(db, email_id)
+
+        if not user:
+            return {
+                "succeeded": False,
+                "errors": [{
+                    "code": "NotFound",
+                    "description": "User not found."
+                }]
+            }
+
+        # Decrypt and hash new password
+        new_plain = _decrypt_client_password(new_password)
+        new_twam = generate_sha256_hash_with_salt(new_plain, _get_password_cipher())
+        new_db_hash = _aspnet_hash_password(new_twam)
+
+        # Update using ORM
+        user.PasswordHash = new_db_hash
+        user.SecurityStamp = str(uuid.uuid4())
+        user.ModifiedDate = datetime.now(timezone.utc)
+        user.ModifiedBy = email_id
+        user.IsRandomPassword = False
+
+        db.commit()
+        return {"succeeded": True, "errors": []}
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to change password for authenticated user: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to change password: {str(e)}"

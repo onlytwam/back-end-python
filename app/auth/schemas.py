@@ -27,6 +27,7 @@ class RegisterUserRequest(BaseModel):
     LastName:    Optional[str]  = Field(None, alias="lastName")
     EmailId:     Optional[str]  = Field(None, alias="emailId")
     Password:    Optional[str]  = Field(None, alias="password")
+    TemporaryPassword: Optional[str] = Field(None, alias="temporaryPassword")
     PhoneNumber: Optional[str]  = Field(None, alias="phoneNumber")
     ProfileImageUrl: Optional[str] = Field(None, alias="profileImageUrl")
     RemoveProfileImage: Optional[bool] = Field(False, alias="removeProfileImage")
@@ -40,6 +41,12 @@ class ChangePasswordRequest(BaseModel):
     EmailId:         str = Field(..., alias="emailId")
     CurrentPassword: str = Field(..., alias="currentPassword")
     NewPassword:     str = Field(..., alias="newPassword")
+
+    model_config = {"populate_by_name": True}
+
+
+class SignedInChangePasswordRequest(BaseModel):
+    NewPassword: str = Field(..., alias="newPassword")
 
     model_config = {"populate_by_name": True}
 
