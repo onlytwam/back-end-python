@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import text, or_
+from sqlalchemy import text, or_, func
 from fastapi import HTTPException, UploadFile, Request
 
 from .models import IdentityUser, UserRole
@@ -172,17 +172,59 @@ def _get_identity_user_by_username(db: Session, username: str) -> Optional[Ident
     Find user by username, email, or phone number.
     Uses ORM query instead of raw SQL.
     """
-    username_upper = username.upper()
-    
-    user = db.query(IdentityUser).filter(
-        or_(
-            IdentityUser.NormalizedUserName == username_upper,
-            IdentityUser.PhoneNumber == username,
-            IdentityUser.NormalizedEmail == username_upper
+    identifier = (username or "").strip()
+    if not identifier:
+        return None
+
+    username_upper = identifier.upper()
+    phone_digits = re.sub(r"\D", "", identifier)
+
+    user_conditions = [
+        IdentityUser.NormalizedUserName == username_upper,
+        IdentityUser.NormalizedEmail == username_upper,
+        IdentityUser.Email == identifier,
+        IdentityUser.PhoneNumber == identifier,
+    ]
+    if phone_digits:
+        user_conditions.append(
+            func.regexp_replace(func.coalesce(IdentityUser.PhoneNumber, ""), r"\D", "", "g") == phone_digits
         )
-    ).first()
-    
-    return user
+
+    user = db.query(IdentityUser).filter(or_(*user_conditions)).first()
+    if user:
+        return user
+
+    people = db.query(People).filter(People.deletedInd == False)
+    if "@" in identifier:
+        people = people.filter(func.upper(People.emailId) == username_upper)
+    else:
+        people_conditions = [People.phoneNumber == identifier]
+        if phone_digits:
+            people_conditions.append(
+                func.regexp_replace(func.coalesce(People.phoneNumber, ""), r"\D", "", "g") == phone_digits
+            )
+        people = people.filter(or_(*people_conditions))
+
+    person = people.first()
+    if not person:
+        return None
+
+    if person.userProfileId:
+        linked_user = db.query(IdentityUser).filter(IdentityUser.Id == person.userProfileId).first()
+        if linked_user:
+            return linked_user
+
+    if person.emailId:
+        linked_user = db.query(IdentityUser).filter(
+            or_(
+                IdentityUser.NormalizedEmail == person.emailId.strip().upper(),
+                IdentityUser.Email == person.emailId.strip(),
+            )
+        ).first()
+        if linked_user:
+            return linked_user
+
+    return None
 
 
 def _get_role_name(db: Session, role_id: int) -> str:
@@ -671,11 +713,16 @@ def update_identity_user_profile(
 
 def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
     try:
+        primary_identifier = (request.EmailId or request.PhoneNumber or "").strip()
+        if not primary_identifier:
+            return {
+                "succeeded": False,
+                "errors": [{"code": "InvalidUser", "description": "Email or phone number is required."}]
+            }
+
         # Check for duplicate phone number
         if request.PhoneNumber:
-            existing = db.query(IdentityUser).filter(
-                IdentityUser.PhoneNumber == request.PhoneNumber
-            ).first()
+            existing = _get_identity_user_by_username(db, request.PhoneNumber)
             if existing:
                 return {
                     "succeeded": False,
@@ -684,10 +731,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
         
         # Check for duplicate email
         if request.EmailId:
-            normalized_email = request.EmailId.upper()
-            existing = db.query(IdentityUser).filter(
-                IdentityUser.NormalizedEmail == normalized_email
-            ).first()
+            existing = _get_identity_user_by_username(db, request.EmailId)
             if existing:
                 return {
                     "succeeded": False,
@@ -707,15 +751,15 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
         # Create new user using ORM
         new_user = IdentityUser(
             Id=str(uuid.uuid4()),
-            UserName=request.EmailId,
-            NormalizedUserName=(request.EmailId or "").upper(),
-            Email=request.EmailId,
-            NormalizedEmail=(request.EmailId or "").upper(),
-            EmailConfirmed=True,
+            UserName=primary_identifier,
+            NormalizedUserName=primary_identifier.upper(),
+            Email=request.EmailId or None,
+            NormalizedEmail=(request.EmailId or "").upper() if request.EmailId else None,
+            EmailConfirmed=bool(request.EmailId),
             PasswordHash=stored_hash,
             SecurityStamp=str(uuid.uuid4()),
             ConcurrencyStamp=str(uuid.uuid4()),
-            PhoneNumber=request.PhoneNumber or "",
+            PhoneNumber=request.PhoneNumber or None,
             PhoneNumberConfirmed=False,
             TwoFactorEnabled=False,
             LockoutEnabled=True,
@@ -727,7 +771,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             IsActive=True,
             UserRoleId=request.RoleId if request.RoleId else 2,
             CreatedDate=datetime.now(timezone.utc),
-            CreatedBy=request.EmailId,
+            CreatedBy=request.EmailId or request.PhoneNumber or "system",
             TenantId="1",
             OrganizationId=1,
             DeletedInd=False,
@@ -746,15 +790,15 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
                     firstName=request.FirstName or "",
                     middleName=request.MiddleName or "",
                     lastName=request.LastName or "",
-                    emailId=request.EmailId or "",
-                    phoneNumber=request.PhoneNumber or "",
+                    emailId=request.EmailId or None,
+                    phoneNumber=request.PhoneNumber or None,
                     profileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
                     userProfileId=new_user.Id,
                     isActive=True,
                     roleId=new_user.UserRoleId,
                     createdDate=datetime.now(timezone.utc),
                     deletedInd=False,
-                    createdBy=request.EmailId,
+                    createdBy=request.EmailId or request.PhoneNumber or "system",
                     organizationId=1,
                 )
             )

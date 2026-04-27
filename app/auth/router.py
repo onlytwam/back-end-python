@@ -7,19 +7,30 @@ Secret management change
 ─────────────────────────
 oauth_client_id and oauth_client_secret are now validated against AppSettings
 (the DB table) instead of being hardcoded strings in source code.
+
+Sync guarantee
+──────────────
+Every write that touches auth.IdentityUser also mirrors the change to
+twam.People (via _sync_people). Both tables stay in lockstep:
+  • signup          → insert both rows atomically (in repository)
+  • update profile  → handled in repository.update_identity_user_profile
+  • updateUser      → syncs IsActive, RoleId, name, phone, deletedInd
+  • deleteUser      → soft-deletes both rows in one transaction
 """
 
 import os
 import random
+import re
 import string
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Form, Request
+from fastapi import APIRouter, Depends, HTTPException, Form, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import get_db
+from app.people.models import People
 from .schemas import (
     TokenResponse, RegisterUserRequest,
     ResetPasswordRequest, ResetPasswordConfirmRequest,
@@ -30,23 +41,33 @@ from .repository import (
     create_identity_user,
     change_password_for_authenticated_user,
     _get_identity_user_by_username,
+    _next_people_id,
     parse_profile_update_payload,
     update_identity_user_profile,
     reset_password_with_token,
 )
-from .security import create_access_token, decode_token, decode_reset_token, EXPIRES_MINUTES
+from .security import create_access_token, decode_reset_token, EXPIRES_MINUTES
 from .dependencies import get_current_user, require_roles, Roles, CurrentUser
 
 from typing import Optional as _Optional
 from fastapi.security import HTTPBearer as _HTTPBearer, HTTPAuthorizationCredentials as _Creds
 from app.auth.security import blacklist_token as _blacklist_token
 
+# NOTE: WhatsApp welcome is fired inside repository.create_identity_user via
+# _send_welcome_notifications(). Do NOT import or call send_whatsapp here —
+# it would crash on startup (wrong module path) AND send the message twice.
+
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:4200")
 
+_OTP_TTL_MINUTES = 60
+_OTP_TABLE = 'auth."OtpStore"'
 
-# ── OAuth2 client validation (reads from AppSettings, not hardcoded) ──────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_client(client_id: Optional[str], client_secret: Optional[str]) -> bool:
     from app.shared.app_settings import get_setting
@@ -55,8 +76,303 @@ def _validate_client(client_id: Optional[str], client_secret: Optional[str]) -> 
     return (client_id or "") == valid_id and (client_secret or "") == valid_secret
 
 
+def _mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    return local[:2] + "***@" + domain
+
+
+def _mask_phone(phone: str) -> str:
+    if not phone or len(phone) < 4:
+        return phone
+    return phone[:2] + "******" + phone[-2:]
+
+
+def _gen_otp(length: int = 6) -> str:
+    return "".join(random.choices(string.digits, k=length))
+
+
+def _is_email_identifier(identifier: str) -> bool:
+    return "@" in (identifier or "")
+
+
+def _normalize_identifier(identifier: str) -> str:
+    return (identifier or "").strip()
+
+
+def _unique_identifiers(*values: Optional[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        item = _normalize_identifier(value)
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _cleanup_expired_otps(db: Session) -> None:
+    db.execute(text(f'DELETE FROM {_OTP_TABLE} WHERE "ExpiresAt" < NOW()'))
+    db.commit()
+
+
+def _db_otp_store(db: Session, identifier: str, otp: str, purpose: str) -> None:
+    """Store or refresh an OTP. identifier may be email or phone number."""
+    identifier = _normalize_identifier(identifier)
+    if not identifier:
+        return
+
+    _cleanup_expired_otps(db)
+    identifier_type = "email" if _is_email_identifier(identifier) else "phone"
+    expires = datetime.now(timezone.utc) + timedelta(minutes=_OTP_TTL_MINUTES)
+    db.execute(text(f"""
+        INSERT INTO {_OTP_TABLE}
+            ("Identifier", "IdentifierType", "Otp", "ExpiresAt", "Purpose")
+        VALUES
+            (:identifier, :id_type, :otp, :expires, :purpose)
+        ON CONFLICT ("Identifier", "Purpose") DO UPDATE
+            SET "Otp"       = EXCLUDED."Otp",
+                "ExpiresAt" = EXCLUDED."ExpiresAt"
+    """), {
+        "identifier": identifier,
+        "id_type":    identifier_type,
+        "otp":        otp,
+        "expires":    expires,
+        "purpose":    purpose,
+    })
+    db.commit()
+
+
+def _db_otp_get(db: Session, identifier: str, purpose: Optional[str] = None) -> dict | None:
+    identifier = _normalize_identifier(identifier)
+    if not identifier:
+        return None
+
+    if purpose:
+        row = db.execute(text(f"""
+            SELECT "Otp", "ExpiresAt", "Purpose", "IdentifierType"
+            FROM   {_OTP_TABLE}
+            WHERE  "Identifier" = :identifier AND "Purpose" = :purpose
+            ORDER BY "ExpiresAt" DESC LIMIT 1
+        """), {"identifier": identifier, "purpose": purpose}).fetchone()
+    else:
+        row = db.execute(text(f"""
+            SELECT "Otp", "ExpiresAt", "Purpose", "IdentifierType"
+            FROM   {_OTP_TABLE}
+            WHERE  "Identifier" = :identifier
+            ORDER BY "ExpiresAt" DESC LIMIT 1
+        """), {"identifier": identifier}).fetchone()
+    if not row:
+        return None
+    return {"otp": row[0], "expires_at": row[1], "purpose": row[2], "identifier_type": row[3]}
+
+
+def _db_otp_delete(db: Session, identifier: str, purpose: Optional[str] = None) -> None:
+    identifier = _normalize_identifier(identifier)
+    if not identifier:
+        return
+
+    if purpose:
+        db.execute(text(f"""
+            DELETE FROM {_OTP_TABLE}
+            WHERE "Identifier" = :identifier AND "Purpose" = :purpose
+        """), {"identifier": identifier, "purpose": purpose})
+    else:
+        db.execute(text(f'DELETE FROM {_OTP_TABLE} WHERE "Identifier" = :identifier'),
+                   {"identifier": identifier})
+    db.commit()
+
+
+def _store_otp_for_user(db: Session, user, otp: str, purpose: str, *, identifier: Optional[str] = None) -> None:
+    identifiers = _unique_identifiers(identifier, user.PhoneNumber, user.Email)
+    for value in identifiers:
+        _db_otp_store(db, value, otp, purpose)
+
+
+def _send_phone_otp(db: Session, phone: str, otp: str, channel: str) -> bool:
+    channel = (channel or "").strip().lower()
+    if channel == "whatsapp":
+        try:
+            from app.whatsapp.service import send_whatsapp
+            return send_whatsapp(
+                db,
+                phone,
+                (
+                    "Your TWAM login OTP is "
+                    f"{otp}. It is valid for {_OTP_TTL_MINUTES} minutes."
+                ),
+                "OTP",
+            )
+        except Exception as e:
+            print(f"[Auth] OTP WhatsApp failed: {e}")
+            return False
+
+    try:
+        from app.ekart.notifications import _send_sms
+        return _send_sms(db, phone, "OTP", [otp])
+    except Exception as e:
+        print(f"[Auth] OTP SMS failed: {e}")
+        return False
+
+
+def _send_email_otp(db: Session, email: str, otp: str, *, full_name: str = "") -> bool:
+    try:
+        from app.sendemail.repository import send_email
+        from app.sendemail.schemas import EmailCreate
+        name = full_name.strip() or email
+        return send_email(db, EmailCreate(
+            name    = name,
+            email   = email,
+            subject = "Your Login OTP — TWAM",
+            message = (
+                f"<p>Hi {name},</p>"
+                f"<p>Your one-time login code is: "
+                f"<strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
+                f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
+            ),
+            filename=None, isFile=False, data=None,
+        ))
+    except Exception as e:
+        print(f"[Auth] OTP email failed: {e}")
+        return False
+
+
+def _send_otp_for_user(db: Session, user, *, purpose: str, channel: str = "email", identifier: Optional[str] = None) -> dict:
+    otp = _gen_otp()
+    channel = (channel or "email").strip().lower()
+    has_phone = bool(user.PhoneNumber and user.PhoneNumber.strip())
+    has_email = bool(user.Email and "@" in user.Email)
+
+    _store_otp_for_user(db, user, otp, purpose, identifier=identifier)
+
+    sent_email = False
+    sent_phone = False
+    if channel == "email" and has_email:
+        sent_email = _send_email_otp(db, user.Email, otp, full_name=user.full_name or user.Email)
+    elif channel in {"whatsapp", "sms"} and has_phone:
+        sent_phone = _send_phone_otp(db, user.PhoneNumber, otp, channel)
+    elif has_email:
+        sent_email = _send_email_otp(db, user.Email, otp, full_name=user.full_name or user.Email)
+    elif has_phone:
+        sent_phone = _send_phone_otp(db, user.PhoneNumber, otp, "sms")
+
+    return {
+        "registered": True,
+        "hasEmail": has_email,
+        "hasPhone": has_phone,
+        "channels": (
+            ["email"] if has_email and not has_phone else
+            ["whatsapp", "sms"] if has_phone and not has_email else
+            ["email", "whatsapp", "sms"]
+        ),
+        "selectedChannel": channel,
+        "maskedPhone": _mask_phone(user.PhoneNumber) if has_phone else None,
+        "maskedEmail": _mask_email(user.Email) if has_email else None,
+        "sentEmail": sent_email,
+        "sentPhone": sent_phone,
+        "message": "OTP sent.",
+    }
+
+
+def _registration_conflict_message() -> str:
+    return "This email or phone number is already registered. Please sign in instead."
+
+
+def _has_duplicate_registration_error(errors: list[dict]) -> bool:
+    return any((error or {}).get("code") in {"DuplicatePhoneNumber", "DuplicateEmail"} for error in errors)
+
+
+def _sync_people(db: Session, user, *, modified_by: str = "system") -> None:
+    """
+    Mirror every user-facing field from auth.IdentityUser → twam.People.
+    Called after every admin write (updateUser, deleteUser).
+    Keeps both tables in the same transaction so a sync failure aborts the write.
+    """
+    try:
+        people = db.query(People).filter(People.userProfileId == user.Id).first()
+        if people is None:
+            people_id = _next_people_id(db)
+            if people_id is None:
+                raise RuntimeError("Could not allocate People.PersonalId.")
+            people = People(
+                personalId=people_id,
+                userProfileId=user.Id,
+                createdDate=datetime.now(timezone.utc),
+                createdBy=user.CreatedBy or modified_by,
+                organizationId=user.OrganizationId,
+            )
+            db.add(people)
+
+        people.firstName = user.FirstName
+        people.middleName = user.MiddleName
+        people.lastName = user.LastName
+        people.emailId = user.Email
+        people.phoneNumber = user.PhoneNumber
+        people.profileImageUrl = user.ProfileImageUrl
+        people.isActive = user.IsActive
+        people.roleId = user.UserRoleId
+        people.deletedInd = user.DeletedInd
+        people.modifiedDate = datetime.now(timezone.utc)
+        people.modifiedBy = modified_by
+        db.flush()
+    except Exception as e:
+        print(f"[Sync] People sync failed for user {user.Id}: {e}")
+        raise
+
+
+def _send_otp_to_channels(db: Session, user, *, purpose: str) -> dict:
+    """
+    Generate one OTP and dispatch it to every available channel (SMS + email).
+    OTP is stored keyed by both phone and email so either can be used to verify.
+    Returns channel info dict suitable for including in the API response.
+    """
+    otp       = _gen_otp()
+    has_phone = bool(user.PhoneNumber and user.PhoneNumber.strip())
+    has_email = bool(user.Email and "@" in user.Email)
+
+    if has_phone:
+        _db_otp_store(db, user.PhoneNumber, otp, purpose)
+    if has_email:
+        _db_otp_store(db, user.Email, otp, purpose)
+
+    if has_phone:
+        try:
+            from app.ekart.notifications import _send_sms
+            _send_sms(db, user.PhoneNumber, "OTP", [otp])
+        except Exception as e:
+            print(f"[Auth] OTP SMS failed: {e}")
+
+    if has_email:
+        try:
+            from app.sendemail.repository import send_email
+            from app.sendemail.schemas import EmailCreate
+            name = user.full_name or user.Email
+            send_email(db, EmailCreate(
+                name    = name,
+                email   = user.Email,
+                subject = "Your Login OTP — TWAM",
+                message = (
+                    f"<p>Hi {name},</p>"
+                    f"<p>Your one-time login code is: "
+                    f"<strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
+                    f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
+                ),
+                filename=None, isFile=False, data=None,
+            ))
+        except Exception as e:
+            print(f"[Auth] OTP email failed: {e}")
+
+    return {
+        "hasPhone":    has_phone,
+        "hasEmail":    has_email,
+        "maskedPhone": _mask_phone(user.PhoneNumber) if has_phone else None,
+        "maskedEmail": _mask_email(user.Email)       if has_email else None,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN — POST /auth/token
+# TOKEN — POST /connect/token
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("connect/token", response_model=TokenResponse, summary="Login — get JWT access token")
@@ -71,12 +387,10 @@ async def token(
 ):
     if grant_type != "password":
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
-
     if not _validate_client(client_id, client_secret):
         raise HTTPException(status_code=401, detail="invalid_client")
 
     result = authenticate_user(db, username, password)
-
     if not result.success:
         error_map = {
             "not_allowed":         "User not found.",
@@ -87,33 +401,144 @@ async def token(
 
     claims       = build_token_claims(db, result.user)
     access_token = create_access_token(claims)
-
     return TokenResponse(access_token=access_token, expires_in=EXPIRES_MINUTES * 60)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNUP — POST /auth/signup
+#
+# Duplicate email/phone → HTTP 409 and the frontend should redirect to sign in.
+# WhatsApp welcome is sent inside create_identity_user (repository) when phone
+# is present. No WhatsApp call here — that would be a double send.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/signup", status_code=201, summary="Register a new user")
 async def signup(request: RegisterUserRequest, db: Session = Depends(get_db)):
     result = create_identity_user(db, request)
+
     if result["succeeded"]:
         return {"message": "User created successfully.", "userId": result["user_id"]}
-    raise HTTPException(status_code=400, detail={"errors": result["errors"]})
+    errors = result.get("errors", [])
+    if _has_duplicate_registration_error(errors):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "already_registered": True,
+                "message": _registration_conflict_message(),
+            },
+        )
+    raise HTTPException(status_code=400, detail={"message": "User creation failed.", "errors": errors})
 
 
 @router.post("/guest-signup", status_code=201, summary="Register a guest/user-role account")
 async def guest_signup(request: RegisterUserRequest, db: Session = Depends(get_db)):
     request.RoleId = request.RoleId or Roles.USER
     result = create_identity_user(db, request)
+
     if result["succeeded"]:
         return {"Succeeded": True, "message": "User created successfully.", "userId": result["user_id"]}
-    raise HTTPException(status_code=400, detail={"message": "User creation failed.", "errors": result["errors"]})
+    errors = result.get("errors", [])
+    if _has_duplicate_registration_error(errors):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "already_registered": True,
+                "message": _registration_conflict_message(),
+            },
+        )
+    raise HTTPException(status_code=400, detail={"message": "User creation failed.", "errors": errors})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHONE / EMAIL OTP LOGIN
+#   POST /auth/send-login-otp    → send OTP to an existing user's channels
+#   POST /auth/verify-login-otp  → verify OTP, return JWT token
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/send-login-otp", summary="Send OTP to phone or email for passwordless login")
+async def send_login_otp(payload: dict, db: Session = Depends(get_db)):
+    """
+    Body: { "identifier": "9876543210" }   ← 10-digit phone OR email
+    Sends OTP to all channels the account has (SMS + email).
+    Always returns 200 — never reveals whether the account exists.
+    """
+    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    channel    = _normalize_identifier(payload.get("channel") or "")
+    if not identifier:
+        raise HTTPException(status_code=400, detail="identifier is required.")
+
+    user = _get_identity_user_by_username(db, identifier)
+    if not user or user.DeletedInd or not user.IsActive:
+        return {"success": True, "message": "If this account exists, an OTP has been sent.",
+                "hasPhone": False, "hasEmail": False}
+
+    if _is_email_identifier(identifier):
+        channel = "email"
+    elif channel.lower() not in {"whatsapp", "sms"}:
+        channel = "whatsapp" if user.PhoneNumber else "email"
+
+    channels = _send_otp_for_user(db, user, purpose="phone_login", channel=channel, identifier=identifier)
+    return {"success": True, "message": "OTP sent. Please check your phone or email.", **channels}
+
+
+@router.post("/verify-login-otp", summary="Verify OTP and return JWT token")
+async def verify_login_otp(payload: dict, db: Session = Depends(get_db)):
+    """
+    Body: { "identifier": "9876543210", "otp": "123456" }
+    identifier = phone or email. Returns same JWT shape as password login.
+    """
+    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    otp        = (payload.get("otp") or "").strip()
+
+    if not identifier or not otp:
+        raise HTTPException(status_code=400, detail="identifier and otp are required.")
+
+    stored = _db_otp_get(db, identifier, purpose="phone_login")
+    if not stored:
+        user = _get_identity_user_by_username(db, identifier)
+        if user:
+            for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
+                stored = _db_otp_get(db, alt_identifier, purpose="phone_login")
+                if stored:
+                    identifier = alt_identifier
+                    break
+    if not stored:
+        raise HTTPException(status_code=400, detail="OTP not found. Please request a new one.")
+    if stored["otp"] != otp:
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
+
+    expires_at = stored["expires_at"]
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires_at:
+        user = _get_identity_user_by_username(db, identifier)
+        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None):
+            _db_otp_delete(db, alt_identifier, purpose="phone_login")
+        raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
+
+    user = _get_identity_user_by_username(db, identifier)
+    if not user or user.DeletedInd or not user.IsActive:
+        raise HTTPException(status_code=404, detail="Account not found or inactive.")
+
+    # Clean OTP from all identifiers it was stored under
+    for ident in {identifier, user.PhoneNumber or "", user.Email or ""}:
+        if ident:
+            _db_otp_delete(db, ident, purpose="phone_login")
+
+    claims       = build_token_claims(db, user)
+    access_token = create_access_token(claims)
+    return {
+        "success":      True,
+        "access_token": access_token,
+        "token_type":   "Bearer",
+        "expires_in":   EXPIRES_MINUTES * 60,
+        "message":      "Login successful.",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UPDATE PROFILE — POST /auth/update
+# People sync handled inside repository.update_identity_user_profile
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/update", summary="Update current user profile (requires login)")
@@ -148,26 +573,60 @@ async def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    user.IsActive = request.IsActive
-    user.UserRoleId = request.RoleId
+    user.IsActive          = request.IsActive
+    user.UserRoleId        = request.RoleId
     user.AccessFailedCount = 0
-    user.LockoutEnd = None
-    user.ModifiedDate = datetime.now(timezone.utc)
+    user.LockoutEnd        = None
+    user.ModifiedDate      = datetime.now(timezone.utc)
+    user.ModifiedBy        = current_user.email
+    db.flush()
 
-    db.execute(
-        text("""
-            UPDATE twam."People"
-            SET "IsActive" = :active, "RoleId" = :role, "ModifiedDate" = NOW()
-            WHERE "UserProfileId" = :uid
-        """),
-        {"active": request.IsActive, "role": request.RoleId, "uid": user.Id},
-    )
+    # Sync ALL fields (not just IsActive + RoleId as before)
+    _sync_people(db, user, modified_by=current_user.email)
     db.commit()
+
     return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHANGE PASSWORD
+# DELETE USER (admin) — POST /auth/deleteUser
+# Soft-deletes both auth.IdentityUser AND twam.People atomically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/deleteUser", summary="Admin: soft-delete a user from both tables")
+async def delete_user(
+    payload:      dict,
+    current_user: CurrentUser = Depends(require_roles(Roles.SUPER_ADMIN)),
+    db:           Session     = Depends(get_db),
+):
+    """
+    Body: { "emailId": "user@example.com" }
+    Sets DeletedInd=True, IsActive=False on both tables in one transaction.
+    """
+    email = (payload.get("emailId") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="emailId is required.")
+
+    user = _get_identity_user_by_username(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if user.DeletedInd:
+        raise HTTPException(status_code=400, detail="User is already deleted.")
+
+    now = datetime.now(timezone.utc)
+
+    user.DeletedInd   = True
+    user.IsActive     = False
+    user.ModifiedDate = now
+    user.ModifiedBy   = current_user.email
+    _sync_people(db, user, modified_by=current_user.email)
+
+    db.commit()
+    return {"success": True, "message": f"User {email} has been deleted."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE PASSWORD — POST /auth/ChangePassword
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/ChangePassword", summary="Change password (requires login)")
@@ -198,11 +657,7 @@ async def send_reset_password(request: ResetPasswordRequest, db: Session = Depen
         return generic_response
 
     reset_token = create_access_token(
-        user_claims={
-            "sub":     user.Email,
-            "purpose": "password_reset",
-            "email":   user.Email,
-        },
+        user_claims={"sub": user.Email, "purpose": "password_reset", "email": user.Email},
         expires_minutes=15,
     )
     reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
@@ -210,7 +665,6 @@ async def send_reset_password(request: ResetPasswordRequest, db: Session = Depen
     try:
         from app.sendemail.repository import send_email
         from app.sendemail.schemas import EmailCreate
-
         full_name = user.full_name or user.Email
         sent = send_email(db, EmailCreate(
             name    = full_name,
@@ -218,16 +672,14 @@ async def send_reset_password(request: ResetPasswordRequest, db: Session = Depen
             subject = request.Subject or "Reset Your Password — Only TWAM",
             message = (
                 f"Hello {full_name},\n\n"
-                f"We received a request to reset your password.\n\n"
-                f"Click the link below to reset it (valid for 15 minutes):\n"
+                f"Click the link below to reset your password (valid 15 minutes):\n"
                 f"{reset_link}\n\n"
-                f"If you did not request this, please ignore this email.\n\n"
-                f"Regards,\nTWAM Team"
+                f"If you did not request this, ignore this email.\n\nTWAM Team"
             ),
             filename=None, isFile=False, data=None,
         ))
         if not sent:
-            raise HTTPException(status_code=500, detail="Failed to send reset email. Please try again later.")
+            raise HTTPException(status_code=500, detail="Failed to send reset email.")
     except ImportError:
         raise HTTPException(status_code=500, detail="Email service not available.")
 
@@ -269,165 +721,90 @@ async def me(current_user: CurrentUser = Depends(get_current_user)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OTP — for guest checkout account creation + password reset
+# SEND OTP — POST /auth/send-otp  (guest checkout)
 # ─────────────────────────────────────────────────────────────────────────────
-
-_OTP_TTL_MINUTES = 10
-_OTP_TABLE = 'auth."OtpStore"'
-
-
-def _ensure_otp_table(db: Session) -> None:
-    # Table is created at startup by OtpStore SQLAlchemy model via create_all().
-    pass
-
-
-def _gen_otp(length: int = 6) -> str:
-    return "".join(random.choices(string.digits, k=length))
-
-
-def _db_otp_store(db: Session, identifier: str, otp: str, purpose: str) -> None:
-    """Store or refresh an OTP. identifier may be email or phone number."""
-    identifier_type = "email" if "@" in identifier else "phone"
-    expires = datetime.now(timezone.utc) + timedelta(minutes=_OTP_TTL_MINUTES)
-    db.execute(text(f"""
-        INSERT INTO {_OTP_TABLE}
-            ("Identifier", "IdentifierType", "Otp", "ExpiresAt", "Purpose")
-        VALUES
-            (:identifier, :id_type, :otp, :expires, :purpose)
-        ON CONFLICT ("Identifier", "Purpose") DO UPDATE
-            SET "Otp"       = EXCLUDED."Otp",
-                "ExpiresAt" = EXCLUDED."ExpiresAt"
-    """), {
-        "identifier": identifier,
-        "id_type":    identifier_type,
-        "otp":        otp,
-        "expires":    expires,
-        "purpose":    purpose,
-    })
-    db.commit()
-
-
-def _db_otp_get(db: Session, identifier: str, purpose: Optional[str] = None) -> dict | None:
-    """Fetch the latest OTP row for identifier, optionally filtered by purpose."""
-    if purpose:
-        row = db.execute(text(f"""
-            SELECT "Otp", "ExpiresAt", "Purpose", "IdentifierType"
-            FROM   {_OTP_TABLE}
-            WHERE  "Identifier" = :identifier AND "Purpose" = :purpose
-            ORDER BY "ExpiresAt" DESC LIMIT 1
-        """), {"identifier": identifier, "purpose": purpose}).fetchone()
-    else:
-        row = db.execute(text(f"""
-            SELECT "Otp", "ExpiresAt", "Purpose", "IdentifierType"
-            FROM   {_OTP_TABLE}
-            WHERE  "Identifier" = :identifier
-            ORDER BY "ExpiresAt" DESC LIMIT 1
-        """), {"identifier": identifier}).fetchone()
-    if not row:
-        return None
-    return {"otp": row[0], "expires_at": row[1], "purpose": row[2], "identifier_type": row[3]}
-
-
-def _db_otp_delete(db: Session, identifier: str, purpose: Optional[str] = None) -> None:
-    """Delete OTP row(s) for identifier, optionally scoped to a purpose."""
-    if purpose:
-        db.execute(text(f"""
-            DELETE FROM {_OTP_TABLE}
-            WHERE "Identifier" = :identifier AND "Purpose" = :purpose
-        """), {"identifier": identifier, "purpose": purpose})
-    else:
-        db.execute(text(f'DELETE FROM {_OTP_TABLE} WHERE "Identifier" = :identifier'),
-                   {"identifier": identifier})
-    db.commit()
-
 
 @router.post("/send-otp", summary="Send OTP to email/sms for guest checkout or verification")
 async def send_otp(payload: dict, db: Session = Depends(get_db)):
-    email   = (payload.get("email") or "").strip().lower()
-    phone   = (payload.get("phone") or "").strip()
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
+    channel = _normalize_identifier(payload.get("channel") or "")
     purpose = payload.get("purpose", "guest_checkout")
 
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Valid email is required.")
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Identifier is required.")
 
-    _ensure_otp_table(db)
+    registered_user = _get_identity_user_by_username(db, identifier)
+    if registered_user and not registered_user.DeletedInd and registered_user.IsActive:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "already_registered": True,
+                "message": _registration_conflict_message(),
+            },
+        )
+
     otp = _gen_otp()
-    _db_otp_store(db, email, otp, purpose)
+    if _is_email_identifier(identifier):
+        channel = "email"
+    elif channel.lower() not in {"whatsapp", "sms"}:
+        channel = "whatsapp"
 
-    # ── Send OTP via email ────────────────────────────────────────────────────
-    try:
-        from app.sendemail.repository import send_email
-        from app.sendemail.schemas import EmailCreate
-        send_email(db, EmailCreate(
-            name    = email.split("@")[0],
-            email   = email,
-            subject = "Your OTP — Only TWAM",
-            message = (
-                f"<p>Your one-time password (OTP) is: <strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
-                f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
-            ),
-            filename=None, isFile=False, data=None,
-        ))
-    except Exception as e:
-        print(f"[Auth] OTP email failed: {e}")
+    # For guest verification we store the OTP against the supplied identifier.
+    # If the caller also sent both email and phone, keep both addresses in sync.
+    extra_email = _normalize_identifier(payload.get("email") or "")
+    extra_phone = _normalize_identifier(payload.get("phone") or "")
+    identifiers = _unique_identifiers(identifier, extra_email, extra_phone)
+    for value in identifiers:
+        _db_otp_store(db, value, otp, purpose)
 
-    # ── Send OTP via SMS — SmartPing OTP template: ${var1} = otp ─────────────
-    if phone:
-        try:
-            from app.ekart.notifications import _send_sms
-            _send_sms(db, phone, "OTP", [otp])
-        except Exception as sms_err:
-            print(f"[Auth] OTP SMS failed: {sms_err}")
+    sent = False
+    if _is_email_identifier(identifier):
+        sent = _send_email_otp(db, identifier, otp, full_name=identifier.split("@")[0])
+    else:
+        sent = _send_phone_otp(db, identifier, otp, channel)
 
-    return {"success": True, "message": "OTP sent. Please check your email."}
+    return {
+        "success": True,
+        "message": "OTP sent. Please check your email or phone.",
+        "channel": channel,
+        "sent": sent,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORGOT PASSWORD — 3-step OTP flow
-#   Step 1: POST /auth/forgot-password/check       → what channels does this account have?
-#   Step 2: POST /auth/forgot-password/send-otp    → send OTP to chosen channel
-#   Step 3: POST /auth/forgot-password/verify-otp  → verify OTP + reset password in one call
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _mask_email(email: str) -> str:
-    if not email or "@" not in email:
-        return email
-    local, domain = email.split("@", 1)
-    return local[:2] + "***@" + domain
-
-
-def _mask_phone(phone: str) -> str:
-    if not phone or len(phone) < 4:
-        return phone
-    return phone[:2] + "******" + phone[-2:]
-
 
 @router.post("/forgot-password/check", summary="Check what channels the account has")
 async def forgot_password_check(payload: dict, db: Session = Depends(get_db)):
-    identifier = (payload.get("identifier") or "").strip()
+    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
     if not identifier:
         raise HTTPException(status_code=400, detail="Identifier is required.")
 
     user = _get_identity_user_by_username(db, identifier)
     if not user:
         return {"registered": False, "hasEmail": False, "hasPhone": False,
-                "maskedEmail": None, "maskedPhone": None}
+                "maskedEmail": None, "maskedPhone": None, "channels": []}
 
     has_email = bool(user.Email)
     has_phone = bool(user.PhoneNumber)
+    channels = ["email"] if has_email and not has_phone else ["whatsapp", "sms"] if has_phone and not has_email else ["email", "whatsapp", "sms"]
     return {
         "registered":  True,
         "hasEmail":    has_email,
         "hasPhone":    has_phone,
         "maskedEmail": _mask_email(user.Email)       if has_email else None,
         "maskedPhone": _mask_phone(user.PhoneNumber) if has_phone else None,
+        "channels":    channels,
     }
 
 
 @router.post("/forgot-password/send-otp", summary="Send OTP to chosen channel for password reset")
 async def forgot_password_send_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier = (payload.get("identifier") or "").strip()
-    channel    = (payload.get("channel")    or "email").strip()  # 'email' | 'phone'
+    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    channel    = _normalize_identifier(payload.get("channel") or "")
 
     if not identifier:
         raise HTTPException(status_code=400, detail="Identifier is required.")
@@ -436,133 +813,144 @@ async def forgot_password_send_otp(payload: dict, db: Session = Depends(get_db))
     if not user:
         return {"success": True, "message": "If this account exists, an OTP has been sent."}
 
-    _ensure_otp_table(db)
-    otp = _gen_otp()
-    _db_otp_store(db, identifier, otp, "forgot_password")
+    if _is_email_identifier(identifier):
+        channel = "email"
+    elif channel.lower() not in {"whatsapp", "sms"}:
+        channel = "whatsapp" if user.PhoneNumber else "email"
 
-    sms_ok = False
-    if channel == "phone" and user.PhoneNumber:
-        # SmartPing OTP template: ${var1} = otp
-        try:
-            from app.ekart.notifications import _send_sms
-            sms_ok = _send_sms(db, user.PhoneNumber, "OTP", [otp])
-            if not sms_ok:
-                print(f"[Auth] SMS returned failure for {user.PhoneNumber}")
-        except Exception as e:
-            print(f"[Auth] forgot-password SMS exception: {e}")
-    else:
-        try:
-            from app.sendemail.repository import send_email
-            from app.sendemail.schemas import EmailCreate
-            full_name = user.full_name or user.Email or identifier
-            send_email(db, EmailCreate(
-                name    = full_name,
-                email   = user.Email,
-                subject = "Reset Your Password — Only TWAM",
-                message = (
-                    f"<p>Hi {full_name},</p>"
-                    f"<p>Your password reset OTP is: "
-                    f"<strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
-                    f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
-                    f"<p>If you did not request this, please ignore this email.</p>"
-                ),
-                filename=None, isFile=False, data=None,
-            ))
-        except Exception as e:
-            print(f"[Auth] forgot-password email failed: {e}")
-
-    if channel == "phone" and not sms_ok:
-        return {"success": True, "smsSent": False,
-                "message": "OTP generated but SMS delivery failed. Check SMS credentials/template."}
-    return {"success": True, "smsSent": channel == "phone" and sms_ok, "message": "OTP sent."}
+    response = _send_otp_for_user(db, user, purpose="forgot_password", channel=channel, identifier=identifier)
+    return {
+        "success": True,
+        "message": "OTP sent.",
+        "selectedChannel": response["selectedChannel"],
+        "hasEmail": response["hasEmail"],
+        "hasPhone": response["hasPhone"],
+        "maskedEmail": response["maskedEmail"],
+        "maskedPhone": response["maskedPhone"],
+        "channels": response["channels"],
+    }
 
 
-@router.post("/forgot-password/verify-otp", summary="Verify OTP and reset password in one call")
+@router.post("/forgot-password/verify-otp", summary="Verify OTP and reset password")
 async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier   = (payload.get("identifier")   or "").strip()
-    otp          = (payload.get("otp")          or "").strip()
-    new_password = (payload.get("newPassword")  or "").strip()
+    identifier   = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    otp          = (payload.get("otp")         or "").strip()
+    new_password = (payload.get("newPassword") or "").strip()
 
     if not identifier or not otp or not new_password:
         raise HTTPException(status_code=400, detail="identifier, otp and newPassword are required.")
 
     stored = _db_otp_get(db, identifier, purpose="forgot_password")
     if not stored:
+        user = _get_identity_user_by_username(db, identifier)
+        if user:
+            for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
+                stored = _db_otp_get(db, alt_identifier, purpose="forgot_password")
+                if stored:
+                    identifier = alt_identifier
+                    break
+    if not stored:
         raise HTTPException(status_code=400, detail="OTP not found. Please request a new one.")
-
     if stored["otp"] != otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP. Please check and try again.")
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
 
     expires_at = stored["expires_at"]
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > expires_at:
-        _db_otp_delete(db, identifier, purpose="forgot_password")
+        user = _get_identity_user_by_username(db, identifier)
+        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None):
+            _db_otp_delete(db, alt_identifier, purpose="forgot_password")
         raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
-    if stored.get("purpose") and stored["purpose"] != "forgot_password":
-        raise HTTPException(status_code=400, detail="Invalid OTP purpose.")
-
     user = _get_identity_user_by_username(db, identifier)
-    if not user or not user.Email:
+    if not user:
         raise HTTPException(status_code=404, detail="Account not found.")
 
-    result = reset_password_with_token(db, user.Email, new_password)
+    result = reset_password_with_token(db, user.Email or user.PhoneNumber or identifier, new_password)
     if not result["succeeded"]:
         raise HTTPException(status_code=400, detail={"errors": result["errors"]})
 
-    _db_otp_delete(db, identifier, purpose="forgot_password")
+    for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
+        _db_otp_delete(db, alt_identifier, purpose="forgot_password")
     return {"success": True, "message": "Password has been reset successfully. You can now sign in."}
 
 
-@router.post("/verify-otp", summary="Verify OTP and create guest account if purpose=guest_checkout")
+# ─────────────────────────────────────────────────────────────────────────────
+# VERIFY OTP — POST /auth/verify-otp  (guest checkout)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/verify-otp", summary="Verify OTP and create guest account")
 async def verify_otp(payload: dict, db: Session = Depends(get_db)):
-    email   = (payload.get("email") or "").strip().lower()
+    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
     otp     = (payload.get("otp") or "").strip()
     purpose = payload.get("purpose", "guest_checkout")
 
-    if not email or not otp:
-        raise HTTPException(status_code=400, detail="Email and OTP are required.")
+    if not identifier or not otp:
+        raise HTTPException(status_code=400, detail="Identifier and OTP are required.")
 
-    stored = _db_otp_get(db, email, purpose="guest_checkout")
+    stored = _db_otp_get(db, identifier, purpose="guest_checkout")
+    if not stored:
+        user = _get_identity_user_by_username(db, identifier)
+        if user:
+            for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
+                stored = _db_otp_get(db, alt_identifier, purpose="guest_checkout")
+                if stored:
+                    identifier = alt_identifier
+                    break
     if not stored:
         raise HTTPException(status_code=400, detail="No OTP found. Please request a new one.")
-
     if stored["otp"] != otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP. Please check and try again.")
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
 
     expires_at = stored["expires_at"]
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > expires_at:
-        _db_otp_delete(db, email, purpose="guest_checkout")
+        user = _get_identity_user_by_username(db, identifier)
+        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None, payload.get("email"), payload.get("phone")):
+            _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
         raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
     if purpose == "guest_checkout":
-        existing = _get_identity_user_by_username(db, email)
+        existing = _get_identity_user_by_username(db, identifier)
         DEFAULT_PASSWORD = "twam@1234"
 
         if not existing:
             from app.auth.schemas import RegisterUserRequest as RUR
-            first_name = payload.get("firstName") or email.split("@")[0]
+            first_name = payload.get("firstName") or (
+                identifier.split("@")[0] if _is_email_identifier(identifier) else identifier
+            )
+            account_email = _normalize_identifier(payload.get("email") or "")
+            account_phone = _normalize_identifier(payload.get("phone") or "")
+            if _is_email_identifier(identifier):
+                account_email = identifier
+            elif not account_phone:
+                account_phone = identifier
             reg = RUR(
-                FirstName   = first_name,
-                LastName    = payload.get("lastName") or "",
-                EmailId     = email,
-                Password    = DEFAULT_PASSWORD,
-                TemporaryPassword = DEFAULT_PASSWORD,
-                PhoneNumber = payload.get("phone") or "",
-                IsActive    = True,
-                RoleId      = Roles.USER,
+                FirstName=first_name, LastName=payload.get("lastName") or "",
+                EmailId=account_email or None, Password=DEFAULT_PASSWORD,
+                TemporaryPassword=DEFAULT_PASSWORD,
+                PhoneNumber=account_phone or None, IsActive=True, RoleId=Roles.USER,
             )
             result = create_identity_user(db, reg)
             if not result["succeeded"]:
-                raise HTTPException(status_code=500, detail="Account creation failed. Please try again.")
+                raise HTTPException(status_code=500, detail="Account creation failed.")
+            # Welcome email + WhatsApp (if phone given) sent inside create_identity_user
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "already_registered": True,
+                    "message": _registration_conflict_message(),
+                },
+            )
 
-        user         = _get_identity_user_by_username(db, email)
+        user         = _get_identity_user_by_username(db, identifier)
         claims       = build_token_claims(db, user)
         access_token = create_access_token(claims)
-        _db_otp_delete(db, email, purpose="guest_checkout")
+        for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber, payload.get("email"), payload.get("phone")):
+            _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
 
         return {
             "success":      True,
@@ -572,27 +960,25 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
             "message":      "Account verified successfully.",
         }
 
-    _db_otp_delete(db, email, purpose="guest_checkout")
-    return {"success": True, "message": "OTP verified. You may now reset your password."}
+    user = _get_identity_user_by_username(db, identifier)
+    for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None, payload.get("email"), payload.get("phone")):
+        _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
+    return {"success": True, "message": "OTP verified."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGOUT — POST /auth/logout
+# ─────────────────────────────────────────────────────────────────────────────
 
 _bearer_scheme = _HTTPBearer(auto_error=False)
 
 
 @router.post("/logout", summary="Logout — invalidate JWT token")
 async def logout(
-    credentials: _Optional[_Creds] = Depends(_bearer_scheme),
-    current_user: CurrentUser      = Depends(get_current_user),
-    db: Session                    = Depends(get_db),
+    credentials:  _Optional[_Creds] = Depends(_bearer_scheme),
+    current_user: CurrentUser       = Depends(get_current_user),
+    db:           Session           = Depends(get_db),
 ):
-    """
-    Adds the current token to the blacklist table.
-    After this, the token returns 401 on every subsequent request.
-    The frontend/mobile app should delete the token from local storage after calling this.
-    """
     if credentials and credentials.credentials:
-        _blacklist_token(
-            token=credentials.credentials,
-            email=current_user.email,
-            db=db,
-        )
+        _blacklist_token(token=credentials.credentials, email=current_user.email, db=db)
     return {"success": True, "message": "Logged out successfully."}
