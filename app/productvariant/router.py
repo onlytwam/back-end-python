@@ -7,6 +7,8 @@ from . import schemas, repository
 import os, shutil, uuid
 from fastapi import UploadFile, File, Form
 from .models import ProductImage, ProductVariant
+from app.products.models import Products
+
 # from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
 
 router = APIRouter(
@@ -14,8 +16,7 @@ router = APIRouter(
     prefix="/api/ProductVariants",
      tags=["ProductVariants"])
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-
+# UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 
 def parse_filters(raw: Optional[str]) -> Optional[list]:
     if not raw:
@@ -112,44 +113,63 @@ def upload_variant_images(
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db)
 ):
-    from .models import ProductImage, ProductVariant
 
-    #  Validate variant
+    # Validate variant
     variant = db.query(ProductVariant).filter(
         ProductVariant.productVariantId == variant_id
     ).first()
-
     if not variant:
         raise HTTPException(status_code=404, detail="Variant not found")
 
-    product_id = variant.productId
+    # Get product to use its code as folder name
+    product = db.query(Products).filter(
+        Products.productId == variant.productId
+    ).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # Sanitize product code for use as folder name
+    # e.g. "BNB 01" → "BNB-01", "TLCB 925" → "TLCB-925"
+    product_folder = product.productCode.strip().replace(' ', '-').replace('/', '-')
+
+    # Build directory: image/BNB-01/
+    upload_dir = os.path.join("image", product_folder)
+    os.makedirs(upload_dir, exist_ok=True)
 
     saved = []
 
     for f in files:
-        ext = os.path.splitext(f.filename or "img.jpg")[1] or ".jpg"
-        fname = f"{uuid.uuid4().hex}{ext}"
-        disk_path = os.path.join(UPLOAD_DIR, fname)
+        # Keep original filename but sanitize it
+        original_name = (f.filename or "image.jpg").replace(' ', '-')
+        ext = os.path.splitext(original_name)[1] or ".jpg"
+        
+        # Use original name if provided, else generate unique name
+        # to avoid collisions append short uuid if file already exists
+        fname = original_name
+        disk_path = os.path.join(upload_dir, fname)
+        
+        if os.path.exists(disk_path):
+            # Avoid overwrite — prefix with short uuid
+            fname = f"{uuid.uuid4().hex[:8]}_{original_name}"
+            disk_path = os.path.join(upload_dir, fname)
 
-        # Save file to disk
+        # Save to disk
         with open(disk_path, "wb") as out:
             shutil.copyfileobj(f.file, out)
 
-        file_path = f"/{UPLOAD_DIR}/{fname}"
+        # Store as: image/BNB-01/beig-6.png  (no leading slash)
+        file_path = f"image/{product_folder}/{fname}"
 
-        print(f"Saving image → Variant: {variant_id}, Product: {product_id}")
+        print(f"Saving → {file_path} | Variant: {variant_id} | Product: {variant.productId}")
 
         # Save to DB
         img = ProductImage(
-            productId=product_id,
+            productId=variant.productId,
             productVariantId=variant_id,
             fileName=fname,
             fileType=f.content_type or "image/jpeg",
-            filePath=file_path,
+            filePath=file_path,   # ← stored as image/BNB-01/beig-6.png
         )
-
         db.add(img)
         db.commit()
         db.refresh(img)

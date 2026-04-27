@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI):
 
     # 3. Uploads directory
     os.makedirs("uploads", exist_ok=True)
+    os.makedirs("image", exist_ok=True)
     os.makedirs(os.path.join("uploads", "profile-images"), exist_ok=True)
 
     from database import SessionLocal
@@ -230,6 +231,7 @@ def root():
 
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/image", StaticFiles(directory="image"), name="image")
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
