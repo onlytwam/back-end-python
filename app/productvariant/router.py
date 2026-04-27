@@ -6,6 +6,7 @@ from database import get_db
 from . import schemas, repository
 import os, shutil, uuid
 from fastapi import UploadFile, File, Form
+from .models import ProductImage, ProductVariant
 # from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
 
 router = APIRouter(
@@ -78,33 +79,113 @@ def delete_variant(variant_id: int, db: Session = Depends(get_db)):
     if not result:
         raise HTTPException(status_code=404, detail="ProductVariant not found.")
 
+# ── Get Images ─────────────────────────────────────────
+@router.get("/{variant_id}/images")
+def get_variant_images(variant_id: int, db: Session = Depends(get_db)):
+    from .models import ProductImage
 
+    images = db.query(ProductImage).filter(
+        ProductImage.productVariantId == variant_id
+    ).all()
+
+    # Debug log
+    print(f"Variant ID: {variant_id}, Images found: {len(images)}")
+
+    # Return clean response
+    return [
+        {
+            "productImageId": img.productImageId,
+            "productId": img.productId,
+            "productVariantId": img.productVariantId,
+            "fileName": img.fileName,
+            "filePath": img.filePath,
+            "fileType": img.fileType,
+        }
+        for img in images
+    ]
+# ─────────────────────────────────────────────────────────────
+# UPLOAD IMAGES
+# ─────────────────────────────────────────────────────────────
 @router.post("/{variant_id}/images", status_code=201)
 def upload_variant_images(
     variant_id: int,
     files: list[UploadFile] = File(...),
     db: Session = Depends(get_db)
 ):
-    """Upload images for a product variant. Saves to disk, records in ProductImage table."""
+    from .models import ProductImage, ProductVariant
+
+    #  Validate variant
+    variant = db.query(ProductVariant).filter(
+        ProductVariant.productVariantId == variant_id
+    ).first()
+
+    if not variant:
+        raise HTTPException(status_code=404, detail="Variant not found")
+
+    product_id = variant.productId
+
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+
     saved = []
+
     for f in files:
         ext = os.path.splitext(f.filename or "img.jpg")[1] or ".jpg"
         fname = f"{uuid.uuid4().hex}{ext}"
         disk_path = os.path.join(UPLOAD_DIR, fname)
+
+        # Save file to disk
         with open(disk_path, "wb") as out:
             shutil.copyfileobj(f.file, out)
+
         file_path = f"/{UPLOAD_DIR}/{fname}"
-        # Record in ProductImage table
-        from .models import ProductImage
-        from datetime import datetime, timezone
+
+        print(f"Saving image → Variant: {variant_id}, Product: {product_id}")
+
+        # Save to DB
         img = ProductImage(
+            productId=product_id,
             productVariantId=variant_id,
             fileName=fname,
-            filePath=file_path,
             fileType=f.content_type or "image/jpeg",
+            filePath=file_path,
         )
+
         db.add(img)
-        saved.append(file_path)
+        db.commit()
+        db.refresh(img)
+
+        saved.append({
+            "productImageId": img.productImageId,
+            "filePath": file_path
+        })
+
+    return {
+        "uploaded": len(saved),
+        "images": saved
+    }
+
+
+@router.delete("/{variant_id}/images/{image_id}", status_code=200)
+def delete_variant_image(variant_id: int, image_id: int, db: Session = Depends(get_db)):
+    from .models import ProductImage
+
+    img = db.query(ProductImage).filter(
+        ProductImage.productImageId == image_id,
+        ProductImage.productVariantId == variant_id  # safety check
+    ).first()
+
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Delete file from disk
+    try:
+        disk_path = img.filePath.lstrip("/")
+        if os.path.exists(disk_path):
+            os.remove(disk_path)
+    except Exception as e:
+        print(f"Warning: could not delete file: {e}")
+
+    db.delete(img)
     db.commit()
-    return {"uploaded": len(saved), "paths": saved}
+
+    return {"deleted": image_id}
