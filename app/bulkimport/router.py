@@ -96,7 +96,12 @@ def _cast(value: Any, dtype: str) -> Any:
         if dtype == "float":
             return float(raw)
         if dtype == "bool":
-            return raw.upper() in ("TRUE", "1", "YES", "Y")
+            val = raw.strip().upper()
+            if val in ("TRUE", "1", "YES", "Y"):
+                return True
+            if val in ("FALSE", "0", "NO", "N"):
+                return False
+            return None    
         return raw
     except (ValueError, TypeError):
         raise ValueError(f"Cannot cast '{value}' to {dtype}")
@@ -123,7 +128,6 @@ ENTITY_CONFIG: dict[str, dict] = {
             ("description",     "Description*",      "str",   True),
             ("categoryId",      "Category ID*",      "int",   True),
             ("brandId",         "Brand ID*",         "int",   True),
-            ("tag",             "Tags",              "str",   False),
             ("childCategoryId", "Child Category ID", "int",   False),
         ],
         "required": ["productCode", "name", "description", "categoryId", "brandId"],
@@ -337,7 +341,7 @@ def _insert_entity_row(db: Session, entity: str, row: dict, user_id: str, now: d
 
 MAX_SIZES = 5
 
-# REMOVED: stockNo, personalId, userProfileId, createdBy, taxHSNCodeId
+# REMOVED: stockNo, personalId, userProfileId, createdBy
 PRODUCT_COLS: list[tuple[str, str, str, bool]] = [
     ("productCode",    "Product Code*",     "str", True),
     ("name",           "Product Name*",     "str", True),
@@ -345,8 +349,6 @@ PRODUCT_COLS: list[tuple[str, str, str, bool]] = [
     ("categoryId",     "Category ID*",      "int", True),
     ("childCategoryId","Child Category ID", "int", False),
     ("brandId",        "Brand ID*",         "int", True),
-    ("tag",            "Tags",              "str", False),
-    ("taxHSNCodeId",   "TAX HSN Code",      "int", False),  # renamed
 ]
 
 # REMOVED: variantTaxHSNCodeId renamed, variantCode → productCode
@@ -369,7 +371,7 @@ SIZE_SLOT_COLS: list[tuple[str, str, str, bool]] = [
     ("cupSizeId",       "Cup Size ID",    "int",   False),   
     ("mrpPrice",        "MRP Price",      "float", True),
     ("finalPrice",      "Final Price",    "float", True),
-    ("availableQuantity",   "Stock Qty",      "int",   True),
+    ("availableQuantity",   "availableQuantity",      "int",   True),
     ("discountPercent", "Discount %",     "int",   False),
 ]
 
@@ -386,8 +388,6 @@ PRODUCT_BULK_SAMPLE: dict[str, Any] = {
     "categoryId":          1,
     "brandId":             1,
     "childCategoryId":     "",
-    "tag":                 "summer,casual",
-    "taxHSNCodeId":        "",
     # variant
     "variantCode":         "VAR-001-RED",
     "variantName":         "Red Variant",
@@ -484,7 +484,7 @@ def _parse_product_bulk_excel(file_bytes: bytes) -> list[dict]:
         )
         if not has_any_size:
             errors.append(
-                "At least one complete size slot (Size ID, MRP Price, Final Price, Stock Qty) is required"
+                "At least one complete size slot (Size ID, MRP Price, Final Price, available Quantity) is required"
             )
 
         record["_errors"] = errors
@@ -517,46 +517,23 @@ def _extract_valid_size_slots(record: dict) -> list[dict]:
         })
     return slots
 
-def _is_sample_row(rec: Any) -> bool:
-    """Safely detect sample rows. Works with both dict (flat) and tuple (hierarchical raw row)."""
-    if isinstance(rec, (list, tuple)):
-        # For hierarchical parser - convert tuple to dict-like access
-        def get_field(field_name: str) -> Any:
-            # Map field names to column indices (based on your _P_FIELDS etc.)
-            field_map = {
-                "productCode": 1,   # Column B (index 1 in 0-based)
-                "name": 2,
-                "variantCode": 9,   # Column J
-                "variantName": 10,
-            }
-            idx = field_map.get(field_name)
-            if idx is None or idx >= len(rec):
-                return None
-            val = rec[idx]
-            return str(val).strip() if val is not None else ""
-        
-        pcode = get_field("productCode")
-        vcode = get_field("variantCode")
-        name  = get_field("name").lower()
-    else:
-        # For flat parser (dict)
-        pcode = str(rec.get("productCode") or "").strip()
-        vcode = str(rec.get("variantCode") or "").strip()
-        name  = str(rec.get("name") or "").strip().lower()
+def _is_sample_row(rec: dict) -> bool:
+    pcode = str(rec.get("productCode") or "").strip()
+    vcode = str(rec.get("variantCode") or "").strip()
+    name  = str(rec.get("name") or "").strip().lower()
 
-    # Sample detection logic
-    if pcode in {"PRD-001", "PRD-002"} or vcode in {"VAR-RED", "VAR-BLUE", "VAR-GREEN"}:
+    # template sample values
+    if pcode in {"PRD-001", "PRD-002"}:
         return True
-    if any(x in name for x in ["sample product", "product 1", "product 2"]):
+    if vcode in {"VAR-RED", "VAR-BLUE", "VAR-GREEN"}:
+        return True
+    if "product 1" in name or "product 2" in name:
         return True
 
     return False
-
-
 def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
-    """Build chains treating every product row as a separate product (no uniqueness on productCode)."""
-    chains: dict[str, dict] = {}   # We'll use a counter-based key instead of productCode
-    product_counter = 0
+    """Flat parser chains — group by productCode (flat sheet has no _p_row)."""
+    chains: dict[str, dict] = {}
 
     for rec in rows:
         if not rec["_valid"]:
@@ -568,17 +545,26 @@ def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
         if not slots:
             continue
 
-        product_counter += 1
-        # Use a synthetic unique key so duplicates don't overwrite
-        key = f"prod_{product_counter}_{rec.get('productCode', 'unknown')}"
+        pcode = rec.get("productCode", "unknown")
+        vcode = rec.get("variantCode", "unknown")
 
-        chains[key] = {
-            "rec": rec,
-            "variants": [{"rec": rec, "slots": slots}]
-        }
+        # Flat sheet: same productCode = same product
+        pkey = pcode
+        vkey = vcode
 
-    return chains
+        if pkey not in chains:
+            chains[pkey] = {"rec": rec, "variants": {}}
 
+        if vkey not in chains[pkey]["variants"]:
+            chains[pkey]["variants"][vkey] = {"rec": rec, "slots": slots}
+
+    result = {}
+    for pkey, chain in chains.items():
+        variant_list = [v for v in chain["variants"].values() if v["slots"]]
+        if variant_list:
+            result[pkey] = {"rec": chain["rec"], "variants": variant_list}
+
+    return result
 # ── Product-bulk SQL inserts ───────────────────────────────────────────────────
 
 def _pb_insert_product(db: AsyncSession, rec: dict) -> int:
@@ -586,12 +572,12 @@ def _pb_insert_product(db: AsyncSession, rec: dict) -> int:
         INSERT INTO twam."Products" (
             "ProductCode","Name","Description",
             "CategoryId","ChildCategoryId","BrandId",
-            "TaxHSNCodeId","Tag",
+            "Tag",
             "State","CreatedDate","DeletedInd"
         ) VALUES (
             :productCode,:name,:description,
             :categoryId,:childCategoryId,:brandId,
-            :taxHSNCodeId,:tag,
+            :tag,
             'Created',:now,false
         ) RETURNING "ProductId"
     """), {
@@ -601,7 +587,6 @@ def _pb_insert_product(db: AsyncSession, rec: dict) -> int:
         "categoryId":      rec["categoryId"],
         "childCategoryId": rec.get("childCategoryId"),
         "brandId":         rec["brandId"],
-        "taxHSNCodeId":    rec.get("taxHSNCodeId"),
         "tag":             rec.get("tag"),
         "now":             NOW(),
     })
@@ -863,6 +848,13 @@ async def import_entity(
 
 _COL_ROW_TYPE = 0   # A
 
+def _to_bool(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().upper() in ("TRUE", "1", "YES", "Y")
+    return False
+
 # Product field positions (B=1 … I=8)
 _P_FIELDS = [
     ("productCode",    1,  "str", True),   # B
@@ -871,34 +863,32 @@ _P_FIELDS = [
     ("categoryId",     4,  "int", True),   # E
     ("brandId",        5,  "int", True),   # F
     ("childCategoryId",6,  "int", False),  # G
-    ("tag",            7,  "str", False),  # H
-    ("taxHSNCodeId",   8,  "int", False),  # I  ← renamed TAX HSN Code
 ]
 
 # Variant field positions (J=9 … R=17)
 _V_FIELDS = [
-    ("variantCode",         9,  "str",  True),  # J  ← renamed Product Code
-    ("variantName",         10, "str",  True),  # K
-    ("variantDescription",  11, "str",  False), # L
-    ("fabricId",            12, "int",  False), # M
-    ("color",               13, "str",  False), # N
-    ("isBestSeller",        14, "bool", False), # O
-    ("isReturnAvailable",   15, "bool", False), # P
-    ("isCupSize",           16, "bool", False), # Q
-    ("variantTaxHSNCodeId", 17, "int",  False), # R  ← renamed Variant TAX HSN Code
+    ("variantCode",         7,  "str",  True), # J  
+    ("variantName",         8, "str",  True),  # K
+    ("variantDescription",  9, "str",  False),  # L
+    ("fabricId",            10, "int",  False), # M
+    ("color",               11, "str",  False), # N
+    ("isBestSeller",        12, "bool", False), # O
+    ("isReturnAvailable",   13, "bool", False), # P
+    ("isCupSize",           14, "bool", True), # Q
+    ("variantTaxHSNCodeId", 15, "int",  False), # R  
 ]
 
 # Size field positions (S=18 … X=23)  — Size and Cup Size side by side
 _S_FIELDS = [
-    ("sizeId",          18, "int",   True),  # S
-    ("cupSizeId",       19, "int",   False), # T  ← next to sizeId
-    ("mrpPrice",        20, "float", True),  # U
-    ("finalPrice",      21, "float", True),  # V
-    ("availableQuantity",   22, "int",   True),  # W
-    ("discountPercent", 23, "int",   False), # X
+    ("sizeId",          16, "int",   True),  # S
+    ("cupSizeId",       17, "int",   False), # T  ← next to sizeId
+    ("mrpPrice",        18, "float", True),  # U
+    ("finalPrice",      19, "float", True),  # V
+    ("availableQuantity",   20, "int",   True),  # W
+    ("discountPercent", 21, "int",   False), # X
 ]
 
-_TOTAL_COLS = 24  # A–X
+_TOTAL_COLS = 21  # A–X
 
 
 def _cell(row: tuple, col: int) -> Any:
@@ -972,8 +962,6 @@ def _build_hierarchical_template() -> bytes:
         "categoryId":     "Category ID*",
         "brandId":        "Brand ID*",
         "childCategoryId":"Child Category ID",
-        "tag":            "Tags",
-        "taxHSNCodeId":   "TAX HSN Code",       # renamed
     }
     for field, col, dtype, req in _P_FIELDS:
         hdr_cell(col, _P_LABELS[field], C_PROD_HDR)
@@ -987,7 +975,7 @@ def _build_hierarchical_template() -> bytes:
         "color":               "Color",
         "isBestSeller":        "Is Best Seller",
         "isReturnAvailable":   "Is Return Available",
-        "isCupSize":           "Is Cup Size",
+        "isCupSize":           "Is Cup Size*",
         "variantTaxHSNCodeId": "Variant TAX HSN Code",  # renamed
     }
     for field, col, dtype, req in _V_FIELDS:
@@ -1065,13 +1053,12 @@ def _build_hierarchical_template() -> bytes:
             "productCode": "PRD-001", "name": "Product 1",
             "description": "First product description",
             "categoryId": 1, "brandId": 1, "childCategoryId": "",
-            "tag": "summer", "taxHSNCodeId": "",
+           
         },
         {
             "productCode": "PRD-002", "name": "Product 2",
             "description": "Second product description",
             "categoryId": 2, "brandId": 1, "childCategoryId": "",
-            "tag": "winter", "taxHSNCodeId": "",
         },
     ]
     sample_variants = [
@@ -1346,8 +1333,12 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
         # ── SIZE row ───────────────────────────────────────────────────────
         elif "SIZE" in raw_type:
             
-            if _is_sample_row(row):   
-                continue        
+            if _is_sample_row({
+                "productCode": current_product.get("productCode"),
+                "variantCode": current_variant.get("variantCode"),
+                "name": current_product.get("name"),
+            }):
+                continue      
             if not current_product:
                 continue
             if not current_variant:
@@ -1387,6 +1378,26 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                         f"Row {current_variant.get('_row', '?')}: Variant field '{field}' is required"
                     )
 
+
+            is_cup = current_variant.get("isCupSize")
+
+            # normalize boolean
+            if isinstance(is_cup, str):
+                is_cup = is_cup.strip().upper() == "TRUE"
+
+            cup_id = rec.get("cupSizeId")
+
+            # Case 1: TRUE but missing
+            if is_cup and not cup_id:
+                errors.append(
+                    f"Row {row_num}: Is Cup Size = TRUE but Cup Size ID is missing"
+                )
+
+            # Case 2: FALSE but provided
+            if not is_cup and cup_id:
+                errors.append(
+                    f"Row {row_num}: Is Cup Size = FALSE but Cup Size ID should not be provided"
+                )
             # business rule
             mrp   = rec.get("mrpPrice")
             final = rec.get("finalPrice")
@@ -1405,11 +1416,13 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
 
     return size_records
 
-
 def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
-    """Build chains — each PRODUCT row creates a new product (even with duplicate productCode)."""
+    """
+    Build chains keyed by the PRODUCT row number (_p_row).
+    All SIZE records sharing the same _p_row belong to the same product.
+    All SIZE records sharing the same _p_row + _v_row belong to the same variant.
+    """
     chains: dict[str, dict] = {}
-    product_counter = 0
 
     for rec in size_records:
         if not rec["_valid"]:
@@ -1422,31 +1435,35 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
         if not pcode or not vcode:
             continue
 
-        product_counter += 1
-        # Use synthetic key to avoid overwriting when productCode repeats
-        pkey = f"prod_{product_counter}_{pcode}"
+        # ── Key by PRODUCT row number — same PRODUCT row = same product ──
+        p_row = rec.get("_p_row")   # set during parse: the row number of the PRODUCT row
+        v_row = rec.get("_v_row")   # set during parse: the row number of the VARIANT row
+
+        pkey = f"p_row_{p_row}_{pcode}"   # unique per PRODUCT row, not per SIZE row
+        vkey = f"v_row_{v_row}_{vcode}"   # unique per VARIANT row
 
         if pkey not in chains:
             chains[pkey] = {"rec": rec, "variants": {}}
 
-        if vcode not in chains[pkey]["variants"]:
-            chains[pkey]["variants"][vcode] = {"rec": rec, "slots": []}
+        if vkey not in chains[pkey]["variants"]:
+            chains[pkey]["variants"][vkey] = {"rec": rec, "slots": []}
 
-        is_out = rec.get("availableQuantity", 0) == 0
-        is_low = not is_out and (rec.get("availableQuantity", 0) < 10)
+        stock  = rec.get("availableQuantity", 0) or 0
+        is_out = stock == 0
+        is_low = not is_out and stock < 10
 
-        chains[pkey]["variants"][vcode]["slots"].append({
-            "sizeId":          rec["sizeId"],
-            "cupSizeId":       rec.get("cupSizeId"),
-            "mrpPrice":        rec["mrpPrice"],
-            "finalPrice":      rec["finalPrice"],
-            "availableQuantity":   rec["availableQuantity"],
-            "discountPercent": rec.get("discountPercent") or 0,
-            "isLowStock":      is_low,
-            "isOutOfStock":    is_out,
+        chains[pkey]["variants"][vkey]["slots"].append({
+            "sizeId":            rec["sizeId"],
+            "cupSizeId":         rec.get("cupSizeId"),
+            "mrpPrice":          rec["mrpPrice"],
+            "finalPrice":        rec["finalPrice"],
+            "availableQuantity": rec["availableQuantity"],
+            "discountPercent":   rec.get("discountPercent") or 0,
+            "isLowStock":        is_low,
+            "isOutOfStock":      is_out,
         })
 
-    # Clean up empty variants
+    # Clean up variants with no slots
     result = {}
     for pkey, chain in chains.items():
         variant_list = [v for v in chain["variants"].values() if v["slots"]]
@@ -1454,6 +1471,7 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
             result[pkey] = {"rec": chain["rec"], "variants": variant_list}
 
     return result
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — Product Bulk  (/product-bulk/*)
 # ══════════════════════════════════════════════════════════════════════════════
