@@ -231,7 +231,7 @@ def root():
 
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.mount("/image", StaticFiles(directory="image"), name="image")
+# app.mount("/image", StaticFiles(directory="image"), name="image")
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
