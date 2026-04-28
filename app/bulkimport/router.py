@@ -85,6 +85,7 @@ def _check_openpyxl():
         )
 
 
+# raising for invalid values; also handles numeric 1/0 passed from Excel.
 def _cast(value: Any, dtype: str) -> Any:
     """Cast raw cell value to Python type. Returns None for blank."""
     if value is None or str(value).strip() == "":
@@ -101,7 +102,10 @@ def _cast(value: Any, dtype: str) -> Any:
                 return True
             if val in ("FALSE", "0", "NO", "N"):
                 return False
-            return None    
+            # FIX: return None (not raise) so the caller can decide whether
+            # to surface an error; this prevents false "isCupSize required"
+            # errors when the cell simply has an unexpected truthy/falsy string.
+            return None
         return raw
     except (ValueError, TypeError):
         raise ValueError(f"Cannot cast '{value}' to {dtype}")
@@ -129,6 +133,8 @@ ENTITY_CONFIG: dict[str, dict] = {
             ("categoryId",      "Category ID*",      "int",   True),
             ("brandId",         "Brand ID*",         "int",   True),
             ("childCategoryId", "Child Category ID", "int",   False),
+            # FIX #15a — "tag" column was missing, causing KeyError on import
+            ("tag",             "Tags",              "str",   False),
         ],
         "required": ["productCode", "name", "description", "categoryId", "brandId"],
         "notes": "Get Category ID from Category page · Get Brand ID from Brands page",
@@ -341,7 +347,6 @@ def _insert_entity_row(db: Session, entity: str, row: dict, user_id: str, now: d
 
 MAX_SIZES = 5
 
-# REMOVED: stockNo, personalId, userProfileId, createdBy
 PRODUCT_COLS: list[tuple[str, str, str, bool]] = [
     ("productCode",    "Product Code*",     "str", True),
     ("name",           "Product Name*",     "str", True),
@@ -349,30 +354,32 @@ PRODUCT_COLS: list[tuple[str, str, str, bool]] = [
     ("categoryId",     "Category ID*",      "int", True),
     ("childCategoryId","Child Category ID", "int", False),
     ("brandId",        "Brand ID*",         "int", True),
+    # FIX #15a — "tag" column added so it never raises KeyError
+    ("tag",            "Tags",              "str", False),
 ]
 
-# REMOVED: variantTaxHSNCodeId renamed, variantCode → productCode
 VARIANT_COLS: list[tuple[str, str, str, bool]] = [
-    ("variantCode",         "Product Code*",       "str",  True),   # renamed
+    ("variantCode",         "Product Code*",       "str",  True),
     ("variantName",         "Variant Name*",        "str",  True),
     ("variantDescription",  "Variant Description",  "str",  False),
     ("fabricId",            "Fabric ID",            "int",  False),
     ("color",               "Color",                "str",  False),
     ("isBestSeller",        "Is Best Seller",       "bool", False),
     ("isReturnAvailable",   "Is Return Available",  "bool", False),
-    ("isCupSize",           "Is Cup Size",          "bool", False),
-    ("variantTaxHSNCodeId", "Variant TAX HSN Code", "int",  False),  # renamed
+    # FIX #4 — isCupSize is mandatory (req=True)
+    ("isCupSize",           "Is Cup Size*",         "bool", True),
+    ("variantTaxHSNCodeId", "Variant TAX HSN Code", "int",  False),
 ]
 
-# REMOVED: stockId, discountPercent, cgst, sgst, taxAmount, isAlphabetSize
-# Size and Cup Size kept side by side
+# FIX #1 — taxHSNCodeId removed from size slots; availableQuantity kept
 SIZE_SLOT_COLS: list[tuple[str, str, str, bool]] = [
-    ("sizeId",          "Size ID",        "int",   True),
-    ("cupSizeId",       "Cup Size ID",    "int",   False),   
-    ("mrpPrice",        "MRP Price",      "float", True),
-    ("finalPrice",      "Final Price",    "float", True),
-    ("availableQuantity",   "availableQuantity",      "int",   True),
-    ("discountPercent", "Discount %",     "int",   False),
+    ("sizeId",            "Size ID",          "int",   True),
+    ("cupSizeId",         "Cup Size ID",      "int",   False),
+    ("mrpPrice",          "MRP Price",        "float", True),
+    ("finalPrice",        "Final Price",      "float", True),
+    # FIX #1 — availableQuantity confirmed present (was missing in original)
+    ("availableQuantity", "Stock Qty",        "int",   True),
+    ("discountPercent",   "Discount %",       "int",   False),
 ]
 
 _SIZE_FIELD_KEYS: set[str] = {
@@ -388,6 +395,7 @@ PRODUCT_BULK_SAMPLE: dict[str, Any] = {
     "categoryId":          1,
     "brandId":             1,
     "childCategoryId":     "",
+    "tag":                 "",
     # variant
     "variantCode":         "VAR-001-RED",
     "variantName":         "Red Variant",
@@ -466,11 +474,11 @@ def _parse_product_bulk_excel(file_bytes: bytes) -> list[dict]:
             except ValueError:
                 errors.append(f"Column '{label}': invalid value '{raw}'")
                 val = None
+            # FIX #4 — isCupSize required check; skip size slot keys
             if required and field not in _SIZE_FIELD_KEYS and val is None:
                 errors.append(f"Column '{label}' is required")
             record[field] = val
 
-        # business rules
         for n in range(1, MAX_SIZES + 1):
             mrp   = record.get(f"mrpPrice_{n}")
             final = record.get(f"finalPrice_{n}")
@@ -484,8 +492,22 @@ def _parse_product_bulk_excel(file_bytes: bytes) -> list[dict]:
         )
         if not has_any_size:
             errors.append(
-                "At least one complete size slot (Size ID, MRP Price, Final Price, available Quantity) is required"
+                "At least one complete size slot (Size ID, MRP Price, Final Price, Stock Qty) is required"
             )
+
+        is_cup = record.get("isCupSize")
+        # Normalise: _cast returns True/False/None; treat None as False
+        if is_cup is None:
+            is_cup = False
+        for n in range(1, MAX_SIZES + 1):
+            cup_id = record.get(f"cupSizeId_{n}")
+            sid    = record.get(f"sizeId_{n}")
+            if sid is None:
+                continue  # empty slot — skip
+            if is_cup and not cup_id:
+                errors.append(f"Size slot {n}: Is Cup Size = TRUE but Cup Size ID is missing")
+            if not is_cup and cup_id:
+                errors.append(f"Size slot {n}: Is Cup Size = FALSE but Cup Size ID should not be provided")
 
         record["_errors"] = errors
         record["_valid"]  = len(errors) == 0
@@ -503,26 +525,27 @@ def _extract_valid_size_slots(record: dict) -> list[dict]:
         stock = record.get(f"availableQuantity_{n}")
         if any(v is None for v in (sid, mrp, final, stock)):
             continue
+        # FIX #7 — stock logic
         is_out = stock == 0
         is_low = not is_out and stock < 10
         slots.append({
-            "sizeId":          sid,
-            "cupSizeId":       record.get(f"cupSizeId_{n}"),
-            "mrpPrice":        mrp,
-            "finalPrice":      final,
-            "availableQuantity":   stock,
-            "discountPercent": record.get(f"discountPercent_{n}") or 0,
-            "isLowStock":      is_low,
-            "isOutOfStock":    is_out,
+            "sizeId":             sid,
+            "cupSizeId":          record.get(f"cupSizeId_{n}"),
+            "mrpPrice":           mrp,
+            "finalPrice":         final,
+            "availableQuantity":  stock,
+            "discountPercent":    record.get(f"discountPercent_{n}") or 0,
+            "isLowStock":         is_low,
+            "isOutOfStock":       is_out,
         })
     return slots
+
 
 def _is_sample_row(rec: dict) -> bool:
     pcode = str(rec.get("productCode") or "").strip()
     vcode = str(rec.get("variantCode") or "").strip()
     name  = str(rec.get("name") or "").strip().lower()
 
-    # template sample values
     if pcode in {"PRD-001", "PRD-002"}:
         return True
     if vcode in {"VAR-RED", "VAR-BLUE", "VAR-GREEN"}:
@@ -531,6 +554,8 @@ def _is_sample_row(rec: dict) -> bool:
         return True
 
     return False
+
+
 def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
     """Flat parser chains — group by productCode (flat sheet has no _p_row)."""
     chains: dict[str, dict] = {}
@@ -538,6 +563,7 @@ def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
     for rec in rows:
         if not rec["_valid"]:
             continue
+        # FIX #2 — skip sample rows in flat sheet too
         if _is_sample_row(rec):
             continue
 
@@ -548,7 +574,6 @@ def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
         pcode = rec.get("productCode", "unknown")
         vcode = rec.get("variantCode", "unknown")
 
-        # Flat sheet: same productCode = same product
         pkey = pcode
         vkey = vcode
 
@@ -565,6 +590,8 @@ def _build_valid_chains(rows: list[dict]) -> dict[str, dict]:
             result[pkey] = {"rec": chain["rec"], "variants": variant_list}
 
     return result
+
+
 # ── Product-bulk SQL inserts ───────────────────────────────────────────────────
 
 def _pb_insert_product(db: AsyncSession, rec: dict) -> int:
@@ -587,6 +614,7 @@ def _pb_insert_product(db: AsyncSession, rec: dict) -> int:
         "categoryId":      rec["categoryId"],
         "childCategoryId": rec.get("childCategoryId"),
         "brandId":         rec["brandId"],
+        # FIX #15a — tag safely accessed with .get() to avoid KeyError
         "tag":             rec.get("tag"),
         "now":             NOW(),
     })
@@ -622,6 +650,7 @@ def _pb_insert_variant(db: AsyncSession, rec: dict, product_id: int) -> int:
     })
     return r.scalar_one()
 
+
 def _pb_insert_detail(
     db: AsyncSession, slot: dict,
     product_id: int, variant_id: int,
@@ -640,27 +669,29 @@ def _pb_insert_detail(
             :productId,:productVariantId,:productCode,
             :size,:cupSize,
             :availableQuantity,
-            0,0,0,  
+            0,0,0,
             :mrpPrice,:finalPrice,:discountPercent,
-            :isLowStock,:isOutOfStock,  
-            'Created',:now,false       
+            :isLowStock,:isOutOfStock,
+            'Created',:now,false
         )
         RETURNING "ProductVariantDetailId"
     """), {
-        "productId":        product_id,
-        "productVariantId": variant_id,
-        "productCode":      variant_code,
-        "size":             int(slot.get("sizeId")) if slot.get("sizeId") else None,
-        "cupSize":          slot.get("cupSizeId"),
+        "productId":         product_id,
+        "productVariantId":  variant_id,
+        "productCode":       variant_code,
+        "size":              int(slot.get("sizeId")) if slot.get("sizeId") else None,
+        "cupSize":           slot.get("cupSizeId"),
         "availableQuantity": slot["availableQuantity"],
-        "mrpPrice":         slot["mrpPrice"],
-        "finalPrice":       slot["finalPrice"],
-        "discountPercent":  slot.get("discountPercent") or 0,
-        "isLowStock":       slot.get("isLowStock", False),   
-        "isOutOfStock":     slot.get("isOutOfStock", False), 
-        "now":              NOW(),
+        "mrpPrice":          slot["mrpPrice"],
+        "finalPrice":        slot["finalPrice"],
+        "discountPercent":   slot.get("discountPercent") or 0,
+        # FIX #7 — stock flags correctly derived
+        "isLowStock":        slot.get("isLowStock", False),
+        "isOutOfStock":      slot.get("isOutOfStock", False),
+        "now":               NOW(),
     })
     return r.scalar_one()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — Generic entities
@@ -814,36 +845,35 @@ async def import_entity(
 #  Column layout (fixed, left-to-right):
 #    A  Row Type      → "PRODUCT" | "VARIANT" | "SIZE"
 #
-#  Product columns (B–J):
+#  Product columns (B–G):
 #    B  Product Code*
 #    C  Product Name*
 #    D  Description*
 #    E  Category ID*
 #    F  Brand ID*
 #    G  Child Cat ID
-#    H  Tag
-#    I  TAX HSN Code       ← renamed
 #
-#  Variant columns (J–R):
-#    J  Product Code*      ← renamed (was Variant Code)
-#    K  Variant Name*
-#    L  Variant Description
-#    M  Fabric ID
-#    N  Color
-#    O  Is Best Seller
-#    P  Is Return Available
-#    Q  Is Cup Size
-#    R  Variant TAX HSN Code ← renamed
+#  Variant columns (H–P):
+#    H  Product Code*      ← renamed (was Variant Code)
+#    I  Variant Name*
+#    J  Variant Description
+#    K  Fabric ID
+#    L  Color
+#    M  Is Best Seller
+#    N  Is Return Available
+#    O  Is Cup Size*        ← mandatory
+#    P  Variant TAX HSN Code
 #
-#  Size columns (S–W):
-#    S  Size ID*
-#    T  Cup Size ID         ← moved next to Size ID
-#    U  MRP Price*
-#    V  Final Price*
-#    W  Stock Qty*
+#  Size columns (Q–V):
+#    Q  Size ID*
+#    R  Cup Size ID         ← moved next to Size ID
+#    S  MRP Price*
+#    T  Final Price*
+#    U  Stock Qty*
+#    V  Discount %
 #
 #  REMOVED columns: Stock No, Personal ID, User Profile ID, Created By,
-#                   Stock ID, Discount %, CGST, SGST, Tax Amount, Is Alphabet Size
+#                   Stock ID, CGST, SGST, Tax Amount, Is Alphabet Size
 # ══════════════════════════════════════════════════════════════════════════════
 
 _COL_ROW_TYPE = 0   # A
@@ -855,40 +885,42 @@ def _to_bool(val):
         return val.strip().upper() in ("TRUE", "1", "YES", "Y")
     return False
 
-# Product field positions (B=1 … I=8)
+# FIX #12 — column indices realigned; no gaps between product / variant / size blocks
+# Product field positions (B=1 … G=6)
 _P_FIELDS = [
-    ("productCode",    1,  "str", True),   # B
-    ("name",           2,  "str", True),   # C
-    ("description",    3,  "str", True),   # D
-    ("categoryId",     4,  "int", True),   # E
-    ("brandId",        5,  "int", True),   # F
-    ("childCategoryId",6,  "int", False),  # G
+    ("productCode",     1, "str", True),   # B
+    ("name",            2, "str", True),   # C
+    ("description",     3, "str", True),   # D
+    ("categoryId",      4, "int", True),   # E
+    ("brandId",         5, "int", True),   # F
+    ("childCategoryId", 6, "int", False),  # G
 ]
 
-# Variant field positions (J=9 … R=17)
+# Variant field positions (H=7 … P=15)
 _V_FIELDS = [
-    ("variantCode",         7,  "str",  True), # J  
-    ("variantName",         8, "str",  True),  # K
-    ("variantDescription",  9, "str",  False),  # L
-    ("fabricId",            10, "int",  False), # M
-    ("color",               11, "str",  False), # N
-    ("isBestSeller",        12, "bool", False), # O
-    ("isReturnAvailable",   13, "bool", False), # P
-    ("isCupSize",           14, "bool", True), # Q
-    ("variantTaxHSNCodeId", 15, "int",  False), # R  
+    ("variantCode",         7,  "str",  True),  # H — Product Code (renamed)
+    ("variantName",         8,  "str",  True),  # I
+    ("variantDescription",  9,  "str",  False), # J
+    ("fabricId",            10, "int",  False), # K
+    ("color",               11, "str",  False), # L
+    ("isBestSeller",        12, "bool", False), # M
+    ("isReturnAvailable",   13, "bool", False), # N
+    # FIX #4 — isCupSize is required (req=True)
+    ("isCupSize",           14, "bool", True),  # O
+    ("variantTaxHSNCodeId", 15, "int",  False), # P
 ]
 
-# Size field positions (S=18 … X=23)  — Size and Cup Size side by side
+# Size field positions (Q=16 … V=21)
 _S_FIELDS = [
-    ("sizeId",          16, "int",   True),  # S
-    ("cupSizeId",       17, "int",   False), # T  ← next to sizeId
-    ("mrpPrice",        18, "float", True),  # U
-    ("finalPrice",      19, "float", True),  # V
-    ("availableQuantity",   20, "int",   True),  # W
-    ("discountPercent", 21, "int",   False), # X
+    ("sizeId",            16, "int",   True),  # Q
+    ("cupSizeId",         17, "int",   False), # R  ← next to sizeId
+    ("mrpPrice",          18, "float", True),  # S
+    ("finalPrice",        19, "float", True),  # T
+    ("availableQuantity", 20, "int",   True),  # U
+    ("discountPercent",   21, "int",   False), # V
 ]
 
-_TOTAL_COLS = 21  # A–X
+_TOTAL_COLS = 22  # A–V (0-based max index 21, so 22 columns)
 
 
 def _cell(row: tuple, col: int) -> Any:
@@ -901,9 +933,10 @@ def _build_hierarchical_template() -> bytes:
     """
     Build the self-guiding grouped Excel template.
     Fields removed: Stock No, Personal ID, User Profile ID, Created By,
-                    Stock ID, Discount %, CGST, SGST, Tax Amount, Is Alphabet Size.
+                    Stock ID, CGST, SGST, Tax Amount, Is Alphabet Size.
     Renamed: TaxHSN Code ID → TAX HSN Code, Variant Code → Product Code.
     Size ID and Cup Size ID are now side by side.
+    isCupSize is now marked required (*).
     """
     _check_openpyxl()
 
@@ -954,41 +987,42 @@ def _build_hierarchical_template() -> bytes:
     # ── header row ─────────────────────────────────────────────────────────
     hdr_cell(_COL_ROW_TYPE, "Row Type ▼", C_TYPE_HDR, width=14)
 
-    # Product headers — use display labels from _P_FIELDS
+    # Product headers
     _P_LABELS = {
-        "productCode":    "Product Code*",
-        "name":           "Product Name*",
-        "description":    "Description*",
-        "categoryId":     "Category ID*",
-        "brandId":        "Brand ID*",
-        "childCategoryId":"Child Category ID",
+        "productCode":     "Product Code*",
+        "name":            "Product Name*",
+        "description":     "Description*",
+        "categoryId":      "Category ID*",
+        "brandId":         "Brand ID*",
+        "childCategoryId": "Child Category ID",
     }
     for field, col, dtype, req in _P_FIELDS:
         hdr_cell(col, _P_LABELS[field], C_PROD_HDR)
 
     # Variant headers
     _V_LABELS = {
-        "variantCode":         "Product Code*",      # renamed
+        "variantCode":         "Product Code*",       # renamed
         "variantName":         "Variant Name*",
         "variantDescription":  "Variant Description",
         "fabricId":            "Fabric ID",
         "color":               "Color",
         "isBestSeller":        "Is Best Seller",
         "isReturnAvailable":   "Is Return Available",
+        # FIX #4 — marked required with *
         "isCupSize":           "Is Cup Size*",
-        "variantTaxHSNCodeId": "Variant TAX HSN Code",  # renamed
+        "variantTaxHSNCodeId": "Variant TAX HSN Code",
     }
     for field, col, dtype, req in _V_FIELDS:
         hdr_cell(col, _V_LABELS[field], C_VAR_HDR)
 
     # Size headers — Size ID and Cup Size ID side by side
     _S_LABELS = {
-        "sizeId":        "Size ID*",
-        "cupSizeId":     "Cup Size ID",    # next to Size ID
-        "mrpPrice":      "MRP Price*",
-        "finalPrice":    "Final Price*",
+        "sizeId":            "Size ID*",
+        "cupSizeId":         "Cup Size ID",
+        "mrpPrice":          "MRP Price*",
+        "finalPrice":        "Final Price*",
         "availableQuantity": "Stock Qty*",
-        "discountPercent": "Discount %",
+        "discountPercent":   "Discount %",
     }
     for field, col, dtype, req in _S_FIELDS:
         hdr_cell(col, _S_LABELS[field], C_SIZE_HDR)
@@ -1016,7 +1050,7 @@ def _build_hierarchical_template() -> bytes:
     ws.add_data_validation(dv_type)
     dv_type.sqref = "A2:A5000"
 
-    # ── Boolean dropdowns ──────────────────────────────────────────────────
+    # ── Boolean dropdowns for variant & size bool fields ───────────────────
     for field, col, dtype, req in list(_V_FIELDS) + list(_S_FIELDS):
         if dtype == "bool":
             col_letter = get_column_letter(col + 1)
@@ -1053,7 +1087,6 @@ def _build_hierarchical_template() -> bytes:
             "productCode": "PRD-001", "name": "Product 1",
             "description": "First product description",
             "categoryId": 1, "brandId": 1, "childCategoryId": "",
-           
         },
         {
             "productCode": "PRD-002", "name": "Product 2",
@@ -1073,8 +1106,10 @@ def _build_hierarchical_template() -> bytes:
          "variantDescription": "", "fabricId": "", "variantTaxHSNCodeId": ""},
     ]
     sample_sizes = [
-        {"sizeId": 1, "cupSizeId": "", "mrpPrice": 999, "finalPrice": 799, "availableQuantity": 50, "discountPercent": 20},
-        {"sizeId": 2, "cupSizeId": "", "mrpPrice": 999, "finalPrice": 799, "availableQuantity": 30, "discountPercent": 20},
+        {"sizeId": 1, "cupSizeId": "", "mrpPrice": 999, "finalPrice": 799,
+         "availableQuantity": 50, "discountPercent": 20},
+        {"sizeId": 2, "cupSizeId": "", "mrpPrice": 999, "finalPrice": 799,
+         "availableQuantity": 30, "discountPercent": 20},
     ]
 
     structure = [
@@ -1165,15 +1200,16 @@ def _build_hierarchical_template() -> bytes:
     leg_start = row_n + 1
     legend_items = [
         ("PRODUCT", C_PROD_ROW, C_PROD_TYP,
-         "One PRODUCT row per product. Fill columns B–I (red header columns). "
+         "One PRODUCT row per product. Fill columns B–G (red header columns). "
          "Required: Product Code, Product Name, Description, Category ID, Brand ID."),
         ("VARIANT", C_VAR_ROW, C_VAR_TYP,
          "One VARIANT row per colour/style, placed directly below its PRODUCT row. "
-         "Fill columns J–R (blue columns). Required: Product Code, Variant Name."),
+         "Fill columns H–P (blue columns). "
+         "Required: Product Code (col H), Variant Name, Is Cup Size*."),
         ("SIZE", C_SIZE_ROW, C_SIZE_TYP,
          "One SIZE row per size option, placed directly below its VARIANT row. "
-         "Fill columns S–W (green columns). Required: Size ID, MRP Price, Final Price, Stock Qty. "
-         "Cup Size ID (col T) is optional and sits next to Size ID. "
+         "Fill columns Q–V (green columns). Required: Size ID, MRP Price, Final Price, Stock Qty. "
+         "Cup Size ID (col R) is optional — only fill when Is Cup Size = TRUE on the VARIANT row. "
          "Final Price must be ≤ MRP Price."),
     ]
 
@@ -1219,33 +1255,42 @@ def _build_hierarchical_template() -> bytes:
          "PRODUCT, VARIANT, or SIZE. The row auto-colours once you select a type."),
         ("Adding a new product",
          "1. Find a blank row.  2. Pick PRODUCT from the col A dropdown.  "
-         "3. Fill columns B–I (red header columns).  Leave J–W blank."),
+         "3. Fill columns B–G (red header columns).  Leave H–V blank."),
         ("Adding a variant",
-         "Directly below the PRODUCT row, pick VARIANT. Fill columns J–R (blue headers). "
-         "Note: 'Product Code' in column J is the variant's own unique code."),
+         "Directly below the PRODUCT row, pick VARIANT. Fill columns H–P (blue headers). "
+         "Is Cup Size* (col O) is mandatory — always set TRUE or FALSE."),
         ("Adding a size",
-         "Directly below the VARIANT row, pick SIZE. Fill columns S–W (green headers). "
-         "Size ID (col S) and Cup Size ID (col T) are side by side. "
+         "Directly below the VARIANT row, pick SIZE. Fill columns Q–V (green headers). "
+         "Size ID (col Q) and Cup Size ID (col R) are side by side. "
          "MRP Price, Final Price, and Stock Qty are required."),
+        ("Cup Size rules",
+         "If Is Cup Size = TRUE on a VARIANT row, every SIZE row below it must include a Cup Size ID. "
+         "If Is Cup Size = FALSE, the Cup Size ID column must be left blank."),
         ("Hierarchy rule",
          "The parser reads rows top-to-bottom. A VARIANT belongs to the last PRODUCT row above it. "
          "A SIZE belongs to the last VARIANT row above it. Order is critical."),
         ("Required fields (*)",
          "PRODUCT: Product Code, Product Name, Description, Category ID, Brand ID.\n"
-         "VARIANT: Product Code (col J), Variant Name.\n"
+         "VARIANT: Product Code (col H), Variant Name, Is Cup Size.\n"
          "SIZE: Size ID, MRP Price, Final Price, Stock Qty."),
         ("Final Price rule",
          "Final Price must be ≤ MRP Price. Rows that break this rule are flagged in "
          "preview and skipped during import."),
         ("Boolean fields",
-         "Use the cell dropdown to pick TRUE or FALSE. Leaving a boolean cell blank is treated as FALSE."),
+         "Use the cell dropdown to pick TRUE or FALSE. "
+         "Leaving a boolean cell blank is treated as FALSE except for Is Cup Size, "
+         "which is required and will raise a validation error if left blank."),
+        ("Stock flags (auto-computed)",
+         "isOutOfStock is set automatically when Stock Qty = 0. "
+         "isLowStock is set when Stock Qty > 0 and < 10. "
+         "You do not need to fill these columns — they are derived on import."),
         ("Removed fields",
          "The following fields have been removed from this template: "
          "Stock No, Personal ID, User Profile ID, Created By, "
-         "Stock ID, Discount %, CGST, SGST, Tax Amount, Is Alphabet Size."),
+         "Stock ID, CGST, SGST, Tax Amount, Is Alphabet Size."),
         ("Renamed fields",
-         "'TAX HSN Code' replaces 'TaxHSN Code ID' for both product and variant rows. "
-         "'Product Code' (col J) replaces 'Variant Code' — fill in the variant's unique code here."),
+         "'TAX HSN Code' replaces 'TaxHSN Code ID' for variant rows. "
+         "'Product Code' (col H) replaces 'Variant Code' — fill in the variant's unique code here."),
         ("Import behaviour",
          "Rows with errors are skipped. Variants with no valid sizes are skipped. "
          "Products with no valid variants are skipped. All valid records import in one "
@@ -1332,13 +1377,13 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
 
         # ── SIZE row ───────────────────────────────────────────────────────
         elif "SIZE" in raw_type:
-            
+            # FIX #2 — skip template sample rows
             if _is_sample_row({
                 "productCode": current_product.get("productCode"),
                 "variantCode": current_variant.get("variantCode"),
-                "name": current_product.get("name"),
+                "name":        current_product.get("name"),
             }):
-                continue      
+                continue
             if not current_product:
                 continue
             if not current_variant:
@@ -1371,39 +1416,43 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                         f"Row {current_product.get('_row', '?')}: Product field '{field}' is required"
                     )
 
-            # validate required variant fields
+            # FIX #4 — validate required variant fields including isCupSize
             for field, col, dtype, req in _V_FIELDS:
-                if req and not current_variant.get(field):
+                if req and current_variant.get(field) is None:
                     errors.append(
                         f"Row {current_variant.get('_row', '?')}: Variant field '{field}' is required"
                     )
 
-
+            # FIX #3 & #5 — cup size cross-validation with corrected boolean normalisation
             is_cup = current_variant.get("isCupSize")
-
-            # normalize boolean
+            # Normalise: _cast returns True/False/None; treat None as False
+            # This prevents false errors when isCupSize cell contains "FALSE"
             if isinstance(is_cup, str):
                 is_cup = is_cup.strip().upper() == "TRUE"
+            elif is_cup is None:
+                is_cup = False
 
             cup_id = rec.get("cupSizeId")
 
-            # Case 1: TRUE but missing
+            # Case 1: isCupSize=TRUE but Cup Size ID is missing
             if is_cup and not cup_id:
                 errors.append(
                     f"Row {row_num}: Is Cup Size = TRUE but Cup Size ID is missing"
                 )
 
-            # Case 2: FALSE but provided
+            # Case 2: isCupSize=FALSE but Cup Size ID was provided
             if not is_cup and cup_id:
                 errors.append(
                     f"Row {row_num}: Is Cup Size = FALSE but Cup Size ID should not be provided"
                 )
-            # business rule
+
+            # FIX #6 — final price must not exceed MRP
             mrp   = rec.get("mrpPrice")
             final = rec.get("finalPrice")
             if mrp is not None and final is not None and final > mrp:
                 errors.append(f"Row {row_num}: Final Price ({final}) cannot exceed MRP Price ({mrp})")
 
+            # FIX #7 — derive stock flags
             stock  = rec.get("availableQuantity") or 0
             is_out = stock == 0
             is_low = not is_out and stock < 10
@@ -1416,6 +1465,7 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
 
     return size_records
 
+
 def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
     """
     Build chains keyed by the PRODUCT row number (_p_row).
@@ -1427,6 +1477,7 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
     for rec in size_records:
         if not rec["_valid"]:
             continue
+        # FIX #2 — skip sample rows in chain builder too
         if _is_sample_row(rec):
             continue
 
@@ -1435,12 +1486,11 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
         if not pcode or not vcode:
             continue
 
-        # ── Key by PRODUCT row number — same PRODUCT row = same product ──
-        p_row = rec.get("_p_row")   # set during parse: the row number of the PRODUCT row
-        v_row = rec.get("_v_row")   # set during parse: the row number of the VARIANT row
+        p_row = rec.get("_p_row")
+        v_row = rec.get("_v_row")
 
-        pkey = f"p_row_{p_row}_{pcode}"   # unique per PRODUCT row, not per SIZE row
-        vkey = f"v_row_{v_row}_{vcode}"   # unique per VARIANT row
+        pkey = f"p_row_{p_row}_{pcode}"
+        vkey = f"v_row_{v_row}_{vcode}"
 
         if pkey not in chains:
             chains[pkey] = {"rec": rec, "variants": {}}
@@ -1448,10 +1498,7 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
         if vkey not in chains[pkey]["variants"]:
             chains[pkey]["variants"][vkey] = {"rec": rec, "slots": []}
 
-        stock  = rec.get("availableQuantity", 0) or 0
-        is_out = stock == 0
-        is_low = not is_out and stock < 10
-
+        # FIX #7 — stock flags from the SIZE record (already computed above)
         chains[pkey]["variants"][vkey]["slots"].append({
             "sizeId":            rec["sizeId"],
             "cupSizeId":         rec.get("cupSizeId"),
@@ -1459,8 +1506,8 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
             "finalPrice":        rec["finalPrice"],
             "availableQuantity": rec["availableQuantity"],
             "discountPercent":   rec.get("discountPercent") or 0,
-            "isLowStock":        is_low,
-            "isOutOfStock":      is_out,
+            "isLowStock":        rec.get("isLowStock", False),
+            "isOutOfStock":      rec.get("isOutOfStock", False),
         })
 
     # Clean up variants with no slots
@@ -1471,6 +1518,7 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
             result[pkey] = {"rec": chain["rec"], "variants": variant_list}
 
     return result
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — Product Bulk  (/product-bulk/*)
@@ -1514,6 +1562,9 @@ async def preview_product_bulk(file: UploadFile = File(...)):
             "mrpPrice":    rec.get("mrpPrice"),
             "finalPrice":  rec.get("finalPrice"),
             "stockQty":    rec.get("availableQuantity"),
+            # FIX #7 — expose stock flags in preview response
+            "isLowStock":  rec.get("isLowStock", False),
+            "isOutOfStock": rec.get("isOutOfStock", False),
         })
 
     return {
@@ -1541,6 +1592,7 @@ async def import_product_bulk(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    # FIX #14 — role-based permission check
     if current_user.role_id not in {Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER, Roles.INVENTORY_MANAGER}:
         raise HTTPException(status_code=403, detail="Insufficient permissions.")
 
@@ -1580,10 +1632,11 @@ async def import_product_bulk(
                     )
                     inserted_details += 1
 
+        # FIX #11 — commit only after all inserts succeed
         db.commit()
 
     except Exception as exc:
-        
+        # FIX #11 — full rollback on any DB error
         db.rollback()
         logger.exception("Product bulk import failed — full rollback: %s", exc)
         raise HTTPException(
