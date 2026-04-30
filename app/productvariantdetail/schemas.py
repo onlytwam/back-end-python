@@ -161,3 +161,16 @@ class UserProductListItem(BaseModel):
 class UserProductListResponse(BaseModel):
     count: int
     list:  List[UserProductListItem]
+
+
+class ProductVariantDetailResponse(BaseModel):
+    stockId: str
+    productName: str
+    size: str
+    color: str
+    price: float
+    hsnCode: str
+    gstPercent: float
+
+    class Config:
+        from_attributes = True 
