@@ -574,6 +574,30 @@ def create_order(db: Session, data) -> dict:
         createdDate=datetime.now(timezone.utc)
     ))
 
+    # ── Surprise gift: link applicable rule to this order ────────────────────
+    surprise_gift_rule_id = getattr(data, "surpriseGiftRuleId", None)
+    if surprise_gift_rule_id:
+        try:
+            from app.surprisegift.models import SurpriseGiftRule
+            from app.surprisegift.repository import attach_gift_to_order
+            rule = (
+                db.query(SurpriseGiftRule)
+                .filter(
+                    SurpriseGiftRule.giftRuleId == surprise_gift_rule_id,
+                    SurpriseGiftRule.deletedInd == False,
+                    SurpriseGiftRule.isActive == True,
+                )
+                .first()
+            )
+            if rule:
+                attach_gift_to_order(db, order_id, rule)
+                print(f"[Order] 🎁 Surprise gift rule #{rule.giftRuleId} ({rule.giftType}) linked to order {order_id}")
+            else:
+                print(f"[Order] ⚠️  surpriseGiftRuleId={surprise_gift_rule_id} not found or inactive — skipping gift")
+        except Exception as _gift_exc:
+            # Non-fatal — don't block the order if gift lookup fails
+            print(f"[Order] ⚠️  Failed to attach surprise gift to order {order_id}: {_gift_exc}")
+
     # ── FIX: do NOT commit yet — PayG must succeed before the order is saved.
     # We only flush here to get orderId from the DB sequence; the full commit
     # happens inside the PayG success path below.  If PayG fails we rollback

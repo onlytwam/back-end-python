@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, BigInteger, Integer, String, Boolean, DateTime, Text
 from database import Base
 
 
@@ -6,37 +6,32 @@ class Coupons(Base):
     __tablename__ = "Coupons"
     __table_args__ = {"schema": "coupons"}
 
-    couponId       = Column("CouponId",       BigInteger, primary_key=True, index=True)
-    couponCode     = Column("CouponCode",     String,  nullable=True)
-    couponName     = Column("CouponName",     String,  nullable=True)
-    description    = Column("Description",    String,  nullable=True)
-    discount       = Column("Discount",       Integer, nullable=True)
-    startDate      = Column("StartDate",      DateTime(timezone=True), nullable=True)
-    endDate        = Column("EndDate",        DateTime(timezone=True), nullable=True)
-    state          = Column("State",          String,  nullable=True)
-    isActive       = Column("IsActive",       Boolean, default=True)
-    isCommon       = Column("IsCommon",       Boolean, nullable=True)
-    toUserProfileId= Column("ToUserProfileId",String,  nullable=True)
-    userProfileId  = Column("UserProfileId",  String,  nullable=True)
-    createdDate    = Column("CreatedDate",    DateTime(timezone=True), nullable=True)
-    modifiedDate   = Column("ModifiedDate",   DateTime(timezone=True), nullable=True)
-    deletedInd     = Column("DeletedInd",     Boolean, default=False)
-    createdBy      = Column("CreatedBy",      String,  nullable=True)
-    modifiedBy     = Column("ModifiedBy",     String,  nullable=True)
-    organizationId = Column("OrganizationId", Integer, nullable=True)
+    couponId        = Column("CouponId",        BigInteger, primary_key=True, index=True)
+    couponCode      = Column("CouponCode",      String,  nullable=True)
+    couponName      = Column("CouponName",      String,  nullable=True)
+    description     = Column("Description",     String,  nullable=True)
+    discount        = Column("Discount",        Integer, nullable=True)
+    startDate       = Column("StartDate",       DateTime(timezone=True), nullable=True)
+    endDate         = Column("EndDate",         DateTime(timezone=True), nullable=True)
+    state           = Column("State",           String,  nullable=True)
+    isActive        = Column("IsActive",        Boolean, default=True)
+    isCommon        = Column("IsCommon",        Boolean, nullable=True)
+    toUserProfileId = Column("ToUserProfileId", String,  nullable=True)
+    userProfileId   = Column("UserProfileId",   String,  nullable=True)
+    createdDate     = Column("CreatedDate",     DateTime(timezone=True), nullable=True)
+    modifiedDate    = Column("ModifiedDate",    DateTime(timezone=True), nullable=True)
+    deletedInd      = Column("DeletedInd",      Boolean, default=False)
+    createdBy       = Column("CreatedBy",       String,  nullable=True)
+    modifiedBy      = Column("ModifiedBy",      String,  nullable=True)
+    organizationId  = Column("OrganizationId",  Integer, nullable=True)
+    couponType      = Column("CouponType",      String,  nullable=True, default="generic")
+    productId       = Column("ProductId",       BigInteger, nullable=True)
 
-    # NEW: "generic" | "user_specific" | "product_specific"
-    couponType = Column("CouponType", String, nullable=True, default="generic")
-    # NEW: used only when couponType == "product_specific"
-    productId  = Column("ProductId",  BigInteger, nullable=True)
+    # NEW: links this row to a bulk-assignment batch
+    batchId         = Column("BatchId",         BigInteger, nullable=True, index=True)
 
 
 class CouponUsage(Base):
-    """
-    Records that a digital coupon has been redeemed by a specific user.
-    Once a row exists for (couponId, userProfileId) the coupon is hidden
-    everywhere for that user and cannot be applied again.
-    """
     __tablename__ = "CouponUsage"
     __table_args__ = {"schema": "coupons"}
 
@@ -48,11 +43,6 @@ class CouponUsage(Base):
 
 
 class PhysicalCoupon(Base):
-    """
-    Store-issued physical coupon codes loaded by admin via Excel upload.
-    Single-use globally: once any user redeems it the code is permanently dead.
-    Never shown in user profile or cart dropdown — pure server-side validation.
-    """
     __tablename__ = "PhysicalCoupons"
     __table_args__ = {"schema": "coupons"}
 
@@ -66,3 +56,36 @@ class PhysicalCoupon(Base):
     orderId             = Column("OrderId",             BigInteger, nullable=True)
     createdDate         = Column("CreatedDate",         DateTime(timezone=True), nullable=True)
     organizationId      = Column("OrganizationId",      Integer, nullable=True)
+
+
+class UserCouponBatch(Base):
+    """
+    Tracks every bulk user-specific coupon assignment.
+    One row per admin upload / segment-generate action.
+    Lets admin see history of who was targeted and with what coupon settings.
+    """
+    __tablename__ = "UserCouponBatch"
+    __table_args__ = {"schema": "coupons"}
+
+    batchId        = Column("BatchId",        BigInteger, primary_key=True, index=True, autoincrement=True)
+    # Coupon details applied to everyone in this batch
+    couponCode     = Column("CouponCode",     String,  nullable=True)
+    couponName     = Column("CouponName",     String,  nullable=True)
+    description    = Column("Description",    String,  nullable=True)
+    discount       = Column("Discount",       Integer, nullable=True)
+    startDate      = Column("StartDate",      DateTime(timezone=True), nullable=True)
+    endDate        = Column("EndDate",        DateTime(timezone=True), nullable=True)
+    # How this batch was created: "excel_upload" | "segment_generate"
+    sourceType     = Column("SourceType",     String,  nullable=True)
+    # If segment: which segment key was used (e.g. "most_frequent")
+    segmentKey     = Column("SegmentKey",     String,  nullable=True)
+    # If segment: "top" or "bottom"
+    segmentDirection = Column("SegmentDirection", String, nullable=True)
+    # How many users were targeted
+    userCount      = Column("UserCount",      Integer, nullable=True)
+    # JSON snapshot of user IDs for audit (stored as Text)
+    userIdsSnapshot = Column("UserIdsSnapshot", Text, nullable=True)
+    organizationId = Column("OrganizationId", Integer, nullable=True)
+    createdDate    = Column("CreatedDate",    DateTime(timezone=True), nullable=True)
+    createdBy      = Column("CreatedBy",      String,  nullable=True)
+    isActive       = Column("IsActive",       Boolean, default=True)
