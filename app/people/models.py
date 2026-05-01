@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, BigInteger, Integer, String, Boolean, Date, DateTime
 from database import Base
 
 
@@ -10,6 +10,7 @@ class People(Base):
     firstName = Column("FirstName", String, nullable=True)
     middleName = Column("MiddleName", String, nullable=True)
     lastName = Column("LastName", String, nullable=True)
+    dateOfBirth = Column("DateOfBirth", Date, nullable=True)
     emailId = Column("EmailId", String, nullable=True)
     phoneNumber = Column("PhoneNumber", String, nullable=True)
     profileImageUrl = Column("ProfileImageUrl", String, nullable=True)

@@ -7,7 +7,7 @@ SQLAlchemy models for the auth schema.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from database import Base
@@ -36,6 +36,7 @@ class IdentityUser(Base):
     FirstName            = Column("FirstName",            String,  nullable=True)
     MiddleName           = Column("MiddleName",           String,  nullable=True)
     LastName             = Column("LastName",             String,  nullable=True)
+    DateOfBirth          = Column("DateOfBirth",          Date,    nullable=True)
     ProfileImageUrl      = Column("ProfileImageUrl",      String,  nullable=True)
     IsActive             = Column("IsActive",             Boolean, default=True)
     UserRoleId           = Column("UserRoleId",           Integer, nullable=True)

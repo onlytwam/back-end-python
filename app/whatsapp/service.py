@@ -5,14 +5,27 @@ Core WhatsApp sending logic using the WAPP API.
 
 Credentials are read from sms.WhatsAppCredential (DB), never hardcoded.
 
-API:  http://apps.studentscorner.org/wapp/api/send?
+API:  http://web.cloudwhatsapp.com/wapp/api/send
 Params:
-    apikey   — from DB
-    mobile   — 91XXXXXXXXXX  (with country code)
-    msg      — message text
-    mediaUrl — (optional) publicly accessible image/video URL
+    apikey  — from DB
+    mobile  — 10-digit mobile number (no country code, e.g. 9392530576)
+    msg     — message text
 
 Returns JSON:  { "status": "success"|"error", "id": "...", ... }
+               OR Spring-Boot error shape: { "status": 400, "error": "..." }
+
+FIXES APPLIED:
+  1. _normalise_phone() returns 10-digit number only (no "91" prefix).
+     The WAPP API (web.cloudwhatsapp.com) example shows 10-digit numbers —
+     sending 12 digits (91XXXXXXXXXX) caused HTTP 400 / ERROR responses.
+  2. param key kept as "mobile" — matches the working example URL in the
+     API docs (&mobile=989898XXXX). The docs table said "number" but the
+     live example uses "mobile"; reverted after confirming 400 with "number".
+  3. ok check uses str() wrap before .lower() — the API can return
+     "status" as an integer (e.g. 400) in error responses, which crashed
+     the previous code with 'int' object has no attribute 'lower'.
+  4. Removed `or response.status_code == 200` from ok — that silently
+     marked failed sends as SENT in the log.
 """
 
 import time
@@ -96,13 +109,17 @@ def _log(
 
 def _normalise_phone(phone: str) -> Optional[str]:
     """
-    Strip non-digits and ensure 12-digit Indian number (91XXXXXXXXXX).
-    Returns None if the number is invalid.
+    Strip non-digits and return the last 10 digits (Indian mobile number).
+    The WAPP API (web.cloudwhatsapp.com) expects a 10-digit number WITHOUT
+    the country code prefix. Sending 12 digits (91XXXXXXXXXX) causes HTTP 400.
+    Returns None if fewer than 10 digits are found.
+
+    FIX: removed "91" prefix — was sending 12 digits, API wants 10.
     """
     digits = "".join(c for c in phone if c.isdigit())
     if len(digits) < 10:
         return None
-    return "91" + digits[-10:]
+    return digits[-10:]   # 10 digits only, no "91" prefix
 
 
 # ── Core send ─────────────────────────────────────────────────────────────────
@@ -137,9 +154,11 @@ def send_whatsapp(
         print(f"[WhatsApp] Invalid phone: {phone!r}")
         return False
 
+    # "mobile" matches the working example URL in the API docs:
+    # ...&mobile=989898XXXX&msg=testmsg
     params: dict = {
         "apikey": cred["apiKey"],
-        "mobile": recipient,
+        "mobile": recipient,          # 10-digit number, no country code
         "msg":    message,
     }
     if media_url:
@@ -154,14 +173,18 @@ def send_whatsapp(
         except Exception:
             data = {}
 
-        ok          = (
-            data.get("status", "").lower() == "success"
-            or response.status_code == 200
-        )
+        # FIX: str() wrap on status — the API returns "status" as an integer
+        # (e.g. 400) in Spring-Boot error responses, which crashed .lower() before.
+        # FIX: removed `or response.status_code == 200` — that caused every
+        # HTTP-200 error response to be silently logged as SENT.
+        ok          = str(data.get("status", "")).lower() == "success"
         txn_id      = str(data.get("id", "") or data.get("msgId", ""))
         state_str   = "SENT" if ok else "FAILED"
         status_code = response.status_code
-        error_desc  = "" if ok else (data.get("message", "") or data.get("error", "") or response.text)
+        error_desc  = (
+            "" if ok
+            else (data.get("message", "") or data.get("error", "") or response.text)
+        )
 
         _log(db, recipient, message_type, message, media_url,
              txn_id, state_str, status_code, error_desc)

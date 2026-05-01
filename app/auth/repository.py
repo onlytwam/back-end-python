@@ -8,7 +8,7 @@ import binascii
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
@@ -55,6 +55,7 @@ FIRST_NAME_FIELDS = ("firstName", "FirstName")
 MIDDLE_NAME_FIELDS = ("middleName", "MiddleName")
 LAST_NAME_FIELDS = ("lastName", "LastName")
 PHONE_FIELDS = ("phoneNumber", "PhoneNumber")
+DOB_FIELDS = ("dateOfBirth", "DateOfBirth", "dob")
 PROFILE_IMAGE_DATA_FIELDS = (
     "profileImageUrl",
     "ProfileImageUrl",
@@ -138,6 +139,7 @@ async def parse_profile_update_payload(
                 "middleName": _first_present(form, MIDDLE_NAME_FIELDS),
                 "lastName": _first_present(form, LAST_NAME_FIELDS),
                 "phoneNumber": _first_present(form, PHONE_FIELDS),
+                "dateOfBirth": _first_present(form, DOB_FIELDS),
                 "profileImageUrl": profile_image_url,
                 "removeProfileImage": remove_profile_image,
             }
@@ -325,12 +327,26 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
         "phone_number": user.PhoneNumber or "",
         "IsRandomPassword": bool(user.IsRandomPassword),
         "is_random_password": bool(user.IsRandomPassword),
+        "DateOfBirth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+        "date_of_birth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
     }
 
 
 # ============================================================================
 # USER REGISTRATION
 # ============================================================================
+
+def _parse_dob(value: Any) -> Optional[date]:
+    """Accept a date object, ISO string (YYYY-MM-DD), or None. Returns date or None."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
 
 def _next_people_id(db: Session) -> Optional[int]:
     """Get next People ID from sequence"""
@@ -539,6 +555,7 @@ def update_identity_user_profile(
     next_middle_name = (request.MiddleName or "").strip()
     next_last_name = (request.LastName or "").strip()
     next_phone = (request.PhoneNumber or "").strip()
+    next_dob = _parse_dob(request.DateOfBirth) if request.DateOfBirth is not None else user.DateOfBirth
 
     if not next_email:
         raise HTTPException(status_code=400, detail="EmailId is required.")
@@ -593,6 +610,7 @@ def update_identity_user_profile(
         next_middle_name == (user.MiddleName or "") and
         next_last_name == (user.LastName or "") and
         next_phone == (user.PhoneNumber or "") and
+        next_dob == user.DateOfBirth and
         not image_will_change
     )
     if no_change:
@@ -637,6 +655,7 @@ def update_identity_user_profile(
         user.MiddleName = next_middle_name
         user.LastName = next_last_name
         user.PhoneNumber = next_phone
+        user.DateOfBirth = next_dob
         user.ProfileImageUrl = next_profile_image
         user.ModifiedDate = datetime.now(timezone.utc)
         user.ModifiedBy = user_id
@@ -650,6 +669,7 @@ def update_identity_user_profile(
                 firstName=next_first_name,
                 middleName=next_middle_name,
                 lastName=next_last_name,
+                dateOfBirth=next_dob,
                 emailId=next_email,
                 phoneNumber=next_phone,
                 profileImageUrl=next_profile_image,
@@ -668,6 +688,7 @@ def update_identity_user_profile(
             people_profile.firstName = next_first_name
             people_profile.middleName = next_middle_name
             people_profile.lastName = next_last_name
+            people_profile.dateOfBirth = next_dob
             people_profile.emailId = next_email
             people_profile.phoneNumber = next_phone
             people_profile.profileImageUrl = next_profile_image
@@ -704,6 +725,7 @@ def update_identity_user_profile(
         "middleName": next_middle_name,
         "lastName": next_last_name,
         "phoneNumber": next_phone,
+        "dateOfBirth": next_dob.isoformat() if next_dob else None,
         "profileImageUrl": next_profile_image,
     }
     if original_profile_image_path:
@@ -767,6 +789,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
             FirstName=request.FirstName or "",
             MiddleName=request.MiddleName or "",
             LastName=request.LastName or "",
+            DateOfBirth=_parse_dob(request.DateOfBirth),
             ProfileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
             IsActive=True,
             UserRoleId=request.RoleId if request.RoleId else 2,
@@ -790,6 +813,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
                     firstName=request.FirstName or "",
                     middleName=request.MiddleName or "",
                     lastName=request.LastName or "",
+                    dateOfBirth=_parse_dob(request.DateOfBirth),
                     emailId=request.EmailId or None,
                     phoneNumber=request.PhoneNumber or None,
                     profileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),

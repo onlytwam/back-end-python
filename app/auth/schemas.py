@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional
+from datetime import date
 
 
 class TokenRequest(BaseModel):
@@ -29,6 +30,7 @@ class RegisterUserRequest(BaseModel):
     Password:    Optional[str]  = Field(None, alias="password")
     TemporaryPassword: Optional[str] = Field(None, alias="temporaryPassword")
     PhoneNumber: Optional[str]  = Field(None, alias="phoneNumber")
+    DateOfBirth: Optional[date] = Field(None, alias="dateOfBirth")
     ProfileImageUrl: Optional[str] = Field(None, alias="profileImageUrl")
     RemoveProfileImage: Optional[bool] = Field(False, alias="removeProfileImage")
     IsActive:    Optional[bool] = Field(True,  alias="isActive")
