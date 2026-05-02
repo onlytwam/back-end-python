@@ -3,6 +3,8 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
+from pydantic.alias_generators import to_camel
+
 
 
 VALID_STOCK_SOURCES = {"store", "warehouse"}
@@ -63,3 +65,33 @@ class SalesChannelOut(BaseModel):
     modifiedDate:  Optional[datetime]
 
     model_config = {"from_attributes": True}
+
+
+
+
+class SalesChannelResponse(BaseModel):
+    channelId:     int      = Field(alias="ChannelId")
+    channelCode:   str      = Field(alias="ChannelCode")
+    channelName:   str      = Field(alias="ChannelName")
+    emoji:         str | None = Field(default=None, alias="Emoji")
+    stockSource:   str      = Field(alias="StockSource")
+    commissionPct: float    = Field(alias="CommissionPct")
+    isActive:      bool     = Field(alias="IsActive")
+    sortOrder:     int      = Field(alias="SortOrder")
+    createdDate:   datetime = Field(alias="CreatedDate")
+    modifiedDate:  datetime | None = Field(default=None, alias="ModifiedDate")
+
+    model_config = {
+        "from_attributes": True,
+        "populate_by_name": True,
+    }
+
+
+class SalesChannelCreate(BaseModel):
+    channelCode: str
+    channelName: str
+    emoji: str
+    stockSource: str
+    commissionPct: float
+    isActive: bool
+    sortOrder: int

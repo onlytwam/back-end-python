@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db
 from .models  import SalesChannel
-from .schemas import SalesChannelCreateIn, SalesChannelUpdateIn, SalesChannelOut
+from .schemas import SalesChannelCreateIn, SalesChannelUpdateIn, SalesChannelResponse  
 
 router = APIRouter(
     prefix="/api/SalesChannels",
@@ -21,8 +21,8 @@ router = APIRouter(
 
 @router.get(
     "",
-    response_model=List[SalesChannelOut],
-    summary="List all sales channels (active + inactive)",
+    response_model=List[SalesChannelResponse],
+    summary="List all sales channels (active + inactive)",response_model_by_alias=False,
 )
 def list_channels(
     active_only: bool    = True,
@@ -38,8 +38,8 @@ def list_channels(
 
 @router.get(
     "/{channel_id}",
-    response_model=SalesChannelOut,
-    summary="Get a single sales channel by ID",
+    response_model=SalesChannelResponse,
+    summary="Get a single sales channel by ID",response_model_by_alias=False,
 )
 def get_channel(
     channel_id: int     = Path(..., ge=1),
@@ -55,9 +55,10 @@ def get_channel(
 
 @router.post(
     "",
-    response_model=SalesChannelOut,
+    response_model=SalesChannelResponse,
     status_code=201,
     summary="Create a new sales channel",
+    response_model_by_alias=False,
 )
 def create_channel(
     payload: SalesChannelCreateIn,
@@ -92,8 +93,9 @@ def create_channel(
 
 @router.patch(
     "/{channel_id}",
-    response_model=SalesChannelOut,
+    response_model=SalesChannelResponse,
     summary="Update a sales channel (partial update)",
+    response_model_by_alias=False,
 )
 def update_channel(
     payload:    SalesChannelUpdateIn,
@@ -130,6 +132,7 @@ def update_channel(
     "/{channel_id}",
     status_code=204,
     summary="Deactivate a sales channel (soft delete)",
+    response_model_by_alias=False
 )
 def deactivate_channel(
     channel_id: int     = Path(..., ge=1),
