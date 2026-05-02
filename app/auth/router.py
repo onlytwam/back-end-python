@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Form, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from app import people
 from database import get_db
 from app.people.models import People
 from .schemas import (
@@ -401,7 +402,11 @@ async def token(
 
     claims       = build_token_claims(db, result.user)
     access_token = create_access_token(claims)
-    return TokenResponse(access_token=access_token, expires_in=EXPIRES_MINUTES * 60)
+    return TokenResponse(access_token=access_token, expires_in=EXPIRES_MINUTES * 60,
+                          storeId       = people.StoreId       if people else None,  # ← ADD
+    warehouseId   = people.WarehouseId   if people else None,  # ← ADD
+    warehouseName = people.warehouse.WarehouseName if (people and people.warehouse) else "",  # ← ADD
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

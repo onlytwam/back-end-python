@@ -11,7 +11,7 @@ ROLE IDs (from TWAMConstants.RoleConstants / AuthenticationConstants.RoleConstan
   4 = Product Manager
   5 = Order Manager
   6 = Customer Support
-
+  7 = Store Manager (new role for store-level access)
 ═══════════════════════════════════════════════════════════════
 IMPORT PATTERN
 ═══════════════════════════════════════════════════════════════

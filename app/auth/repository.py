@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, or_, func
 from fastapi import HTTPException, UploadFile, Request
 
+
 from .models import IdentityUser, UserRole
 from app.people.models import People
 from .security import (
@@ -295,43 +296,109 @@ def authenticate_user(db: Session, username: str, encrypted_password: str) -> Au
     return AuthResult(True, user=user)
 
 
+# def build_token_claims(db: Session, user: IdentityUser) -> dict:
+#     """
+#     Build JWT token claims from user object.
+#     IMPROVED: Uses ORM model properties instead of dictionary keys.
+#     """
+#     role_name = _get_role_name(db, user.UserRoleId or 2)
+#     session = str(uuid.uuid4())
+    
+#     full_name = user.full_name  # Uses the model property
+    
+    
+#     return {
+#         "sub": user.Id,
+#         "preferred_username": user.UserName,
+#         "name": full_name,
+#         "sid": session,
+#         "email": user.Email or "",
+#         "email_id": user.Email or "",
+#         "UserId": user.Id,
+#         "session_id": session,
+#         "TenantId": user.TenantId or "1",
+#         "FirstName": user.FirstName or "",
+#         "MiddleName": user.MiddleName or "",
+#         "LastName": user.LastName or "",
+#         "ProfileImageUrl": _normalize_profile_image_url(user.ProfileImageUrl) or "",
+#         "RoleId": str(user.UserRoleId or 2),
+#         "RoleName": role_name,
+#         "role": role_name,
+#         "family_name": user.LastName or "",
+#         "given_name": user.FirstName or "",
+#         "phone_number": user.PhoneNumber or "",
+#         "IsRandomPassword": bool(user.IsRandomPassword),
+#         "is_random_password": bool(user.IsRandomPassword),
+#         "DateOfBirth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+#         "date_of_birth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+#         "storeId":       People.StoreId     if People else None,
+#         "warehouseId":   People.WarehouseId if People else None,
+#         "warehouseName": (
+#             People.warehouse.WarehouseName
+#             if People and People.warehouse else ""
+#         ),
+#         "storeName": (
+#             People.store.StoreName
+#             if People and People.store else ""
+#         ),
+#     }
+
 def build_token_claims(db: Session, user: IdentityUser) -> dict:
     """
     Build JWT token claims from user object.
     IMPROVED: Uses ORM model properties instead of dictionary keys.
     """
     role_name = _get_role_name(db, user.UserRoleId or 2)
-    session = str(uuid.uuid4())
-    
-    full_name = user.full_name  # Uses the model property
-    
+    session   = str(uuid.uuid4())
+    full_name = user.full_name
+
+    # ✅ Query the People instance for this user
+    person = db.query(People).filter(People.userProfileId == user.Id).first()
+
+    warehouse_name = ""
+    store_name     = ""
+
+    if person is not None and person.WarehouseId is not None:
+        from app.billing.models import Warehouse
+        wh = db.query(Warehouse).filter(Warehouse.WarehouseId == person.WarehouseId).first()
+        warehouse_name = str(wh.WarehouseName) if wh and wh.WarehouseName else ""
+
+    if person is not None and person.StoreId is not None:
+        from app.stores.models import Stores
+        st = db.query(Stores).filter(Stores.StoreId == person.StoreId).first()
+        store_name = str(st.StoreName) if st and st.StoreName else ""
+
     return {
-        "sub": user.Id,
+        "sub":                user.Id,
         "preferred_username": user.UserName,
-        "name": full_name,
-        "sid": session,
-        "email": user.Email or "",
-        "email_id": user.Email or "",
-        "UserId": user.Id,
-        "session_id": session,
-        "TenantId": user.TenantId or "1",
-        "FirstName": user.FirstName or "",
-        "MiddleName": user.MiddleName or "",
-        "LastName": user.LastName or "",
-        "ProfileImageUrl": _normalize_profile_image_url(user.ProfileImageUrl) or "",
-        "RoleId": str(user.UserRoleId or 2),
-        "RoleName": role_name,
-        "role": role_name,
-        "family_name": user.LastName or "",
-        "given_name": user.FirstName or "",
-        "phone_number": user.PhoneNumber or "",
-        "IsRandomPassword": bool(user.IsRandomPassword),
+        "name":               full_name,
+        "sid":                session,
+        "email":              user.Email or "",
+        "email_id":           user.Email or "",
+        "UserId":             user.Id,
+        "session_id":         session,
+        "TenantId":           user.TenantId or "1",
+        "FirstName":          user.FirstName or "",
+        "MiddleName":         user.MiddleName or "",
+        "LastName":           user.LastName or "",
+        "ProfileImageUrl":    _normalize_profile_image_url(user.ProfileImageUrl) or "",
+        "RoleId":             str(user.UserRoleId or 2),
+        "RoleName":           role_name,
+        "role":               role_name,
+        "family_name":        user.LastName or "",
+        "given_name":         user.FirstName or "",
+        "phone_number":       user.PhoneNumber or "",
+        "IsRandomPassword":   bool(user.IsRandomPassword),
         "is_random_password": bool(user.IsRandomPassword),
-        "DateOfBirth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
-        "date_of_birth": user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+        "DateOfBirth":        user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+        "date_of_birth":      user.DateOfBirth.isoformat() if user.DateOfBirth else "",
+
+        # ✅ person = instance, People = class
+        "storeId":       int(person.StoreId)     if person is not None and person.StoreId     is not None else None,
+        "warehouseId":   int(person.WarehouseId) if person is not None and person.WarehouseId is not None else None,
+        "warehouseName": warehouse_name,
+        "storeName":     store_name,
     }
-
-
 # ============================================================================
 # USER REGISTRATION
 # ============================================================================

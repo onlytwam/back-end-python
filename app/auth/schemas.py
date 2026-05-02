@@ -20,6 +20,9 @@ class TokenResponse(BaseModel):
     token_type:   str = "Bearer"
     expires_in:   int = 3600
     scope:        str = "twam-web-portal read write openid profile email"
+    warehouseId:    Optional[int] = None   # ← ADD
+    warehouseName:  str = ""               # ← ADD
+    storeId:        Optional[int] = None 
 
 
 class RegisterUserRequest(BaseModel):
@@ -35,6 +38,8 @@ class RegisterUserRequest(BaseModel):
     RemoveProfileImage: Optional[bool] = Field(False, alias="removeProfileImage")
     IsActive:    Optional[bool] = Field(True,  alias="isActive")
     RoleId:      int            = Field(2,      alias="roleId")
+    StoreId:     Optional[int] = Field(None,   alias="storeId")
+    WarehouseId: Optional[int] = Field(None,   alias="warehouseId")
 
     model_config = {"populate_by_name": True}
 
@@ -97,3 +102,6 @@ class CurrentUser(BaseModel):
     full_name:  str = ""
     profile_image_url: str = ""
     tenant_id:  str = "1"
+    store_id:   Optional[int] = None
+    warehouse_id:      Optional[int]  = None   # inventory managers
+    warehouse_name: str = ""  

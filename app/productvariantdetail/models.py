@@ -38,3 +38,5 @@ class ProductVariantDetail(Base):
     createdDate            = Column("CreatedDate",            DateTime(timezone=True), server_default=func.now())
     modifiedDate           = Column("ModifiedDate",           DateTime(timezone=True), onupdate=func.now(), nullable=True)
     deletedInd             = Column("DeletedInd",             Boolean,    default=False)
+    purchasePrice          = Column("PurchasePrice", Integer, nullable=True)
+    storeId                = Column("StoreId", BigInteger, nullable=True)

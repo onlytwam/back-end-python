@@ -1,5 +1,7 @@
 from sqlalchemy import Column, Integer, BigInteger, Boolean, DateTime, String
 from database import Base
+from sqlalchemy.orm import relationship
+
 
 class Stores(Base):
     __tablename__ = "Stores"
@@ -23,3 +25,6 @@ class Stores(Base):
     createdBy      = Column("CreatedBy",      String,  nullable=True)
     modifiedBy     = Column("ModifiedBy",     String,  nullable=True)
     organizationId = Column("OrganizationId", Integer, nullable=True)
+
+    inventory = relationship("Inventory",back_populates="store")
+    people = relationship("People", back_populates="store")

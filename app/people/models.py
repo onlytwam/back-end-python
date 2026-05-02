@@ -1,6 +1,6 @@
-from sqlalchemy import Column, BigInteger, Integer, String, Boolean, Date, DateTime
+from sqlalchemy import Column, BigInteger, ForeignKey, Integer, String, Boolean, Date, DateTime
 from database import Base
-
+from sqlalchemy.orm import relationship
 
 class People(Base):
     __tablename__ = "People"
@@ -23,3 +23,10 @@ class People(Base):
     createdBy      = Column("CreatedBy",      String,  nullable=True)
     modifiedBy     = Column("ModifiedBy",     String,  nullable=True)
     organizationId = Column("OrganizationId", Integer, nullable=True)
+    StoreId = Column(BigInteger, ForeignKey("twam.Stores.StoreId"))
+    WarehouseId = Column(BigInteger, ForeignKey("twam.Warehouses.WarehouseId"))
+
+    store = relationship("Stores", back_populates="people")
+    warehouse = relationship("Warehouse", back_populates="people")  
+    def __repr__(self):
+        return f"<People(PersonalId={self.personalId}, FirstName={self.firstName}, EmailId={self.emailId})>"            

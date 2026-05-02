@@ -10,9 +10,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import jwt
 
+from app.billing.schemas import TokenPayload
+
 from .security import decode_token, is_token_blacklisted
 from .schemas import CurrentUser
 from database import SessionLocal
+from pydantic import BaseModel as _BaseModel
 
 
 # ── Role constants ─────────────────────────────────────────────────────────────
@@ -24,6 +27,7 @@ class Roles:
     PRODUCT_MANAGER   = 4
     ORDER_MANAGER     = 5
     CUSTOMER_SUPPORT  = 6
+    STORE_MANAGER      = 7  # ← new role for store-level access
 
     NAMES = {
         1: "Super Admin",
@@ -32,10 +36,11 @@ class Roles:
         4: "Product Manager",
         5: "Order Manager",
         6: "Customer Support",
+        7: "Store Manager",
     }
 
-    STAFF = {1, 3, 4, 5, 6}
-    ALL   = {1, 2, 3, 4, 5, 6}
+    STAFF = {1, 3, 4, 5, 6, }
+    ALL   = {1, 2, 3, 4, 5, 6,}
 
 
 # ── Bearer extractor ───────────────────────────────────────────────────────────
@@ -48,7 +53,7 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 async def get_current_user(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
-) -> CurrentUser:
+)  -> CurrentUser: 
     """
     Validates JWT and checks the token blacklist.
     Returns 401 for missing/expired/blacklisted tokens.
@@ -105,15 +110,18 @@ async def get_current_user(
     user_id = str(payload.get("sub") or payload.get("UserId") or "")
 
     return CurrentUser(
-        user_id           = user_id,
-        email             = email_id,
-        role_id           = role_id,
-        role_name         = payload.get("RoleName") or payload.get("role") or "",
-        first_name        = payload.get("FirstName") or payload.get("given_name") or "",
+        user_id    = user_id,
+        email      = email_id,
+        role_id    = role_id,
+        role_name  = payload.get("RoleName") or payload.get("role") or "",
+        first_name = payload.get("FirstName") or payload.get("given_name") or "",
         last_name         = payload.get("LastName")  or payload.get("family_name") or "",
         full_name         = payload.get("name") or "",
         profile_image_url = payload.get("ProfileImageUrl") or payload.get("profile_image_url") or "",
         tenant_id         = str(payload.get("TenantId") or "1"),
+        store_id          = payload.get("StoreId") or payload.get("store_id"),
+        warehouse_id=     payload.get("WarehouseId") or payload.get("warehouse_id"),
+        warhouse_name=   payload.get("WarehouseName") or payload.get("warehouse_name") or "",
     )
 
 
@@ -177,3 +185,34 @@ def require_admin_or_order_manager():
 
 def require_inventory_access():
     return require_roles(Roles.SUPER_ADMIN, Roles.INVENTORY_MANAGER, Roles.PRODUCT_MANAGER)
+
+
+# ── require_store_user  (used by billing v2 router) ─────────────
+def require_store_user(
+    current_user: CurrentUser = Depends(get_current_user),
+) -> TokenPayload:                     # ← converts CurrentUser → TokenPayload
+    SUPER_ADMIN = 1
+
+    if current_user.role_id == SUPER_ADMIN:
+        return TokenPayload(
+            sub          = current_user.user_id,
+            role_id      = current_user.role_id,
+            store_id     = current_user.store_id,
+            warehouse_id = current_user.warehouse_id,
+        )
+
+    if not current_user.store_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint requires a store-manager account.",
+        )
+
+    return TokenPayload(
+        sub          = current_user.user_id,
+        role_id      = current_user.role_id,
+        store_id     = current_user.store_id,
+        warehouse_id = current_user.warehouse_id,
+    )
+
+
+

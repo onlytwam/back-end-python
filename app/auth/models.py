@@ -7,11 +7,13 @@ SQLAlchemy models for the auth schema.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Column, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from database import Base
 from app.userrole.models import UserRole
+from app.stores.models import Stores
+from sqlalchemy.orm import relationship
 
 
 class IdentityUser(Base):
@@ -48,6 +50,11 @@ class IdentityUser(Base):
     OrganizationId       = Column("OrganizationId",       Integer, nullable=True)
     DeletedInd           = Column("DeletedInd",           Boolean, default=False)
     IsRandomPassword     = Column("IsRandomPassword",     Boolean, default=False)
+    StoreId              = Column("StoreId",              Integer, ForeignKey("twam.Stores.StoreId"),nullable=True)
+    warehouseId          = Column("WarehouseId",          Integer, ForeignKey("twam.Warehouses.WarehouseId"), nullable=True)
+
+    store = relationship("Stores")
+    warehouse = relationship("Warehouse")
 
     def __repr__(self):
         return f"<IdentityUser(Id={self.Id}, UserName={self.UserName}, Email={self.Email})>"

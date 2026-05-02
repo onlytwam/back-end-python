@@ -1,33 +1,52 @@
-# ── Response: product lookup ──────────────────────────────────
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional
 from datetime import datetime
-from typing import Optional,List,Any
-from pydantic import BaseModel,Field
-
-from sqlalchemy.orm import Session, relationship, declarative_base
+from enum import Enum
 
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+class TokenPayload(BaseModel):
+    sub:          str                  # = user_id
+    role_id:      int           = 0
+    store_id:     Optional[int] = None
+    warehouse_id: Optional[int] = None
+
+
+# ── Inventory ─────────────────────────────────────────────────────────────────
+class InventoryItem(BaseModel):
+    inventoryId:  int
+    stockId:      str
+    storeId:      Optional[int]
+    warehouseId:  Optional[int]
+    locationName: str
+    locationType: str
+    quantity:     int
+    available:    int
+
+    model_config = {"from_attributes": True}
+
+
+
+# ── Product lookup ────────────────────────────────────────────────────────────
 class ProductLookupOut(BaseModel):
     stockId:           str
     productName:       str
     size:              str
     color:             str
     price:             float
+    mrpPrice:          float
     hsnCode:           str
     gstPercent:        float
     availableQuantity: int
-    mrpPrice:          float
- 
-    class Config:
-        from_attributes = True
- 
- 
-# ── Request: create order ─────────────────────────────────────
-class OrderItemIn(BaseModel):
+
+
+# ── Billing line item ─────────────────────────────────────────────────────────
+class BillLineIn(BaseModel):
     stockId:     str
     productName: str
-    size:        str
-    color:       str
-    hsnCode:     str
+    size:        str   = ""
+    color:       str   = ""
+    hsnCode:     str   = ""
     gstPercent:  float
     price:       float
     quantity:    int   = Field(..., ge=1)
@@ -37,82 +56,57 @@ class OrderItemIn(BaseModel):
     sgst:        float
     igst:        float
     lineTotal:   float
- 
- 
-class CreateOrderIn(BaseModel):
+
+
+# ── Warehouse response ────────────────────────────────────────────────────────
+class WarehouseOut(BaseModel):
+    warehouseId:   int
+    warehouseName: str
+    address:       Optional[str]
+    contactPhone:  Optional[str]
+    isActive:      bool
+
+    model_config = {"from_attributes": True}
+
+
+# ── Create bill ───────────────────────────────────────────────────────────────
+class CreateBillIn(BaseModel):
     customerName:   Optional[str] = None
     customerPhone:  Optional[str] = None
-    gstMode:        str = "intrastate"   # intrastate | interstate
-    paymentMethod:  str = "cash"
-    items:          List[OrderItemIn] = Field(..., min_length=1)
+    gstMode:        str           = "intrastate"
+    paymentMethod:  str           = "cash"
+    channel:        str                          # matches SalesChannel.ChannelCode in DB
+    storeId:        Optional[int] = None         # super admin supplies this for POS orders
+    warehouseId:    Optional[int] = None         # required for online channel orders
+    items:          List[BillLineIn]
     subtotal:       float
-    gstTotal:       float
     cgstTotal:      float
     sgstTotal:      float
     igstTotal:      float
+    gstTotal:       float
     discount:       float = 0
     grandTotal:     float
     receivedAmount: float = 0
     balance:        float = 0
     createdBy:      Optional[str] = None
- 
- 
-# ── Response: create order ────────────────────────────────────
-class CreateOrderOut(BaseModel):
+
+    # NOTE: warehouse validation is done in the endpoint (needs DB channel lookup),
+    # not here, because channel is a free string matched against the SalesChannel table.
+
+
+class CreateBillOut(BaseModel):
     orderId:   int
     invoiceNo: str
     message:   str
- 
- 
-# ── Response: order list ──────────────────────────────────────
-class OrderListItem(BaseModel):
-    orderId:      int
-    invoiceNo:    str
-    customerName: Optional[str]
-    grandTotal:   float
-    paymentMethod: str
-    createdDate:  datetime
- 
-    class Config:
-        from_attributes = True
- 
- 
-# ── Response: order detail ────────────────────────────────────
-class OrderItemOut(BaseModel):
-    stockId:    str
-    productName: str
-    size:       str
-    color:      str
-    hsnCode:    str
-    gstPercent: float
-    price:      float
-    quantity:   int
-    lineTotal:  float
- 
-    class Config:
-        from_attributes = True
- 
- 
-class OrderDetailOut(BaseModel):
-    orderId:       int
-    invoiceNo:     str
-    customerName:  Optional[str]
-    customerPhone: Optional[str]
-    gstMode:       str
-    paymentMethod: str
-    subtotal:      float
-    cgstTotal:     float
-    sgstTotal:     float
-    igstTotal:     float
-    gstTotal:      float
-    discount:      float
-    grandTotal:    float
-    receivedAmount: float
-    balance:       float
-    createdDate:   datetime
-    items:         List[OrderItemOut]
- 
-    class Config:
-        from_attributes = True
- 
- 
+
+
+class StoreOut(BaseModel):
+    storeId:   int
+    storeName: str
+    address:   str = ""
+    phone:     str = ""
+    city:      str = ""
+    state:     str = ""
+    pinCode:   str = ""
+
+    model_config = {"from_attributes": True}

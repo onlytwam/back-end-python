@@ -66,10 +66,8 @@ from app.sms.models                  import SmsCredential, SmsMessageTemplate, S
 from app.whatsapp.models             import WhatsAppLog, WhatsAppCredential
 from app.auth.models                 import OtpStore
 from app.speech.models               import AzureSpeechConfig
-from app.billing.models              import BillingOrder, BillingOrderItem
-# ── Surprise Gift models — imported so Base.metadata.create_all creates tables
-from app.surprisegift.models         import SurpriseGiftRule, OrderSurpriseGift
-
+from app.billing.models              import   Warehouse, Inventory  , BillingOrder, BillingOrderItem
+from app.saleschannel.models         import SalesChannel
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -200,9 +198,8 @@ from app.wishlist.router             import router as wishlist_router
 from app.bulkimport.router           import router as bulkimport_router
 from app.sms.router                  import template_router as sms_template_router
 from app.sms.router                  import credential_router as sms_credential_router
-from app.billing.router              import router as billing_router
-# ── Surprise Gift ─────────────────────────────────────────────────────────────
-from app.surprisegift.router         import router as surprise_gift_router
+from app.billing.router               import router as billing_router
+from app.saleschannel.router         import router as saleschannel_router
 
 # ── Ekart Logistics Integration ───────────────────────────────────────────────
 from app.ekart.router                import router as ekart_router
@@ -224,8 +221,7 @@ for _router in (
     shippingtype_router, size_router, state_router, stores_router,
     supplierinfo_router, supportrequest_router, taxhsncode_router,
     userrole_router, wishlist_router, bulkimport_router,
-    newsletter_router, billing_router,
-    surprise_gift_router,
+    newsletter_router, billing_router,saleschannel_router,
     ekart_router, ekart_webhook_router,
     payment_router, sms_template_router, sms_credential_router, speech_router,
 ):

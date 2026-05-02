@@ -1,12 +1,60 @@
-from pydantic import BaseModel, Field
+from __future__ import annotations
+from datetime import datetime, timezone
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Integer,
-    Numeric, String, ForeignKey, Text, func, text
+    Column, Integer, String, Boolean, DateTime,
+    Numeric, ForeignKey, CheckConstraint, UniqueConstraint, Text, BigInteger
 )
-from sqlalchemy.orm import Session, relationship, declarative_base
-from database import  Base          # ← your DB session & Base
-from datetime import datetime, timezone 
+from sqlalchemy.orm import relationship
+from database import Base
 
+
+class Warehouse(Base):
+    __tablename__ = "Warehouses"
+    __table_args__ = {"schema": "twam", "extend_existing": True}
+
+    WarehouseId   = Column(Integer, primary_key=True, index=True)
+    WarehouseName = Column(String(120), nullable=False)
+    Address       = Column(Text)
+    ContactPhone  = Column(String(20))
+    IsActive      = Column(Boolean, default=True, nullable=False)
+    CreatedDate   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    ModifiedDate  = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
+
+    inventory = relationship("Inventory", back_populates="warehouse")
+    people = relationship("People", back_populates="warehouse")
+    
+class Inventory(Base):
+    __tablename__ = "Inventory"
+    __table_args__ = (
+        CheckConstraint(
+            "(\"StoreId\" IS NOT NULL AND \"WarehouseId\" IS NULL)"
+            " OR "
+            "(\"StoreId\" IS NULL AND \"WarehouseId\" IS NOT NULL)",
+            name="chk_inventory_location",
+        ),
+        UniqueConstraint("StockId", "StoreId",     name="uq_inventory_stock_store"),
+        UniqueConstraint("StockId", "WarehouseId", name="uq_inventory_stock_warehouse"),
+        {"schema": "twam", "extend_existing": True},
+    )
+
+    InventoryId            = Column(Integer, primary_key=True, index=True)
+    StockId                = Column(String(60), nullable=False, index=True)
+    StoreId                = Column(Integer, ForeignKey("twam.Stores.StoreId"),         nullable=True, index=True)
+    WarehouseId            = Column(Integer, ForeignKey("twam.Warehouses.WarehouseId"), nullable=True, index=True)
+    ProductVariantDetailId = Column(Integer, ForeignKey("twam.ProductVariantDetail.ProductVariantDetailId"), nullable=True, index=True)  # ← new
+    Quantity               = Column(Integer, nullable=False, default=0)
+    ReservedQty            = Column(Integer, nullable=False, default=0)
+    CreatedDate            = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    ModifiedDate           = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
+
+    store                  = relationship("Stores",               back_populates="inventory", foreign_keys=[StoreId])
+    warehouse              = relationship("Warehouse",            back_populates="inventory", foreign_keys=[WarehouseId])
+    product_variant_detail = relationship("ProductVariantDetail", foreign_keys=[ProductVariantDetailId])  # ← new
+
+    @property
+    def available(self) -> int:
+        return max(0, (self.Quantity or 0) - (self.ReservedQty or 0))
+    
 
 class BillingOrder(Base):
     __tablename__ = "BillingOrders"
@@ -29,6 +77,10 @@ class BillingOrder(Base):
     Balance        = Column(Numeric(22, 6), default=0)
     CreatedDate    = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     CreatedBy      = Column(String(100))
+    Channel    = Column(String(20), nullable=True,  default="POS")
+    StoreId     = Column(Integer,    nullable=True)
+    WarehouseId = Column(Integer,    nullable=True)
+
  
     items = relationship("BillingOrderItem", back_populates="order", cascade="all, delete-orphan")
  
