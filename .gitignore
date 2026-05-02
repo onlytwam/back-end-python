@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+uploads/
+venv/
+.env.production
+.env
+.env.*
+uploads/
+image/
+*.zip
