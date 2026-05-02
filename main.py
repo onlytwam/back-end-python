@@ -66,7 +66,10 @@ from app.sms.models                  import SmsCredential, SmsMessageTemplate, S
 from app.whatsapp.models             import WhatsAppLog, WhatsAppCredential
 from app.auth.models                 import OtpStore
 from app.speech.models               import AzureSpeechConfig
-from app.billing.models                  import BillingOrder, BillingOrderItem
+from app.billing.models              import BillingOrder, BillingOrderItem
+# ── Surprise Gift models — imported so Base.metadata.create_all creates tables
+from app.surprisegift.models         import SurpriseGiftRule, OrderSurpriseGift
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -142,7 +145,7 @@ All protected endpoints require a Bearer JWT token.
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,   # ← reads from config, not hardcoded
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,7 +155,7 @@ app.add_middleware(
 from app.auth.router                 import router as auth_router
 from app.connect.router              import router as connect_router
 from app.blog.router                 import router as blog_router
-from app.brand.router                import router as brand_router   
+from app.brand.router                import router as brand_router
 from app.category.router             import router as category_router
 from app.coupons.router              import router as coupons_router
 from app.deliverycharge.router       import router as deliverycharge_router
@@ -197,7 +200,9 @@ from app.wishlist.router             import router as wishlist_router
 from app.bulkimport.router           import router as bulkimport_router
 from app.sms.router                  import template_router as sms_template_router
 from app.sms.router                  import credential_router as sms_credential_router
-from app.billing.router               import router as billing_router
+from app.billing.router              import router as billing_router
+# ── Surprise Gift ─────────────────────────────────────────────────────────────
+from app.surprisegift.router         import router as surprise_gift_router
 
 # ── Ekart Logistics Integration ───────────────────────────────────────────────
 from app.ekart.router                import router as ekart_router
@@ -220,8 +225,9 @@ for _router in (
     supplierinfo_router, supportrequest_router, taxhsncode_router,
     userrole_router, wishlist_router, bulkimport_router,
     newsletter_router, billing_router,
+    surprise_gift_router,
     ekart_router, ekart_webhook_router,
-    payment_router,sms_template_router, sms_credential_router, speech_router,
+    payment_router, sms_template_router, sms_credential_router, speech_router,
 ):
     app.include_router(_router)
 
@@ -235,5 +241,5 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    print("VALIDATION ERROR:", exc.errors())  # ← shows exact field + reason
+    print("VALIDATION ERROR:", exc.errors())
     return JSONResponse(status_code=422, content={"detail": exc.errors()})

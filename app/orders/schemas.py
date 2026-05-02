@@ -89,6 +89,8 @@ class CreateOrderRequest(BaseModel):
     paymentMethod: Optional[str] = None
     paymentAccount: Optional[str] = None
     platform: Optional[str] = None
+    # Surprise gift — set by the cart UI when a gift is unlocked
+    surpriseGiftRuleId: Optional[int] = None
 
 
 # ── ReOrder (Cart) ────────────────────────────────────────────────────────────
@@ -186,6 +188,8 @@ class OrderItemModel(BaseModel):
     isReturnAvailable: Optional[bool] = None
     rating: Optional[int] = None
     comment: Optional[str] = None
+    # Surprise gift flag — True means this is a mystery gift item
+    isSurpriseGift: Optional[bool] = False
 
     class Config:
         from_attributes = True

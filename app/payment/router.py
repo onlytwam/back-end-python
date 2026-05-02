@@ -245,6 +245,24 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         ]
         print(f"[Payment→Ekart] {len(items)} item(s) fetched")
 
+        # ── Surprise gift: if physical_gift type, add to shipment at ₹0 ─────
+        try:
+            from app.surprisegift.repository import get_order_gift_snapshot
+            gift_snap = get_order_gift_snapshot(db, order_id)
+            if gift_snap and gift_snap.giftType == "physical_gift":
+                items.append(EkartShipmentItem(
+                    name=gift_snap.giftName,
+                    sku=gift_snap.sku or f"GIFT-{gift_snap.giftRuleId}",
+                    quantity=1,
+                    price=0.0,
+                    hsn_code=gift_snap.hsnCode,
+                ))
+                print(f"[Payment→Ekart] 🎁 Added physical gift '{gift_snap.giftName}' (sku={gift_snap.sku}) to shipment")
+            elif gift_snap and gift_snap.giftType == "physical_coupon":
+                print(f"[Payment→Ekart] 🎁 Physical coupon gift — no ekart item needed (packed by inventory)")
+        except Exception as _gexc:
+            print(f"[Payment→Ekart] ⚠️  Could not fetch surprise gift for order {order_id}: {_gexc}")
+
         request = CreateShipmentRequest(
             order_id=            order["order_id"],
             order_number=        order["order_number"],
