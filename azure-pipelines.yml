@@ -1,7 +1,7 @@
 trigger:
   branches:
     include:
-      - backend-setup/Vishnu
+      - backend-setup/Vishnu     # ✅ Build only on every push
 
 pool:
   vmImage: ubuntu-latest
@@ -12,9 +12,9 @@ variables:
 
 steps:
   - task: Docker@2
-    displayName: Build and Push to ACR
+    displayName: Build only (no push)
     inputs:
-      command: buildAndPush
+      command: build              # ✅ build only, not buildAndPush
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
@@ -23,15 +23,5 @@ steps:
         $(Build.BuildId)
       arguments: '--no-cache'
 
-  - task: AzureCLI@2
-    displayName: Deploy to Container Apps (force new revision)
-    inputs:
-      azureSubscription: twam-azure-connection
-      scriptType: bash
-      scriptLocation: inlineScript
-      inlineScript: |
-        az containerapp update \
-          --name twam-backend \
-          --resource-group twam-production \
-          --image twamregistry.azurecr.io/twam-backend:$(Build.BuildId) \
-          --revision-suffix build$(Build.BuildId)
+  # ❌ No push to ACR
+  # ❌ No deploy
