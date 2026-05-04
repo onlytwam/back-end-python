@@ -30,30 +30,36 @@ Column layout (fixed, left-to-right):
 
   Product columns (B-G):
     B  Product Code*   C  Product Name*   D  Description*
-    E  Category ID*    F  Brand ID*        G  Child Category ID
+    E  Category*       F  Child Category  G  Brand*
 
   Variant columns (H-P):
     H  Product Code*        I  Variant Name*     J  Variant Description
     K  Fabric* (required)   L  Color* (required) M  Is Best Seller
     N  Is Return Available  O  Is Cup Size*      P  TAX HSN Code
 
-  Size columns (Q-AA):
+  Size columns (Q-AC):
     Q  Stock ID          R  Size ID*         S  Cup Size ID
     T  Purchase Price*   U  MRP Price*       V  Final Price*
     W  Discount %        X  Stock Qty*       Y  CGST % (auto, locked)
-    Z  SGST % (auto, locked)  AA  Store Name*
+    Z  SGST % (auto, locked)  AA  Store Name   AB  Warehouse Name
+    AC  Date*
+
+  NOTE: Either Store Name (AA) or Warehouse Name (AB) must be provided.
+        Date (AC) is required and stored in ProductVariantDetail.
 
 DB migration (run once before deploying):
   ALTER TABLE twam."ProductVariantDetail"
     ADD COLUMN IF NOT EXISTS "PurchasePrice"  integer,
     ADD COLUMN IF NOT EXISTS "CGST"           numeric(5,2),
     ADD COLUMN IF NOT EXISTS "SGST"           numeric(5,2),
-    ADD COLUMN IF NOT EXISTS "StoreId"        bigint;
+    ADD COLUMN IF NOT EXISTS "StoreId"        bigint,
+    ADD COLUMN IF NOT EXISTS "WarehouseId"    bigint,
+    ADD COLUMN IF NOT EXISTS "Date"           date;
 """
 
 import io
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
@@ -119,6 +125,23 @@ def _cast(value: Any, dtype: str) -> Any:
             if val in ("FALSE", "0", "NO", "N"):
                 return False
             return None
+        if dtype == "date":
+            # Handle Excel serial date numbers
+            if isinstance(value, (int, float)):
+                d = datetime(1899, 12, 30) + timedelta(days=int(value))
+                return d.date()
+            # Handle datetime objects from openpyxl
+            if isinstance(value, datetime):
+                return value.date()
+            if isinstance(value, date):
+                return value
+            # Handle string dates in various formats
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+                try:
+                    return datetime.strptime(raw, fmt).date()
+                except ValueError:
+                    continue
+            raise ValueError(f"Cannot parse date '{raw}'")
         return raw
     except (ValueError, TypeError):
         raise ValueError(f"Cannot cast '{value}' to {dtype}")
@@ -340,7 +363,6 @@ def _insert_entity_row(db: Session, entity: str, row: dict, user_id: str, now: d
 async def _fetch_hsn_rates(db: Session, hsn_ids: list[int]) -> dict[int, dict]:
     """
     Query DB for HSN tax rates.
-    Adjust table/column names to match your actual schema if needed.
     """
     if not hsn_ids:
         return {}
@@ -358,8 +380,6 @@ async def _fetch_hsn_rates(db: Session, hsn_ids: list[int]) -> dict[int, dict]:
         row.TaxHSNCodeId: {"cgst": float(row.CGST or 0), "sgst": float(row.SGST or 0)}
         for row in result
     }
-
-
 
 
 # ==============================================================================
@@ -382,6 +402,28 @@ def _fetch_store_map(db: Session) -> dict[str, int]:
     """Return {storeName -> storeId} for validation during parse/import."""
     stores = _fetch_all_stores(db)
     return {s["storeName"]: s["storeId"] for s in stores}
+
+
+# ==============================================================================
+#  Warehouse lookup helpers  ← NEW
+# ==============================================================================
+
+def _fetch_all_warehouses(db: Session) -> list[dict]:
+    """Return all active warehouses as list of {warehouseId, warehouseName}."""
+    result = db.execute(text("""
+        SELECT "WarehouseId", "WarehouseName"
+        FROM   twam."Warehouses"
+        WHERE  "IsActive" = true
+        ORDER  BY "WarehouseName"
+    """))
+    return [{"warehouseId": row.WarehouseId, "warehouseName": row.WarehouseName}
+            for row in result]
+
+
+def _fetch_warehouse_map(db: Session) -> dict[str, int]:
+    """Return {warehouseName -> warehouseId} for validation."""
+    warehouses = _fetch_all_warehouses(db)
+    return {w["warehouseName"]: w["warehouseId"] for w in warehouses}
 
 
 def _fetch_ref_data(db: Session) -> dict:
@@ -433,17 +475,17 @@ def _fetch_ref_data(db: Session) -> dict:
 # ==============================================================================
 #  Hierarchical column definitions
 #
-#  CHANGE 1 — StockId moved to VARIANT row (col Q, index 16)
-#  CHANGE 2 — PurchasePrice added to SIZE row (col Y, index 24) as integer
-#  CHANGE 3 — SellingPrice added to SIZE row (col U, index 20); validated <= MRP
-#  CHANGE 4 — CGST/SGST added to SIZE row (cols Z/AA, indices 25/26); auto-filled
+#  CHANGE 1 — StockId on SIZE row (col Q, index 16)
+#  CHANGE 2 — PurchasePrice on SIZE row (col T, index 19) as integer
+#  CHANGE 3 — CGST/SGST auto-filled (cols Y/Z, indices 24/25); locked
+#  CHANGE 4 — StoreName on SIZE row (col AA, index 26)
+#  NEW       — WarehouseName on SIZE row (col AB, index 27); either Store or Warehouse required
+#  NEW       — Date on SIZE row (col AC, index 28); required; stored as date
 # ==============================================================================
 
 _COL_ROW_TYPE = 0  # A
 
 # Product field positions (B=1 ... G=6)
-# Sequence: Code, Name, Desc, Category, ChildCategory, Brand
-# categoryName/childCategoryName/brandName stored as str; resolved to IDs in chain builder
 _P_FIELDS: list[tuple[str, int, str, bool]] = [
     ("productCode",        1, "str", True),   # B  Product Code (SKU)*
     ("name",               2, "str", True),   # C  Product Name*
@@ -454,8 +496,6 @@ _P_FIELDS: list[tuple[str, int, str, bool]] = [
 ]
 
 # Variant field positions (H=7 ... P=15)
-# fabricName + color are now REQUIRED
-# Sequence matches UI: Code,Name,Desc,Fabric*,Color*,BestSeller,Return,CupSize,HSN
 _V_FIELDS: list[tuple[str, int, str, bool]] = [
     ("variantCode",         7,  "str",  True),  # H  Product Code*
     ("variantName",         8,  "str",  True),  # I  Variant Name*
@@ -468,25 +508,25 @@ _V_FIELDS: list[tuple[str, int, str, bool]] = [
     ("hsnCode",             15, "str",  False), # P  TAX HSN Code (dropdown)
 ]
 
-# Size field positions (Q=16 ... AA=26)
-# purchasePrice is now REQUIRED
-# Sequence: StockId, SizeId*, CupSizeId, PurchasePrice*, MRP*, FinalPrice*,
-#           Discount, StockQty*, CGST(auto), SGST(auto), StoreName*
+# Size field positions (Q=16 ... AC=28)
+# Store OR Warehouse must be provided — enforced in parser
 _S_FIELDS: list[tuple[str, int, str, bool]] = [
     ("stockId",           16, "str",   False), # Q  Stock ID
     ("sizeId",            17, "int",   True),  # R  Size ID*
     ("cupSizeId",         18, "int",   False), # S  Cup Size ID
     ("purchasePrice",     19, "int",   True),  # T  Purchase Price* (required)
-    ("mrpPrice",          20, "float", True),  # U  MRP Price* (Selling)
+    ("mrpPrice",          20, "float", True),  # U  MRP Price*
     ("finalPrice",        21, "float", True),  # V  Final Price*
     ("discountPercent",   22, "int",   False), # W  Discount %
     ("availableQuantity", 23, "int",   True),  # X  Stock Qty*
     ("cgst",              24, "float", False), # Y  CGST % (auto, locked)
     ("sgst",              25, "float", False), # Z  SGST % (auto, locked)
-    ("storeName",         26, "str",   True),  # AA Store Name*
+    ("storeName",         26, "str",   False), # AA Store Name  (either this or warehouseName)
+    ("warehouseName",     27, "str",   False), # AB Warehouse Name  ← NEW
+    ("entryDate",         28, "date",  True),  # AC Date*  ← NEW
 ]
 
-_TOTAL_COLS = 27  # A-AA  (col AB hidden VLOOKUP for StoreId)
+_TOTAL_COLS = 29  # A-AC
 
 
 def _cell(row: tuple, col: int) -> Any:
@@ -510,34 +550,36 @@ def _is_sample_row(rec: dict) -> bool:
 #  Hierarchical template builder
 # ==============================================================================
 
-def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
+def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: list[dict]) -> bytes:
     """
     Build the Excel template with:
-    - No legend section, no How-to-Fill sheet
     - Dropdowns for Category, Child Category, Brand (PRODUCT row)
     - Dropdowns for Fabric, HSN Code (VARIANT row)
-    - Dropdown for Store (SIZE row)
-    - StockId on SIZE row beside Cup Size ID
-    - CGST/SGST locked (grey, uneditable style, protected via sheet protection)
+    - Dropdowns for Store and Warehouse (SIZE row) — either one must be filled
+    - Date picker (calendar) for Date column (SIZE row)
+    - CGST/SGST locked (auto-filled from HSN)
     """
     _check_openpyxl()
 
-    C_PROD_HDR  = "6B0F2A"
-    C_VAR_HDR   = "1A3A5C"
-    C_SIZE_HDR  = "14532D"
-    C_TAX_HDR   = "7C6000"   # amber for auto-tax columns
-    C_STORE_HDR = "1E3A5F"
-    C_TYPE_HDR  = "2D2D2D"
-    C_PROD_ROW  = "FFF0F3"
-    C_VAR_ROW   = "EFF6FF"
-    C_SIZE_ROW  = "F0FDF4"
-    C_PROD_TYP  = "6B0F2A"
-    C_VAR_TYP   = "1D4ED8"
-    C_SIZE_TYP  = "047857"
-    C_BLANK     = "F5F5F5"
-    C_SEP       = "EFEFEF"
-    C_LOCK_BG   = "D1D5DB"   # grey for locked CGST/SGST cells
-    C_LOCK_FONT = "6B7280"
+    C_PROD_HDR   = "6B0F2A"
+    C_VAR_HDR    = "1A3A5C"
+    C_SIZE_HDR   = "14532D"
+    C_TAX_HDR    = "7C6000"   # amber for auto-tax columns
+    C_STORE_HDR  = "1E3A5F"
+    C_WH_HDR     = "4A1D96"   # purple for warehouse column  ← NEW
+    C_DATE_HDR   = "065F46"   # teal for date column  ← NEW
+    C_TYPE_HDR   = "2D2D2D"
+    C_PROD_ROW   = "FFF0F3"
+    C_VAR_ROW    = "EFF6FF"
+    C_SIZE_ROW   = "F0FDF4"
+    C_PROD_TYP   = "6B0F2A"
+    C_VAR_TYP    = "1D4ED8"
+    C_SIZE_TYP   = "047857"
+    C_BLANK      = "F5F5F5"
+    C_SEP        = "EFEFEF"
+    C_LOCK_BG    = "D1D5DB"   # grey for locked CGST/SGST cells
+    C_LOCK_FONT  = "6B7280"
+    C_DATE_BG    = "ECFDF5"   # light teal for date cells  ← NEW
 
     wb = Workbook()
     ws = wb.active
@@ -600,19 +642,25 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
         "sizeId":            "Size ID*",
         "cupSizeId":         "Cup Size ID",
         "purchasePrice":     "Purchase Price*",
-        "mrpPrice":          "MRP Price* (Selling)",
+        "mrpPrice":          "MRP Price*",
         "finalPrice":        "Final Price*",
         "discountPercent":   "Discount %",
         "availableQuantity": "Stock Qty*",
         "cgst":              "CGST % (auto)",
         "sgst":              "SGST % (auto)",
-        "storeName":         "Store Name*",
+        "storeName":         "Store Name (or Warehouse)",   # updated label
+        "warehouseName":     "Warehouse Name (or Store)",   # ← NEW
+        "entryDate":         "Date*",                       # ← NEW
     }
     for field, col, dtype, req in _S_FIELDS:
         if field in ("cgst", "sgst"):
             bg = C_TAX_HDR
         elif field == "storeName":
             bg = C_STORE_HDR
+        elif field == "warehouseName":
+            bg = C_WH_HDR      # ← NEW
+        elif field == "entryDate":
+            bg = C_DATE_HDR    # ← NEW
         else:
             bg = C_SIZE_HDR
         hdr_cell(col, _S_LABELS[field], bg)
@@ -644,13 +692,15 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
             bv.sqref = f"{col_letter}2:{col_letter}5000"
 
     # ── Column letter shortcuts ───────────────────────────────────────────────
-    mrp_col   = get_column_letter(20 + 1)   # U  MRP Price
-    final_col = get_column_letter(21 + 1)   # V  Final Price
-    store_col = get_column_letter(26 + 1)   # AA Store Name
-    cgst_col  = get_column_letter(24 + 1)   # Y  CGST
-    sgst_col  = get_column_letter(25 + 1)   # Z  SGST
+    mrp_col       = get_column_letter(20 + 1)   # U  MRP Price
+    final_col     = get_column_letter(21 + 1)   # V  Final Price
+    store_col     = get_column_letter(26 + 1)   # AA Store Name
+    cgst_col      = get_column_letter(24 + 1)   # Y  CGST
+    sgst_col      = get_column_letter(25 + 1)   # Z  SGST
+    wh_col        = get_column_letter(27 + 1)   # AB Warehouse Name  ← NEW
+    date_col      = get_column_letter(28 + 1)   # AC Date  ← NEW
 
-    # Final Price <= MRP validation
+    # ── Final Price <= MRP validation ─────────────────────────────────────────
     dv_final = DataValidation(
         type="decimal", operator="lessThanOrEqual",
         formula1=f"${mrp_col}2",
@@ -660,6 +710,31 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
     )
     ws.add_data_validation(dv_final)
     dv_final.sqref = f"{final_col}2:{final_col}5000"
+
+    # ── Date validation ────────────────────────────────────────────────────────
+    # Use type="date" with DATE() formula so Excel accepts typed YYYY-MM-DD values.
+    # type="date" with string formula1/formula2 is the correct openpyxl approach;
+    # the earlier "2000-01-01" string form works when wrapped in DATE().
+    dv_date = DataValidation(
+        type="date",
+        operator="between",
+        formula1="DATE(2000,1,1)",
+        formula2="DATE(2099,12,31)",
+        allow_blank=True,
+        showErrorMessage=True,
+        showInputMessage=True,
+        errorTitle="Invalid Date",
+        error="Please enter a valid date in YYYY-MM-DD format (e.g. 2026-05-02).",
+        promptTitle="Date*",
+        prompt="Type a date: YYYY-MM-DD",
+    )
+    ws.add_data_validation(dv_date)
+    dv_date.sqref = f"{date_col}2:{date_col}5000"
+
+    # Format date column cells so Excel displays them as YYYY-MM-DD
+    for row_i in range(2, 5001):
+        c = ws.cell(row=row_i, column=28 + 1)
+        c.number_format = "YYYY-MM-DD"
 
     # ── Conditional formatting ────────────────────────────────────────────────
     data_range = f"A2:{get_column_letter(_TOTAL_COLS)}5000"
@@ -681,10 +756,29 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
     ws.conditional_formatting.add(
         f"{final_col}2:{final_col}5000",
         FormulaRule(
-            formula=[f"AND({final_col}2<>\"\"," 
+            formula=[f"AND({final_col}2<>\"\","
                      f"{mrp_col}2<>\"\",{final_col}2>{mrp_col}2)"],
             fill=PatternFill("solid", fgColor="FEE2E2"),
             font=Font(color="B91C1C", bold=True),
+            stopIfTrue=True,
+        ),
+    )
+    # Orange highlight when BOTH store and warehouse are filled (only one allowed)  ← NEW
+    ws.conditional_formatting.add(
+        f"{store_col}2:{store_col}5000",
+        FormulaRule(
+            formula=[f'AND({store_col}2<>"",{wh_col}2<>"")'],
+            fill=PatternFill("solid", fgColor="FEF3C7"),
+            font=Font(color="92400E", bold=True),
+            stopIfTrue=True,
+        ),
+    )
+    ws.conditional_formatting.add(
+        f"{wh_col}2:{wh_col}5000",
+        FormulaRule(
+            formula=[f'AND({store_col}2<>"",{wh_col}2<>"")'],
+            fill=PatternFill("solid", fgColor="FEF3C7"),
+            font=Font(color="92400E", bold=True),
             stopIfTrue=True,
         ),
     )
@@ -700,32 +794,27 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
                 ws_r.cell(row=ri, column=ci, value=val)
         return ws_r, len(rows_data)
 
-    # Category ref: col A=CategoryId, col B=Name (parent cats only)
     cats    = _refs["categories"]
     _make_ref_sheet("CAT_REF",   ["CategoryId", "Name"],
                     [[r["id"], r["name"]] for r in cats])
 
-    # Child Category ref: col A=CategoryId, col B=Name
     child_cats = _refs["childCategories"]
     _make_ref_sheet("CHILD_CAT_REF", ["CategoryId", "Name"],
                     [[r["id"], r["name"]] for r in child_cats])
 
-    # Brand ref: col A=brandId, col B=brandName
     brands = _refs["brands"]
     _make_ref_sheet("BRAND_REF", ["brandId", "brandName"],
                     [[r["id"], r["name"]] for r in brands])
 
-    # Fabric ref: col A=FabricId, col B=Name
     fabrics = _refs["fabrics"]
     _make_ref_sheet("FABRIC_REF", ["FabricId", "Name"],
                     [[r["id"], r["name"]] for r in fabrics])
 
-    # HSN ref: col A=TaxHSNCodeId, col B=HSNCode (shown to user), col C=CGST, col D=SGST
     hsn_codes = _refs["hsnCodes"]
     _make_ref_sheet("HSN_REF", ["TaxHSNCodeId", "HSNCode", "CGST", "SGST"],
                     [[r["id"], r["code"], r["cgst"], r["sgst"]] for r in hsn_codes])
 
-    # Store ref: col A=StoreId, col B=StoreName
+    # Store ref sheet
     ws_st = wb.create_sheet("STORES_REF")
     ws_st.sheet_state = "hidden"
     ws_st.cell(row=1, column=1, value="StoreId")
@@ -735,7 +824,17 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
         ws_st.cell(row=i, column=2, value=store["storeName"])
     num_stores = len(_stores)
 
-    # ── Named ranges helper (use sheet!$B$2:$B$N as formula1) ─────────────────
+    # Warehouse ref sheet  ← NEW
+    ws_wh = wb.create_sheet("WAREHOUSE_REF")
+    ws_wh.sheet_state = "hidden"
+    ws_wh.cell(row=1, column=1, value="WarehouseId")
+    ws_wh.cell(row=1, column=2, value="WarehouseName")
+    for i, wh in enumerate(_warehouses, start=2):
+        ws_wh.cell(row=i, column=1, value=wh["warehouseId"])
+        ws_wh.cell(row=i, column=2, value=wh["warehouseName"])
+    num_warehouses = len(_warehouses)
+
+    # ── Dropdown helper ───────────────────────────────────────────────────────
     def _add_list_dv(col_letter, sheet_name, num_rows, title="", err=""):
         if num_rows == 0:
             return
@@ -750,35 +849,37 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
         ws.add_data_validation(dv)
         dv.sqref = f"{col_letter}2:{col_letter}5000"
 
-    # PRODUCT row dropdowns
     cat_col        = get_column_letter(4 + 1)   # E  Category
     child_cat_col  = get_column_letter(5 + 1)   # F  Child Category
     brand_col      = get_column_letter(6 + 1)   # G  Brand
     fabric_col     = get_column_letter(10 + 1)  # K  Fabric
     hsn_col        = get_column_letter(15 + 1)  # P  HSN Code
 
-    _add_list_dv(cat_col,       "CAT_REF",       len(cats),       "Invalid Category",     "Select a category.")
-    _add_list_dv(child_cat_col, "CHILD_CAT_REF", len(child_cats), "Invalid Child Cat",    "Select a child category.")
-    _add_list_dv(brand_col,     "BRAND_REF",     len(brands),     "Invalid Brand",        "Select a brand.")
-    _add_list_dv(fabric_col,    "FABRIC_REF",    len(fabrics),    "Invalid Fabric",       "Select a fabric.")
-    _add_list_dv(hsn_col,       "HSN_REF",       len(hsn_codes),  "Invalid HSN Code",     "Select an HSN code.")
-    _add_list_dv(store_col,     "STORES_REF",    num_stores,      "Invalid Store",        "Select a store.")
+    _add_list_dv(cat_col,       "CAT_REF",       len(cats),        "Invalid Category",   "Select a category.")
+    _add_list_dv(child_cat_col, "CHILD_CAT_REF", len(child_cats),  "Invalid Child Cat",  "Select a child category.")
+    _add_list_dv(brand_col,     "BRAND_REF",     len(brands),      "Invalid Brand",      "Select a brand.")
+    _add_list_dv(fabric_col,    "FABRIC_REF",    len(fabrics),     "Invalid Fabric",     "Select a fabric.")
+    _add_list_dv(hsn_col,       "HSN_REF",       len(hsn_codes),   "Invalid HSN Code",   "Select an HSN code.")
+    _add_list_dv(store_col,     "STORES_REF",    num_stores,       "Invalid Store",      "Select a store (or leave blank and fill Warehouse).")
+    _add_list_dv(wh_col,        "WAREHOUSE_REF", num_warehouses,   "Invalid Warehouse",  "Select a warehouse (or leave blank and fill Store).")  # ← NEW
 
     # ── Hidden VLOOKUP columns for IDs ────────────────────────────────────────
-    # Col AB (28): CategoryId  — VLOOKUP E -> CAT_REF B:A
-    # Col AC (29): ChildCatId  — VLOOKUP G -> CHILD_CAT_REF B:A
-    # Col AD (30): BrandId     — VLOOKUP F -> BRAND_REF B:A
-    # Col AE (31): FabricId    — VLOOKUP K -> FABRIC_REF B:A
-    # Col AF (32): TaxHSNCodeId— VLOOKUP P -> HSN_REF B:A
-    # Col AG (33): StoreId     — VLOOKUP AA-> STORES_REF B:A
+    # Col AD (30): CategoryId
+    # Col AE (31): ChildCatId
+    # Col AF (32): BrandId
+    # Col AG (33): FabricId
+    # Col AH (34): TaxHSNCodeId
+    # Col AI (35): StoreId
+    # Col AJ (36): WarehouseId  ← NEW
     hidden_lookups = [
-        (28, cat_col,       "CAT_REF",       len(cats),       "CategoryId"),
-        (29, child_cat_col, "CHILD_CAT_REF", len(child_cats), "ChildCategoryId"),
-        (30, brand_col,     "BRAND_REF",     len(brands),     "BrandId"),
-        (31, fabric_col,    "FABRIC_REF",    len(fabrics),    "FabricId"),
-        (32, hsn_col,       "HSN_REF",       len(hsn_codes),  "TaxHSNCodeId"),
-        (33, store_col,     "STORES_REF",    num_stores,      "StoreId"),
-    ]  # AB-AG hidden cols
+        (30, cat_col,       "CAT_REF",       len(cats),        "CategoryId"),
+        (31, child_cat_col, "CHILD_CAT_REF", len(child_cats),  "ChildCategoryId"),
+        (32, brand_col,     "BRAND_REF",     len(brands),      "BrandId"),
+        (33, fabric_col,    "FABRIC_REF",    len(fabrics),     "FabricId"),
+        (34, hsn_col,       "HSN_REF",       len(hsn_codes),   "TaxHSNCodeId"),
+        (35, store_col,     "STORES_REF",    num_stores,       "StoreId"),
+        (36, wh_col,        "WAREHOUSE_REF", num_warehouses,   "WarehouseId"),   # ← NEW
+    ]
     for abs_col, src_col, ref_sheet, n_rows, label in hidden_lookups:
         col_letter = get_column_letter(abs_col)
         ws.cell(row=1, column=abs_col, value=label).font = Font(color="FFFFFF", size=8)
@@ -786,26 +887,24 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
         if n_rows > 0:
             for vrow in range(2, 501):
                 formula = (
-                    f'=IFERROR(VLOOKUP({src_col}{vrow},' 
-                    f'{ref_sheet}!$B$2:$A${n_rows+1},2,0),"")' 
+                    f'=IFERROR(VLOOKUP({src_col}{vrow},'
+                    f'{ref_sheet}!$B$2:$A${n_rows+1},2,0),"")'
                 )
                 c = ws.cell(row=vrow, column=abs_col, value=formula)
                 c.font = Font(color="FFFFFF", size=8)
 
-    # ── CGST/SGST auto-fill formula from HSN_REF via hidden TaxHSNCodeId ──────
-    # Y col (cgst, index 24+1=25): =IFERROR(VLOOKUP(AF{row},HSN_REF!$A$2:$C$N,3,0),"")
-    # Z col (sgst, index 25+1=26): =IFERROR(VLOOKUP(AF{row},HSN_REF!$A$2:$D$N,4,0),"")
-    hsn_id_col = get_column_letter(32)  # AF = TaxHSNCodeId hidden col
+    # ── CGST/SGST auto-fill formula ───────────────────────────────────────────
+    hsn_id_col = get_column_letter(34)  # AH = TaxHSNCodeId hidden col
     n_hsn = len(hsn_codes)
     if n_hsn > 0:
         for vrow in range(2, 501):
             cgst_formula = (
-                f'=IFERROR(VLOOKUP({hsn_id_col}{vrow},' 
-                f'HSN_REF!$A$2:$D${n_hsn+1},3,0),"")' 
+                f'=IFERROR(VLOOKUP({hsn_id_col}{vrow},'
+                f'HSN_REF!$A$2:$D${n_hsn+1},3,0),"")'
             )
             sgst_formula = (
-                f'=IFERROR(VLOOKUP({hsn_id_col}{vrow},' 
-                f'HSN_REF!$A$2:$D${n_hsn+1},4,0),"")' 
+                f'=IFERROR(VLOOKUP({hsn_id_col}{vrow},'
+                f'HSN_REF!$A$2:$D${n_hsn+1},4,0),"")'
             )
             for col_i, formula in [(25, cgst_formula), (26, sgst_formula)]:
                 c = ws.cell(row=vrow, column=col_i, value=formula)
@@ -816,6 +915,8 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
                 c.protection = openpyxl.styles.Protection(locked=True)
 
     # ── Sample data ───────────────────────────────────────────────────────────
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
     sample_products = [
         {"productCode": "PRD-001", "name": "Product 1",
          "description": "First product description",
@@ -838,10 +939,12 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
     sample_sizes = [
         {"sizeId": 1, "cupSizeId": "", "stockId": "", "mrpPrice": 999,
          "finalPrice": 799, "availableQuantity": 50, "discountPercent": 20,
-         "purchasePrice": 500, "cgst": "", "sgst": "", "storeName": ""},
+         "purchasePrice": 500, "cgst": "", "sgst": "",
+         "storeName": "", "warehouseName": "", "entryDate": today_str},
         {"sizeId": 2, "cupSizeId": "", "stockId": "", "mrpPrice": 999,
          "finalPrice": 799, "availableQuantity": 30, "discountPercent": 20,
-         "purchasePrice": 500, "cgst": "", "sgst": "", "storeName": ""},
+         "purchasePrice": 500, "cgst": "", "sgst": "",
+         "storeName": "", "warehouseName": "", "entryDate": today_str},
     ]
     structure = [
         (sample_products[0], [sample_variants[0], sample_variants[1]], sample_sizes),
@@ -875,13 +978,19 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
                     data_cell(row_n, col, "", C_BLANK)
                 for field, col, dtype, req in _S_FIELDS:
                     if field in ("cgst", "sgst"):
-                        # locked cell — formula already written above for data rows
-                        # for sample rows just show grey locked style
                         c = ws.cell(row=row_n, column=col + 1, value="")
                         c.fill      = PatternFill("solid", fgColor=C_LOCK_BG)
                         c.font      = Font(italic=True, color=C_LOCK_FONT, size=9)
                         c.border    = thin
                         c.alignment = Alignment(horizontal="center", vertical="center")
+                    elif field == "entryDate":
+                        # Write date value and apply date format  ← NEW
+                        c = ws.cell(row=row_n, column=col + 1, value=sz.get(field, ""))
+                        c.fill         = PatternFill("solid", fgColor=C_DATE_BG)
+                        c.font         = Font(color=C_SIZE_TYP, size=10)
+                        c.border       = thin
+                        c.alignment    = Alignment(horizontal="center", vertical="center")
+                        c.number_format = "YYYY-MM-DD"
                     else:
                         data_cell(row_n, col, sz.get(field, ""), C_SIZE_ROW, indent=2)
                 ws.row_dimensions[row_n].height = 18
@@ -899,27 +1008,41 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict) -> bytes:
             )
             c = ws.cell(row=row_n, column=col_i + 1, value="")
             if col_field in ("cgst", "sgst"):
-                c.fill      = PatternFill("solid", fgColor=C_LOCK_BG)
-                c.font      = Font(italic=True, color=C_LOCK_FONT, size=9)
+                c.fill       = PatternFill("solid", fgColor=C_LOCK_BG)
+                c.font       = Font(italic=True, color=C_LOCK_FONT, size=9)
                 c.protection = openpyxl.styles.Protection(locked=True)
+            elif col_field == "entryDate":
+                c.fill          = PatternFill("solid", fgColor=C_DATE_BG)
+                c.number_format = "YYYY-MM-DD"          # ← NEW
             c.border = thin
         ws.row_dimensions[row_n].height = 18
         row_n += 1
 
-    # ── Sheet protection: lock CGST/SGST columns, keep rest editable ─────────
-    ws.protection.sheet     = True
-    ws.protection.password  = "twam_auto"
+    # ── Sheet protection: lock CGST/SGST, keep rest editable ─────────────────
+    ws.protection.sheet    = True
+    ws.protection.password = "twam_auto"
     ws.protection.enable()
-    # Unlock all non-CGST/SGST cells
     for row in ws.iter_rows(min_row=2, max_row=row_n - 1,
                              min_col=1, max_col=_TOTAL_COLS):
         for cell in row:
-            col_idx = cell.column - 1   # 0-based
-            is_tax  = any(col_idx == c for _, c, _, _ in _S_FIELDS
-                          if _ in ("cgst", "sgst"))
-            # simpler: check column number directly
-            if cell.column not in (25, 26):  # Y=25, Z=26 (1-based)
+            if cell.column not in (25, 26):  # Y=25, Z=26 (1-based) are locked
                 cell.protection = openpyxl.styles.Protection(locked=False)
+
+    # ── Instruction note in row below data ────────────────────────────────────
+    note_row = row_n
+    note_cell = ws.cell(
+        row=note_row,
+        column=27,  # AB
+        value="⚠ Fill EITHER Store Name OR Warehouse Name (not both). Date is required.",
+    )
+    note_cell.font      = Font(italic=True, color="92400E", size=9, bold=True)
+    note_cell.fill      = PatternFill("solid", fgColor="FEF3C7")
+    note_cell.alignment = Alignment(horizontal="left", wrap_text=True)
+    ws.merge_cells(
+        start_row=note_row, start_column=27,
+        end_row=note_row,   end_column=29,
+    )
+    ws.row_dimensions[note_row].height = 28
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -969,8 +1092,6 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                     current_variant[field] = _cast(_cell(row, col), dtype)
                 except ValueError:
                     current_variant[field] = None
-            # Resolve dropdown names -> IDs stored alongside
-            # (actual resolution happens in chain builder using ref_map)
             current_variant["_fabricName"] = current_variant.get("fabricName")
             current_variant["_hsnCode"]    = current_variant.get("hsnCode")
 
@@ -1002,18 +1123,35 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                         f"Row {row_num}: Size field '{field}' has invalid value '{raw}'"
                     )
                     val = None
-                if req and val is None:
+                # storeName and warehouseName are NOT individually required —
+                # cross-validated below
+                if req and field not in ("storeName", "warehouseName") and val is None:
                     errors.append(f"Row {row_num}: Size field '{field}' is required")
                 rec[field] = val
 
+            # ── Store / Warehouse cross-validation  ← NEW ─────────────────────
+            store_val = rec.get("storeName") or ""
+            wh_val    = rec.get("warehouseName") or ""
+            if store_val and wh_val:
+                errors.append(
+                    f"Row {row_num}: Provide EITHER Store Name OR Warehouse Name, not both."
+                )
+            elif not store_val and not wh_val:
+                errors.append(
+                    f"Row {row_num}: Either Store Name or Warehouse Name is required."
+                )
+
+            # ── Date validation  ← NEW ────────────────────────────────────────
+            if rec.get("entryDate") is None:
+                errors.append(f"Row {row_num}: Date is required.")
+
             # Required product fields
-            # categoryName/brandName are strings from dropdowns; validate non-empty
             _P_REQUIRED_DISPLAY = {
-                "productCode":       "Product Code (SKU)",
-                "name":              "Product Name",
-                "description":       "Description",
-                "categoryName":      "Category",
-                "brandName":         "Brand",
+                "productCode":  "Product Code (SKU)",
+                "name":         "Product Name",
+                "description":  "Description",
+                "categoryName": "Category",
+                "brandName":    "Brand",
             }
             for field, col, dtype, req in _P_FIELDS:
                 if req:
@@ -1025,18 +1163,17 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                             f"Product field '{label}' is required"
                         )
 
-            # Required variant fields (incl. isCupSize, fabricName, color)
+            # Required variant fields
             _V_REQUIRED_DISPLAY = {
-                "variantCode":  "Product Code",
-                "variantName":  "Variant Name",
-                "fabricName":   "Fabric",
-                "color":        "Color",
-                "isCupSize":    "Is Cup Size",
+                "variantCode": "Product Code",
+                "variantName": "Variant Name",
+                "fabricName":  "Fabric",
+                "color":       "Color",
+                "isCupSize":   "Is Cup Size",
             }
             for field, col, dtype, req in _V_FIELDS:
                 if req:
                     val = current_variant.get(field)
-                    # bool False is valid; only None or empty string is missing
                     missing = (
                         val is None
                         or (isinstance(val, str) and not val.strip())
@@ -1047,7 +1184,6 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                             f"Row {current_variant.get('_row', '?')}: "
                             f"Variant field '{label}' is required"
                         )
-            # Cup-size cross-check uses the _hsnCode for lookup later
 
             # Cup size cross-validation
             is_cup = current_variant.get("isCupSize")
@@ -1063,7 +1199,6 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
 
             mrp   = rec.get("mrpPrice")
             final = rec.get("finalPrice")
-
             if mrp is not None and final is not None and final > mrp:
                 errors.append(f"Row {row_num}: Final Price ({final}) cannot exceed MRP ({mrp})")
 
@@ -1107,7 +1242,6 @@ def _build_hierarchical_chains(
         vkey  = f"v_row_{v_row}_{vcode}"
 
         if pkey not in chains:
-            # Resolve product dropdown names -> IDs
             p_rec = dict(rec)
             if cat_map:
                 p_rec["categoryId"] = cat_map.get(p_rec.get("categoryName") or "", None)
@@ -1118,9 +1252,9 @@ def _build_hierarchical_chains(
             if brand_map:
                 p_rec["brandId"] = brand_map.get(p_rec.get("brandName") or "", None)
             chains[pkey] = {"rec": p_rec, "variants": {}}
+
         if vkey not in chains[pkey]["variants"]:
-            # Resolve dropdown names to IDs on the variant rec
-            v_rec = dict(rec)  # copy so we don't mutate shared current_variant
+            v_rec = dict(rec)
             if fabric_map:
                 fname = v_rec.get("fabricName") or ""
                 v_rec["fabricId"] = fabric_map.get(fname)
@@ -1128,10 +1262,8 @@ def _build_hierarchical_chains(
                 hcode = v_rec.get("hsnCode") or ""
                 hsn_entry = hsn_map_by_code.get(hcode)
                 v_rec["variantTaxHSNCodeId"] = hsn_entry["id"] if hsn_entry else None
-                # Pre-fill CGST/SGST on all slots from this variant
                 v_rec["_cgst"] = hsn_entry["cgst"] if hsn_entry else None
                 v_rec["_sgst"] = hsn_entry["sgst"] if hsn_entry else None
-            # category/brand resolution is done on p_rec above
             chains[pkey]["variants"][vkey] = {"rec": v_rec, "slots": []}
 
         chains[pkey]["variants"][vkey]["slots"].append({
@@ -1147,6 +1279,9 @@ def _build_hierarchical_chains(
             "sgst":              rec.get("sgst") or chains[pkey]["variants"][vkey]["rec"].get("_sgst"),
             "storeName":         rec.get("storeName"),
             "storeId":           rec.get("storeId"),
+            "warehouseName":     rec.get("warehouseName"),   # ← NEW
+            "warehouseId":       rec.get("warehouseId"),     # ← NEW
+            "entryDate":         rec.get("entryDate"),       # ← NEW
             "isLowStock":        rec.get("isLowStock", False),
             "isOutOfStock":      rec.get("isOutOfStock", False),
         })
@@ -1219,9 +1354,9 @@ def _pb_insert_product(db: Session, rec: dict) -> int:
         "productCode":     rec["productCode"],
         "name":            rec["name"],
         "description":     rec["description"],
-        "categoryId":      rec.get("categoryId"),        # resolved from categoryName
-        "childCategoryId": rec.get("childCategoryId"),  # resolved from childCategoryName
-        "brandId":         rec.get("brandId"),          # resolved from brandName
+        "categoryId":      rec.get("categoryId"),
+        "childCategoryId": rec.get("childCategoryId"),
+        "brandId":         rec.get("brandId"),
         "tag":             rec.get("tag"),
         "now":             NOW(),
     })
@@ -1229,7 +1364,6 @@ def _pb_insert_product(db: Session, rec: dict) -> int:
 
 
 def _pb_insert_variant(db: Session, rec: dict, product_id: int) -> int:
-    # CHANGE 1: StockId stored on ProductVariants
     r = db.execute(text("""
         INSERT INTO twam."ProductVariants" (
             "ProductId","ProductCode",
@@ -1249,8 +1383,8 @@ def _pb_insert_variant(db: Session, rec: dict, product_id: int) -> int:
         "variantCode":        rec["variantCode"],
         "variantName":        rec["variantName"],
         "variantDescription": rec.get("variantDescription"),
-        "fabricId":           rec.get("fabricId"),   # resolved from fabricName
-        "taxHSNCodeId":       rec.get("variantTaxHSNCodeId"),  # resolved from hsnCode
+        "fabricId":           rec.get("fabricId"),
+        "taxHSNCodeId":       rec.get("variantTaxHSNCodeId"),
         "color":              rec.get("color"),
         "isBestSeller":       rec.get("isBestSeller") or False,
         "isReturnAvailable":  rec.get("isReturnAvailable") or False,
@@ -1275,6 +1409,8 @@ def _pb_insert_detail(
             "MRPPrice","FinalPrice","DiscountPercent",
             "CGST","SGST",
             "StoreId",
+            "WarehouseId",
+            "Date",
             "IsLowStock","IsOutOfStock",
             "State","CreatedDate","DeletedInd"
         ) VALUES (
@@ -1286,6 +1422,8 @@ def _pb_insert_detail(
             :mrpPrice,:finalPrice,:discountPercent,
             :cgst,:sgst,
             :storeId,
+            :warehouseId,
+            :entryDate,
             :isLowStock,:isOutOfStock,
             'Created',:now,false
         ) RETURNING "ProductVariantDetailId"
@@ -1304,6 +1442,8 @@ def _pb_insert_detail(
         "cgst":              slot.get("cgst"),
         "sgst":              slot.get("sgst"),
         "storeId":           slot.get("storeId"),
+        "warehouseId":       slot.get("warehouseId"),    # ← NEW
+        "entryDate":         slot.get("entryDate"),      # ← NEW
         "isLowStock":        slot.get("isLowStock", False),
         "isOutOfStock":      slot.get("isOutOfStock", False),
         "now":               NOW(),
@@ -1445,10 +1585,6 @@ async def get_hsn_tax_info(
     codes: str = Query(..., description="Comma-separated TaxHSNCodeIds, e.g. 1,2,3"),
     db: Session = Depends(get_db),
 ):
-    """
-    Called by the frontend after Preview when hsnWarnings is non-empty,
-    to show a popup listing missing HSN codes so the user can correct them.
-    """
     try:
         ids = [int(x.strip()) for x in codes.split(",") if x.strip()]
     except ValueError:
@@ -1469,14 +1605,16 @@ async def get_hsn_tax_info(
 #  ROUTES — Product Bulk
 # ==============================================================================
 
-@router.get("/stores", summary="List all active stores for bulk import store picker")
+@router.get("/stores", summary="List all active stores")
 async def list_stores(db: Session = Depends(get_db)):
-    """
-    Returns all active stores. Frontend can call this to show a store picker
-    before or after download. The template dropdown is populated at download time.
-    """
     stores = _fetch_all_stores(db)
     return {"stores": stores, "total": len(stores)}
+
+
+@router.get("/warehouses", summary="List all active warehouses")   # ← NEW ROUTE
+async def list_warehouses(db: Session = Depends(get_db)):
+    warehouses = _fetch_all_warehouses(db)
+    return {"warehouses": warehouses, "total": len(warehouses)}
 
 
 @router.get(
@@ -1485,8 +1623,9 @@ async def list_stores(db: Session = Depends(get_db)):
 )
 def download_product_bulk_template(db: Session = Depends(get_db)):
     stores     = _fetch_all_stores(db)
+    warehouses = _fetch_all_warehouses(db)   # ← NEW
     refs       = _fetch_ref_data(db)
-    xlsx_bytes = _build_hierarchical_template(stores, refs)
+    xlsx_bytes = _build_hierarchical_template(stores, refs, warehouses)
     return StreamingResponse(
         io.BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1505,90 +1644,105 @@ async def preview_product_bulk(
     content      = await file.read()
     size_records = _parse_hierarchical_excel(content)
 
-    # Build name->id maps from ref data for dropdown resolution
-    refs           = _fetch_ref_data(db)
-    fabric_map     = {r["name"]: r["id"] for r in refs["fabrics"]}
+    refs            = _fetch_ref_data(db)
+    fabric_map      = {r["name"]: r["id"] for r in refs["fabrics"]}
     hsn_map_by_code = {r["code"]: r for r in refs["hsnCodes"]}
-    cat_map        = {r["name"]: r["id"] for r in refs["categories"]}
-    child_cat_map  = {r["name"]: r["id"] for r in refs["childCategories"]}
-    brand_map      = {r["name"]: r["id"] for r in refs["brands"]}
+    cat_map         = {r["name"]: r["id"] for r in refs["categories"]}
+    child_cat_map   = {r["name"]: r["id"] for r in refs["childCategories"]}
+    brand_map       = {r["name"]: r["id"] for r in refs["brands"]}
     chains = _build_hierarchical_chains(
         size_records, fabric_map, hsn_map_by_code,
         cat_map, child_cat_map, brand_map,
     )
 
-    # HSN lookup
     hsn_ids      = _collect_hsn_ids(chains)
     hsn_map      = await _fetch_hsn_rates(db, hsn_ids)
     hsn_warnings = _apply_hsn_rates(chains, hsn_map)
 
-    # Resolve storeName -> storeId for every slot
+    # Resolve storeName -> storeId
     store_map = _fetch_store_map(db)
     store_warnings: list[dict] = []
     seen_bad_stores: set[str] = set()
+
+    # Resolve warehouseName -> warehouseId  ← NEW
+    warehouse_map = _fetch_warehouse_map(db)
+    warehouse_warnings: list[dict] = []
+    seen_bad_warehouses: set[str] = set()
+
     for chain in chains.values():
         for var in chain["variants"]:
             for slot in var["slots"]:
-                name = slot.get("storeName") or ""
-                sid  = store_map.get(name)
-                if sid:
+                # Store resolution
+                sname = slot.get("storeName") or ""
+                if sname:
+                    sid = store_map.get(sname)
                     slot["storeId"] = sid
-                else:
-                    slot["storeId"] = None
-                    if name and name not in seen_bad_stores:
-                        seen_bad_stores.add(name)
+                    if not sid and sname not in seen_bad_stores:
+                        seen_bad_stores.add(sname)
                         store_warnings.append({
-                            "storeName":   name,
+                            "storeName":   sname,
                             "variantCode": var["rec"].get("variantCode"),
-                            "message":     (
-                                f"Store '{name}' not found in DB — "
-                                "StoreId will be NULL for this size slot."
-                            ),
+                            "message":     f"Store '{sname}' not found in DB — StoreId will be NULL.",
+                        })
+
+                # Warehouse resolution  ← NEW
+                wname = slot.get("warehouseName") or ""
+                if wname:
+                    wid = warehouse_map.get(wname)
+                    slot["warehouseId"] = wid
+                    if not wid and wname not in seen_bad_warehouses:
+                        seen_bad_warehouses.add(wname)
+                        warehouse_warnings.append({
+                            "warehouseName": wname,
+                            "variantCode":   var["rec"].get("variantCode"),
+                            "message":       f"Warehouse '{wname}' not found in DB — WarehouseId will be NULL.",
                         })
 
     preview_rows = []
     for rec in size_records:
         preview_rows.append({
-            "row":           rec["_row"],
-            "status":        "OK" if rec["_valid"] else "Error",
-            "issues":        rec["_errors"],
-            "productCode":   rec.get("productCode"),
-            "productName":   rec.get("name"),
-            "variantCode":   rec.get("variantCode"),
-            "variantName":   rec.get("variantName"),
-            "fabricName":    rec.get("fabricName"),
-            "hsnCode":       rec.get("hsnCode"),
-            "stockId":       rec.get("stockId"),        # size-level
-            "color":         rec.get("color"),
-            "sizeId":        rec.get("sizeId"),
-            "cupSizeId":     rec.get("cupSizeId"),
-            "mrpPrice":      rec.get("mrpPrice"),
-            "sellingPrice":  rec.get("sellingPrice"),   # CHANGE 3
-            "finalPrice":    rec.get("finalPrice"),
-            "purchasePrice": rec.get("purchasePrice"),  # CHANGE 2
-            "stockQty":      rec.get("availableQuantity"),
-            "cgst":          rec.get("cgst"),
-            "sgst":          rec.get("sgst"),
-            "storeName":     rec.get("storeName"),
-            "isLowStock":    rec.get("isLowStock", False),
-            "isOutOfStock":  rec.get("isOutOfStock", False),
+            "row":            rec["_row"],
+            "status":         "OK" if rec["_valid"] else "Error",
+            "issues":         rec["_errors"],
+            "productCode":    rec.get("productCode"),
+            "productName":    rec.get("name"),
+            "variantCode":    rec.get("variantCode"),
+            "variantName":    rec.get("variantName"),
+            "fabricName":     rec.get("fabricName"),
+            "hsnCode":        rec.get("hsnCode"),
+            "stockId":        rec.get("stockId"),
+            "color":          rec.get("color"),
+            "sizeId":         rec.get("sizeId"),
+            "cupSizeId":      rec.get("cupSizeId"),
+            "mrpPrice":       rec.get("mrpPrice"),
+            "finalPrice":     rec.get("finalPrice"),
+            "purchasePrice":  rec.get("purchasePrice"),
+            "stockQty":       rec.get("availableQuantity"),
+            "cgst":           rec.get("cgst"),
+            "sgst":           rec.get("sgst"),
+            "storeName":      rec.get("storeName"),
+            "warehouseName":  rec.get("warehouseName"),   # ← NEW
+            "entryDate":      str(rec["entryDate"]) if rec.get("entryDate") else None,  # ← NEW
+            "isLowStock":     rec.get("isLowStock", False),
+            "isOutOfStock":   rec.get("isOutOfStock", False),
         })
 
     return {
-        "totalSizeRows":      len(size_records),
-        "validRows":          sum(1 for r in size_records if r["_valid"]),
-        "errorRows":          sum(1 for r in size_records if not r["_valid"]),
-        "willImportProducts": len(chains),
-        "willImportVariants": sum(len(v["variants"]) for v in chains.values()),
-        "willImportDetails":  sum(
+        "totalSizeRows":       len(size_records),
+        "validRows":           sum(1 for r in size_records if r["_valid"]),
+        "errorRows":           sum(1 for r in size_records if not r["_valid"]),
+        "willImportProducts":  len(chains),
+        "willImportVariants":  sum(len(v["variants"]) for v in chains.values()),
+        "willImportDetails":   sum(
             len(var["slots"])
             for v in chains.values()
             for var in v["variants"]
         ),
-        "canImport":      len(chains) > 0,
-        "hsnWarnings":    hsn_warnings,
-        "storeWarnings":  store_warnings,
-        "rows":           preview_rows[:500],
+        "canImport":           len(chains) > 0,
+        "hsnWarnings":         hsn_warnings,
+        "storeWarnings":       store_warnings,
+        "warehouseWarnings":   warehouse_warnings,   # ← NEW
+        "rows":                preview_rows[:500],
     }
 
 
@@ -1607,45 +1761,56 @@ async def import_product_bulk(
     content      = await file.read()
     size_records = _parse_hierarchical_excel(content)
 
-    # Build name->id maps from ref data for dropdown resolution
-    refs           = _fetch_ref_data(db)
-    fabric_map     = {r["name"]: r["id"] for r in refs["fabrics"]}
+    refs            = _fetch_ref_data(db)
+    fabric_map      = {r["name"]: r["id"] for r in refs["fabrics"]}
     hsn_map_by_code = {r["code"]: r for r in refs["hsnCodes"]}
-    cat_map        = {r["name"]: r["id"] for r in refs["categories"]}
-    child_cat_map  = {r["name"]: r["id"] for r in refs["childCategories"]}
-    brand_map      = {r["name"]: r["id"] for r in refs["brands"]}
+    cat_map         = {r["name"]: r["id"] for r in refs["categories"]}
+    child_cat_map   = {r["name"]: r["id"] for r in refs["childCategories"]}
+    brand_map       = {r["name"]: r["id"] for r in refs["brands"]}
     chains = _build_hierarchical_chains(
         size_records, fabric_map, hsn_map_by_code,
         cat_map, child_cat_map, brand_map,
     )
 
-    # HSN lookup
     hsn_ids      = _collect_hsn_ids(chains)
     hsn_map      = await _fetch_hsn_rates(db, hsn_ids)
     hsn_warnings = _apply_hsn_rates(chains, hsn_map)
 
-    # Resolve storeName -> storeId for every slot
+    # Resolve storeName -> storeId
     store_map = _fetch_store_map(db)
     store_warnings: list[dict] = []
     seen_bad_stores: set[str] = set()
+
+    # Resolve warehouseName -> warehouseId  ← NEW
+    warehouse_map = _fetch_warehouse_map(db)
+    warehouse_warnings: list[dict] = []
+    seen_bad_warehouses: set[str] = set()
+
     for chain in chains.values():
         for var in chain["variants"]:
             for slot in var["slots"]:
-                name = slot.get("storeName") or ""
-                sid  = store_map.get(name)
-                if sid:
+                sname = slot.get("storeName") or ""
+                if sname:
+                    sid = store_map.get(sname)
                     slot["storeId"] = sid
-                else:
-                    slot["storeId"] = None
-                    if name and name not in seen_bad_stores:
-                        seen_bad_stores.add(name)
+                    if not sid and sname not in seen_bad_stores:
+                        seen_bad_stores.add(sname)
                         store_warnings.append({
-                            "storeName":   name,
+                            "storeName":   sname,
                             "variantCode": var["rec"].get("variantCode"),
-                            "message":     (
-                                f"Store '{name}' not found in DB — "
-                                "StoreId will be NULL for this size slot."
-                            ),
+                            "message":     f"Store '{sname}' not found in DB — StoreId will be NULL.",
+                        })
+
+                wname = slot.get("warehouseName") or ""
+                if wname:
+                    wid = warehouse_map.get(wname)
+                    slot["warehouseId"] = wid
+                    if not wid and wname not in seen_bad_warehouses:
+                        seen_bad_warehouses.add(wname)
+                        warehouse_warnings.append({
+                            "warehouseName": wname,
+                            "variantCode":   var["rec"].get("variantCode"),
+                            "message":       f"Warehouse '{wname}' not found in DB — WarehouseId will be NULL.",
                         })
 
     skipped_rows = sum(1 for r in size_records if not r["_valid"])
@@ -1658,6 +1823,7 @@ async def import_product_bulk(
             "insertedDetails":  0,
             "skippedRows":      skipped_rows,
             "hsnWarnings":      hsn_warnings,
+            "warehouseWarnings": warehouse_warnings,
         }
 
     inserted_products = inserted_variants = inserted_details = 0
@@ -1696,9 +1862,11 @@ async def import_product_bulk(
             f"{inserted_variants} variant(s), {inserted_details} size detail(s). "
             f"{skipped_rows} row(s) skipped due to validation errors."
         ),
-        "insertedProducts": inserted_products,
-        "insertedVariants": inserted_variants,
-        "insertedDetails":  inserted_details,
-        "skippedRows":      skipped_rows,
-        "hsnWarnings":      hsn_warnings,  # frontend shows popup when non-empty
+        "insertedProducts":  inserted_products,
+        "insertedVariants":  inserted_variants,
+        "insertedDetails":   inserted_details,
+        "skippedRows":       skipped_rows,
+        "hsnWarnings":       hsn_warnings,
+        "storeWarnings":     store_warnings,
+        "warehouseWarnings": warehouse_warnings,   # ← NEW
     }
