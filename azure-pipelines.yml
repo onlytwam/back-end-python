@@ -1,7 +1,12 @@
 trigger:
   branches:
     include:
-      - backend-setup/Vishnu
+      - develop                  # ✅ Merge → Build + Push + Deploy
+
+pr:
+  branches:
+    include:
+      - develop                  # ✅ PR raised → Build only
 
 pool:
   vmImage: ubuntu-latest
@@ -11,10 +16,12 @@ variables:
   containerRegistry: 'twamregistry.azurecr.io'
 
 steps:
+  # ✅ Always runs — both on PR and on merge
   - task: Docker@2
-    displayName: Build and Push to ACR
+    displayName: Build only (PR validation)
+    condition: eq(variables['Build.Reason'], 'PullRequest')
     inputs:
-      command: buildAndPush
+      command: build             # ❌ No push on PR
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
@@ -23,8 +30,24 @@ steps:
         $(Build.BuildId)
       arguments: '--no-cache'
 
+  # ✅ Only runs on actual merge to develop
+  - task: Docker@2
+    displayName: Build and Push to ACR (merge only)
+    condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    inputs:
+      command: buildAndPush      # ✅ Push to ACR only after merge
+      repository: $(imageRepository)
+      dockerfile: $(Build.SourcesDirectory)/Dockerfile
+      containerRegistry: twamregistry
+      tags: |
+        latest
+        $(Build.BuildId)
+      arguments: '--no-cache'
+
+  # ✅ Deploy only after successful push to ACR on merge
   - task: AzureCLI@2
-    displayName: Deploy to Container Apps (force new revision)
+    displayName: Deploy to Container Apps
+    condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
     inputs:
       azureSubscription: twam-azure-connection
       scriptType: bash
