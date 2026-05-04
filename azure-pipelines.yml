@@ -1,7 +1,7 @@
 trigger:
   branches:
     include:
-      - backend-setup/Vishnu     # ✅ Build only on every push
+      - backend/v2/Mamatha    # ✅ Build only on every push
 
 pool:
   vmImage: ubuntu-latest
