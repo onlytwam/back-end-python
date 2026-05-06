@@ -271,6 +271,9 @@ class OrderAdminItemModel(BaseModel):
     cupSize: Optional[str] = None
     color: Optional[str] = None
     orderItemNumber: Optional[str] = None
+    brandName: Optional[str] = None   # ← add
+    sku: Optional[str] = None          # ← add
+    isReturnAvailable: Optional[bool] = None  # ← add (your SQL returns this)
 
     class Config:
         from_attributes = True
@@ -375,3 +378,5 @@ class ReturnOrderItemsResponse(BaseModel):
     count: Optional[int] = None
     list: Optional[List[ReturnOrderDetails]] = None
     parameters: Optional[Any] = None
+
+

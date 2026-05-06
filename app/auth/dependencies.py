@@ -27,16 +27,14 @@ class Roles:
     PRODUCT_MANAGER   = 4
     ORDER_MANAGER     = 5
     CUSTOMER_SUPPORT  = 6
-    STORE_MANAGER      = 7  # ← new role for store-level access
 
     NAMES = {
         1: "Super Admin",
         2: "User",
         3: "Inventory Manager",
-        4: "Product Manager",
+        4: "Store Manager",
         5: "Order Manager",
         6: "Customer Support",
-        7: "Store Manager",
     }
 
     STAFF = {1, 3, 4, 5, 6, }

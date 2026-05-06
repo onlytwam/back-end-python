@@ -26,8 +26,8 @@ def _upsert_product_color(db, color_name: str):
         """), {"name": color_name.lower().strip(), "hex": hex_val})
     except Exception:
         pass  # Table may not exist yet — ignore
-
-BASE_URL = os.getenv("BASE_URL", "")
+    
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/") + "/"
 
 # Product types that should NEVER use cup-size logic even if isCupSize=True in DB
 ALPHA_SIZE_PRODUCT_KEYWORDS = [
@@ -40,7 +40,24 @@ def _is_alpha_size_product(name: str) -> bool:
     lower = (name or '').lower()
     return any(kw in lower for kw in ALPHA_SIZE_PRODUCT_KEYWORDS)
 
-def _get_images(db: Session, product_variant_id: int) -> list:
+# def _get_images(db: Session, product_variant_id: int) -> list:
+#     rows = db.execute(
+#         text("""
+#             SELECT "ProductImageId", "FileName", "FilePath", "FileType"
+#             FROM twam."ProductImage"
+#             WHERE "ProductVariantId" = :pvid
+#               AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+#         """),
+#         {"pvid": product_variant_id}
+#     ).fetchall()
+#     return [
+#         {"productImageId": r[0], "fileName": r[1], "filePath": r[2], "fileType": r[3]}
+#         for r in rows
+#     ]
+
+
+def _get_images(db: Session, product_variant_id: int, product_id: int) -> list:
+    # Step 1: Try variant images
     rows = db.execute(
         text("""
             SELECT "ProductImageId", "FileName", "FilePath", "FileType"
@@ -50,8 +67,26 @@ def _get_images(db: Session, product_variant_id: int) -> list:
         """),
         {"pvid": product_variant_id}
     ).fetchall()
+
+    # 🔥 Step 2: Fallback to product-level images
+    if not rows:
+        rows = db.execute(
+            text("""
+                SELECT "ProductImageId", "FileName", "FilePath", "FileType"
+                FROM twam."ProductImage"
+                WHERE "ProductId" = :pid
+                  AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+            """),
+            {"pid": product_id}
+        ).fetchall()
+
     return [
-        {"productImageId": r[0], "fileName": r[1], "filePath": r[2], "fileType": r[3]}
+        {
+            "productImageId": r[0],
+            "fileName": r[1],
+            "filePath": r[2],
+            "fileType": r[3],
+        }
         for r in rows
     ]
 
@@ -470,7 +505,7 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
 
 
 def _fallback_product_list(db, filters, page_index, page_size, order_property, order_ascending):
-    BASE = os.getenv("BASE_URL", "")
+    BASE = os.getenv("BASE_URL", "").rstrip("/") + "/"
 
     def _fv(prop, default=""):
         for f in (filters or []):
@@ -857,7 +892,8 @@ def get_new_arrivals(
     last 6 months, ordered newest-first.  Only active/non-deleted variants with
     at least one non-deleted ProductVariantDetail are returned.
     """
-    BASE = os.getenv("BASE_URL", "")
+    # BASE = os.getenv("BASE_URL", "")
+    BASE = os.getenv("BASE_URL", "").rstrip("/") + "/"
 
     p_index = max(1, page_index)
     p_size  = max(1, page_size)
