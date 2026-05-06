@@ -1,7 +1,7 @@
 trigger:
   branches:
     include:
-      - backend/v2/Mamatha    # ✅ Build only on every push
+      - backend/v2/mamatha    # ✅ Build only on every push
 
 pool:
   vmImage: ubuntu-latest
@@ -25,3 +25,6 @@ steps:
 
   # ❌ No push to ACR
   # ❌ No deploy
+
+
+  
