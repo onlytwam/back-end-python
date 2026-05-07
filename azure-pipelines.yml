@@ -1,12 +1,12 @@
 trigger:
   branches:
     include:
-      - develop                  # ✅ Merge → Build + Push + Deploy
+      - feature/Eshwar                  # ✅ Merge → Build + Push + Deploy
 
 pr:
   branches:
     include:
-      - develop                  # ✅ PR raised → Build only
+      - feature/Eshwar                  # ✅ PR raised → Build only
 
 pool:
   vmImage: ubuntu-latest
