@@ -9,12 +9,29 @@ from urllib3 import _DEFAULT_POOL
 from database import get_db
 from app.report import schemas, repository
 from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
-
+from fastapi.responses import JSONResponse
 router = APIRouter(
     dependencies=[Depends(get_current_user)],prefix="/api/Report", tags=["Report"])
 
 def _paging(Page_Index, Page_Size, Filters):
-    return json.loads(Filters) if Filters else None, Page_Index, Page_Size
+    if not Filters:
+        return None, Page_Index, Page_Size
+    try:
+        parsed = json.loads(Filters)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {}
+        for part in Filters.split(","):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                parsed[k.strip()] = v.strip()
+    return parsed, Page_Index, Page_Size
+@router.get("/OrderReport/Channels")
+def order_report_channels(db: Session = Depends(get_db)):
+    channels = repository.get_order_report_channels(db)
+    return JSONResponse(content=channels)
+@router.get("/OrderReport/AvailableDates")
+def get_available_dates(channel: str = None, db: Session = Depends(get_db)):
+    return repository.get_available_order_dates(db, channel)
 
 @router.get("/OrderList", response_model=schemas.ReportListResponse)
 def order_list(Filters: Optional[str]=Query(None,alias="Filters"),
@@ -96,10 +113,25 @@ def sales_by_platform(Filters: Optional[str]=Query(None,alias="Filters"),
     return repository.get_sales_by_platform(db, *_paging(Page_Index, Page_Size, Filters))
 
 @router.get("/CouponUsageReport", response_model=schemas.ReportListResponse)
-def coupon_usage(Filters: Optional[str]=Query(None,alias="Filters"),
-    Page_Index: Optional[int]=Query(None,alias="Page.Index",ge=1),
-    Page_Size: Optional[int]=Query(None,alias="Page.Size",ge=1), db: Session=Depends(get_db)):
-    return repository.get_coupon_usage_report(db, *_paging(Page_Index, Page_Size, Filters))
+def coupon_usage(
+    Filters:    Optional[str] = Query(None, alias="Filters"),
+    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(None, alias="Page.Size",  ge=1),
+    fromDate:   Optional[str] = Query(None),
+    toDate:     Optional[str] = Query(None),
+    type:       Optional[str] = Query("all"),          # "coupon" | "gift" | "all"
+    organizationId: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
+):
+    filters = {
+        "fromDate":       fromDate,
+        "toDate":         toDate,
+        "type":           type,
+        "organizationId": str(organizationId) if organizationId else None,
+    }
+    return repository.get_coupon_usage_report(
+        db, filters, *_paging(Page_Index, Page_Size, Filters)
+    )
 
 @router.get("/InvoiceReport", response_model=schemas.ReportListResponse)
 def invoice_report(Filters: Optional[str]=Query(None,alias="Filters"),
@@ -275,121 +307,61 @@ def customer_acquisition_report(
     page_index = Page_Index or 1
     page_size  = Page_Size  or 200
     return repository.get_customer_acquisition_report(db, filters, page_index, page_size)
- 
- 
-@router.get("/RepeatVsNewCustomers", response_model=schemas.ReportListResponse)
-def repeat_vs_new_customers(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
-    db: Session = Depends(get_db),
-):
-    """
-    Splits customers in a date window into New vs Repeat buyers.
-    New = customer placed their first-ever order in this period.
-    Repeat = had at least one order before this period.
- 
-    Filters (JSON):
-      start_date : "YYYY-MM-DD"  (default: 90 days ago)
-      end_date   : "YYYY-MM-DD"  (default: today)
- 
-    Example:
-      /RepeatVsNewCustomers?Filters={"start_date":"2024-01-01","end_date":"2024-12-31"}
-    """
-    return repository.get_repeat_vs_new_customers(
-        db, *_paging(Page_Index, Page_Size, Filters)
-    )
- 
- 
 @router.get("/CustomerLifetimeValue", response_model=schemas.ReportListResponse)
 def customer_lifetime_value(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
+    top_n:      Optional[int] = Query(20,  alias="top_n"),
+    min_orders: Optional[int] = Query(1,   alias="min_orders"),
+    Page_Index: Optional[int] = Query(1,   alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(200, alias="Page.Size",  ge=1),
     db: Session = Depends(get_db),
 ):
-    """
-    CLV report: total revenue, avg order value, order count,
-    first/last order dates, and days as customer per user.
- 
-    Filters (JSON):
-      min_orders : int  (default: 1)   — exclude customers with fewer orders
-      top_n      : int  (default: 20)  — limit results
- 
-    Example:
-      /CustomerLifetimeValue?Filters={"top_n":50,"min_orders":2}
-    """
-    return repository.get_customer_lifetime_value(
-        db, *_paging(Page_Index, Page_Size, Filters)
-    )
- 
- 
+    filters = {"top_n": top_n, "min_orders": min_orders}
+    return repository.get_customer_lifetime_value(db, filters, Page_Index or 1, Page_Size or 200)
+
+
 @router.get("/CustomerSegmentation", response_model=schemas.ReportListResponse)
 def customer_segmentation(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
+    segment_by: Optional[str] = Query("location", alias="segment_by"),
+    Page_Index: Optional[int] = Query(1,           alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(200,         alias="Page.Size",  ge=1),
     db: Session = Depends(get_db),
 ):
-    """
-    Segments customers by location, spending tier, or purchase frequency.
- 
-    Filters (JSON):
-      segment_by : "location | spending | frequency"  (default: "location")
- 
-    Spending tiers  : Low (<2k) / Mid (2k–10k) / High (≥10k)
-    Frequency tiers : One-time (1–2) / Occasional (3–9) / Frequent (10+)
- 
-    Example:
-      /CustomerSegmentation?Filters={"segment_by":"spending"}
-    """
-    return repository.get_customer_segmentation(
-        db, *_paging(Page_Index, Page_Size, Filters)
-    )
- 
- 
+    filters = {"segment_by": segment_by}
+    return repository.get_customer_segmentation(db, filters, Page_Index or 1, Page_Size or 200)
+
+
 @router.get("/CustomerChurnRate", response_model=schemas.ReportListResponse)
 def customer_churn_rate(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
+    inactive_days: Optional[int] = Query(90, alias="inactive_days"),
+    period_months: Optional[int] = Query(12, alias="period_months"),
+    Page_Index:    Optional[int] = Query(1,  alias="Page.Index", ge=1),
+    Page_Size:     Optional[int] = Query(200,alias="Page.Size",  ge=1),
     db: Session = Depends(get_db),
 ):
-    """
-    Churn = customers who ordered within `period_months` but whose
-    last order is older than `inactive_days`. Returns monthly breakdown
-    with ChurnRatePct per row.
- 
-    Filters (JSON):
-      inactive_days  : int  (default: 90)   — days of inactivity = churned
-      period_months  : int  (default: 12)   — analysis window in months
- 
-    Example:
-      /CustomerChurnRate?Filters={"inactive_days":60,"period_months":6}
-    """
-    return repository.get_customer_churn_rate(
-        db, *_paging(Page_Index, Page_Size, Filters)
-    )
- 
- 
+    filters = {"inactive_days": inactive_days, "period_months": period_months}
+    return repository.get_customer_churn_rate(db, filters, Page_Index or 1, Page_Size or 200)
+
+
 @router.get("/TopCustomersByRevenue", response_model=schemas.ReportListResponse)
 def top_customers_by_revenue(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
+    top_n:      Optional[int] = Query(10,  alias="top_n"),
+    start_date: Optional[str] = Query(None,alias="start_date"),
+    end_date:   Optional[str] = Query(None,alias="end_date"),
+    Page_Index: Optional[int] = Query(1,   alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(200, alias="Page.Size",  ge=1),
     db: Session = Depends(get_db),
 ):
-    """
-    Revenue leaderboard with rank, revenue share % bar, and order history.
- 
-    Filters (JSON):
-      start_date : "YYYY-MM-DD"  (default: 1 year ago)
-      end_date   : "YYYY-MM-DD"  (default: today)
-      top_n      : int           (default: 10, max: 100)
- 
-    Example:
-      /TopCustomersByRevenue?Filters={"start_date":"2024-01-01","top_n":25}
-    """
-    return repository.get_top_customers_by_revenue(
-        db, *_paging(Page_Index, Page_Size, Filters)
-    )
+    filters = {"top_n": top_n, "start_date": start_date, "end_date": end_date}
+    return repository.get_top_customers_by_revenue(db, filters, Page_Index or 1, Page_Size or 200)
+
+
+@router.get("/RepeatVsNewCustomers", response_model=schemas.ReportListResponse)
+def repeat_vs_new_customers(
+    start_date: Optional[str] = Query(None, alias="start_date"),
+    end_date:   Optional[str] = Query(None, alias="end_date"),
+    Page_Index: Optional[int] = Query(1,    alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(200,  alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+):
+    filters = {"start_date": start_date, "end_date": end_date}
+    return repository.get_repeat_vs_new_customers(db, filters, Page_Index or 1, Page_Size or 200)
