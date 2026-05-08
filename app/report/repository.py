@@ -427,11 +427,14 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             NULL                                        AS "Weight"
         FROM coupons."PhysicalCoupons" pc
         WHERE 1=1
-          {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
-          {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
-          {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
+     
+        {f"""AND pc."OrganizationId" = {org_id}""" if org_id else ''}
+        {f"""AND pc."UsedAt" >= '{from_date}'""" if from_date else ''}
+        {f"""AND pc."UsedAt" <= '{to_date} 23:59:59'""" if to_date else ''}
     """
-
+   #   {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
+        #   {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
+        #   {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
     # ─────────────────────────────────────────────────────────────────────────
     # PART 3 — Surprise Gifts (twam.OrderSurpriseGift + SurpriseGiftRule)
     # ─────────────────────────────────────────────────────────────────────────
