@@ -192,7 +192,16 @@ def _store_otp_for_user(db: Session, user, otp: str, purpose: str, *, identifier
 
 
 def _send_phone_otp(db: Session, phone: str, otp: str, channel: str) -> bool:
+    """
+    Send OTP via WhatsApp or SMS.
+
+    For SMS: calls _send_sms with the correct named_vars + positional_order
+    matching the OTP template:
+        DB placeholder : {otp}
+        SmartPing var  : var1 = otp
+    """
     channel = (channel or "").strip().lower()
+
     if channel == "whatsapp":
         try:
             from app.whatsapp.service import send_whatsapp
@@ -209,9 +218,14 @@ def _send_phone_otp(db: Session, phone: str, otp: str, channel: str) -> bool:
             print(f"[Auth] OTP WhatsApp failed: {e}")
             return False
 
+    # SMS path — must match _send_sms(db, phone, message_type, named_vars, positional_order)
     try:
         from app.ekart.notifications import _send_sms
-        return _send_sms(db, phone, "OTP", [otp])
+        return _send_sms(
+            db, phone, "OTP",
+            named_vars={"otp": otp},
+            positional_order=["otp"],
+        )
     except Exception as e:
         print(f"[Auth] OTP SMS failed: {e}")
         return False
@@ -238,25 +252,106 @@ def _send_email_otp(db: Session, email: str, otp: str, *, full_name: str = "") -
         print(f"[Auth] OTP email failed: {e}")
         return False
 
+def _send_otp_for_user(
+    db: Session,
+    user,
+    *,
+    purpose: str,
+    channel: str = "email",
+    identifier: Optional[str] = None,
+) -> dict:
 
-def _send_otp_for_user(db: Session, user, *, purpose: str, channel: str = "email", identifier: Optional[str] = None) -> dict:
     otp = _gen_otp()
     channel = (channel or "email").strip().lower()
+
     has_phone = bool(user.PhoneNumber and user.PhoneNumber.strip())
     has_email = bool(user.Email and "@" in user.Email)
 
-    _store_otp_for_user(db, user, otp, purpose, identifier=identifier)
-
     sent_email = False
     sent_phone = False
+
+    # EMAIL
     if channel == "email" and has_email:
-        sent_email = _send_email_otp(db, user.Email, otp, full_name=user.full_name or user.Email)
+
+        sent_email = _send_email_otp(
+            db,
+            user.Email,
+            otp,
+            full_name=user.full_name or user.Email
+        )
+
+        if sent_email:
+            _store_otp_for_user(
+                db,
+                user,
+                otp,
+                purpose,
+                identifier=identifier
+            )
+
+    # SMS / WHATSAPP
     elif channel in {"whatsapp", "sms"} and has_phone:
-        sent_phone = _send_phone_otp(db, user.PhoneNumber, otp, channel)
+
+        sent_phone = _send_phone_otp(
+            db,
+            user.PhoneNumber,
+            otp,
+            channel
+        )
+
+        if sent_phone:
+            _store_otp_for_user(
+                db,
+                user,
+                otp,
+                purpose,
+                identifier=identifier
+            )
+
+    # FALLBACK EMAIL
     elif has_email:
-        sent_email = _send_email_otp(db, user.Email, otp, full_name=user.full_name or user.Email)
+
+        sent_email = _send_email_otp(
+            db,
+            user.Email,
+            otp,
+            full_name=user.full_name or user.Email
+        )
+
+        if sent_email:
+            _store_otp_for_user(
+                db,
+                user,
+                otp,
+                purpose,
+                identifier=identifier
+            )
+
+    # FALLBACK SMS
     elif has_phone:
-        sent_phone = _send_phone_otp(db, user.PhoneNumber, otp, "sms")
+
+        sent_phone = _send_phone_otp(
+            db,
+            user.PhoneNumber,
+            otp,
+            "sms"
+        )
+
+        if sent_phone:
+            _store_otp_for_user(
+                db,
+                user,
+                otp,
+                purpose,
+                identifier=identifier
+            )
+
+    # IMPORTANT
+    if not sent_email and not sent_phone:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to send OTP."
+        )
 
     return {
         "registered": True,
@@ -275,13 +370,15 @@ def _send_otp_for_user(db: Session, user, *, purpose: str, channel: str = "email
         "message": "OTP sent.",
     }
 
-
 def _registration_conflict_message() -> str:
     return "This email or phone number is already registered. Please sign in instead."
 
 
 def _has_duplicate_registration_error(errors: list[dict]) -> bool:
-    return any((error or {}).get("code") in {"DuplicatePhoneNumber", "DuplicateEmail"} for error in errors)
+    return any(
+        (error or {}).get("code") in {"DuplicatePhoneNumber", "DuplicateEmail"}
+        for error in errors
+    )
 
 
 def _sync_people(db: Session, user, *, modified_by: str = "system") -> None:
@@ -297,25 +394,25 @@ def _sync_people(db: Session, user, *, modified_by: str = "system") -> None:
             if people_id is None:
                 raise RuntimeError("Could not allocate People.PersonalId.")
             people = People(
-                personalId=people_id,
-                userProfileId=user.Id,
-                createdDate=datetime.now(timezone.utc),
-                createdBy=user.CreatedBy or modified_by,
-                organizationId=user.OrganizationId,
+                personalId    = people_id,
+                userProfileId = user.Id,
+                createdDate   = datetime.now(timezone.utc),
+                createdBy     = user.CreatedBy or modified_by,
+                organizationId= user.OrganizationId,
             )
             db.add(people)
 
-        people.firstName = user.FirstName
-        people.middleName = user.MiddleName
-        people.lastName = user.LastName
-        people.emailId = user.Email
-        people.phoneNumber = user.PhoneNumber
+        people.firstName       = user.FirstName
+        people.middleName      = user.MiddleName
+        people.lastName        = user.LastName
+        people.emailId         = user.Email
+        people.phoneNumber     = user.PhoneNumber
         people.profileImageUrl = user.ProfileImageUrl
-        people.isActive = user.IsActive
-        people.roleId = user.UserRoleId
-        people.deletedInd = user.DeletedInd
-        people.modifiedDate = datetime.now(timezone.utc)
-        people.modifiedBy = modified_by
+        people.isActive        = user.IsActive
+        people.roleId          = user.UserRoleId
+        people.deletedInd      = user.DeletedInd
+        people.modifiedDate    = datetime.now(timezone.utc)
+        people.modifiedBy      = modified_by
         db.flush()
     except Exception as e:
         print(f"[Sync] People sync failed for user {user.Id}: {e}")
@@ -326,7 +423,10 @@ def _send_otp_to_channels(db: Session, user, *, purpose: str) -> dict:
     """
     Generate one OTP and dispatch it to every available channel (SMS + email).
     OTP is stored keyed by both phone and email so either can be used to verify.
-    Returns channel info dict suitable for including in the API response.
+
+    SMS call matches _send_sms(db, phone, message_type, named_vars, positional_order):
+        named_vars      = {"otp": otp}
+        positional_order= ["otp"]          → var1 = otp value sent to SmartPing
     """
     otp       = _gen_otp()
     has_phone = bool(user.PhoneNumber and user.PhoneNumber.strip())
@@ -337,13 +437,19 @@ def _send_otp_to_channels(db: Session, user, *, purpose: str) -> dict:
     if has_email:
         _db_otp_store(db, user.Email, otp, purpose)
 
+    # ── SMS ──────────────────────────────────────────────────────────────────
     if has_phone:
         try:
             from app.ekart.notifications import _send_sms
-            _send_sms(db, user.PhoneNumber, "OTP", [otp])
+            _send_sms(
+                db, user.PhoneNumber, "OTP",
+                named_vars={"otp": otp},
+                positional_order=["otp"],
+            )
         except Exception as e:
             print(f"[Auth] OTP SMS failed: {e}")
 
+    # ── Email ─────────────────────────────────────────────────────────────────
     if has_email:
         try:
             from app.sendemail.repository import send_email
@@ -398,23 +504,28 @@ async def token(
             "locked_out":          "Account is locked. Please reset your password.",
             "invalid_credentials": "Invalid username or password.",
         }
-        raise HTTPException(status_code=400, detail=error_map.get(result.error, "Authentication failed."))
+        raise HTTPException(
+            status_code=400,
+            detail=error_map.get(result.error, "Authentication failed.")
+        )
+
+    # ✅ Get the user object from the result
+    people = result.user  
 
     claims       = build_token_claims(db, result.user)
     access_token = create_access_token(claims)
-    return TokenResponse(access_token=access_token, expires_in=EXPIRES_MINUTES * 60,
-                          storeId       = people.StoreId       if people else None,  # ← ADD
-    warehouseId   = people.WarehouseId   if people else None,  # ← ADD
-    warehouseName = people.warehouse.WarehouseName if (people and people.warehouse) else "",  # ← ADD
-)
+
+    return TokenResponse(
+        access_token  = access_token,
+        expires_in    = EXPIRES_MINUTES * 60,
+        storeId       = people.StoreId if people else None,
+        warehouseId   = people.WarehouseId if people else None,
+        warehouseName = people.warehouse.WarehouseName if (people and people.warehouse) else "",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGNUP — POST /auth/signup
-#
-# Duplicate email/phone → HTTP 409 and the frontend should redirect to sign in.
-# WhatsApp welcome is sent inside create_identity_user (repository) when phone
-# is present. No WhatsApp call here — that would be a double send.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/signup", status_code=201, summary="Register a new user")
@@ -456,8 +567,6 @@ async def guest_signup(request: RegisterUserRequest, db: Session = Depends(get_d
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PHONE / EMAIL OTP LOGIN
-#   POST /auth/send-login-otp    → send OTP to an existing user's channels
-#   POST /auth/verify-login-otp  → verify OTP, return JWT token
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/send-login-otp", summary="Send OTP to phone or email for passwordless login")
@@ -467,15 +576,21 @@ async def send_login_otp(payload: dict, db: Session = Depends(get_db)):
     Sends OTP to all channels the account has (SMS + email).
     Always returns 200 — never reveals whether the account exists.
     """
-    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
-    channel    = _normalize_identifier(payload.get("channel") or "")
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
+    channel = _normalize_identifier(payload.get("channel") or "")
     if not identifier:
         raise HTTPException(status_code=400, detail="identifier is required.")
 
     user = _get_identity_user_by_username(db, identifier)
     if not user or user.DeletedInd or not user.IsActive:
-        return {"success": True, "message": "If this account exists, an OTP has been sent.",
-                "hasPhone": False, "hasEmail": False}
+        return {
+            "success":  True,
+            "message":  "If this account exists, an OTP has been sent.",
+            "hasPhone": False,
+            "hasEmail": False,
+        }
 
     if _is_email_identifier(identifier):
         channel = "email"
@@ -492,8 +607,10 @@ async def verify_login_otp(payload: dict, db: Session = Depends(get_db)):
     Body: { "identifier": "9876543210", "otp": "123456" }
     identifier = phone or email. Returns same JWT shape as password login.
     """
-    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
-    otp        = (payload.get("otp") or "").strip()
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
+    otp = (payload.get("otp") or "").strip()
 
     if not identifier or not otp:
         raise HTTPException(status_code=400, detail="identifier and otp are required.")
@@ -517,7 +634,11 @@ async def verify_login_otp(payload: dict, db: Session = Depends(get_db)):
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > expires_at:
         user = _get_identity_user_by_username(db, identifier)
-        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None):
+        for alt_identifier in _unique_identifiers(
+            identifier,
+            user.Email        if user else None,
+            user.PhoneNumber  if user else None,
+        ):
             _db_otp_delete(db, alt_identifier, purpose="phone_login")
         raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
@@ -525,7 +646,6 @@ async def verify_login_otp(payload: dict, db: Session = Depends(get_db)):
     if not user or user.DeletedInd or not user.IsActive:
         raise HTTPException(status_code=404, detail="Account not found or inactive.")
 
-    # Clean OTP from all identifiers it was stored under
     for ident in {identifier, user.PhoneNumber or "", user.Email or ""}:
         if ident:
             _db_otp_delete(db, ident, purpose="phone_login")
@@ -543,7 +663,6 @@ async def verify_login_otp(payload: dict, db: Session = Depends(get_db)):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UPDATE PROFILE — POST /auth/update
-# People sync handled inside repository.update_identity_user_profile
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/update", summary="Update current user profile (requires login)")
@@ -586,7 +705,6 @@ async def update_user(
     user.ModifiedBy        = current_user.email
     db.flush()
 
-    # Sync ALL fields (not just IsActive + RoleId as before)
     _sync_people(db, user, modified_by=current_user.email)
     db.commit()
 
@@ -595,7 +713,6 @@ async def update_user(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DELETE USER (admin) — POST /auth/deleteUser
-# Soft-deletes both auth.IdentityUser AND twam.People atomically.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/deleteUser", summary="Admin: soft-delete a user from both tables")
@@ -756,12 +873,9 @@ async def send_otp(payload: dict, db: Session = Depends(get_db)):
     elif channel.lower() not in {"whatsapp", "sms"}:
         channel = "whatsapp"
 
-    # For guest verification we store the OTP against the supplied identifier.
-    # If the caller also sent both email and phone, keep both addresses in sync.
     extra_email = _normalize_identifier(payload.get("email") or "")
     extra_phone = _normalize_identifier(payload.get("phone") or "")
-    identifiers = _unique_identifiers(identifier, extra_email, extra_phone)
-    for value in identifiers:
+    for value in _unique_identifiers(identifier, extra_email, extra_phone):
         _db_otp_store(db, value, otp, purpose)
 
     sent = False
@@ -774,7 +888,7 @@ async def send_otp(payload: dict, db: Session = Depends(get_db)):
         "success": True,
         "message": "OTP sent. Please check your email or phone.",
         "channel": channel,
-        "sent": sent,
+        "sent":    sent,
     }
 
 
@@ -784,18 +898,26 @@ async def send_otp(payload: dict, db: Session = Depends(get_db)):
 
 @router.post("/forgot-password/check", summary="Check what channels the account has")
 async def forgot_password_check(payload: dict, db: Session = Depends(get_db)):
-    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
     if not identifier:
         raise HTTPException(status_code=400, detail="Identifier is required.")
 
     user = _get_identity_user_by_username(db, identifier)
     if not user:
-        return {"registered": False, "hasEmail": False, "hasPhone": False,
-                "maskedEmail": None, "maskedPhone": None, "channels": []}
+        return {
+            "registered": False, "hasEmail": False, "hasPhone": False,
+            "maskedEmail": None,  "maskedPhone": None, "channels": [],
+        }
 
     has_email = bool(user.Email)
     has_phone = bool(user.PhoneNumber)
-    channels = ["email"] if has_email and not has_phone else ["whatsapp", "sms"] if has_phone and not has_email else ["email", "whatsapp", "sms"]
+    channels = (
+        ["email"]           if has_email and not has_phone else
+        ["whatsapp", "sms"] if has_phone and not has_email else
+        ["email", "whatsapp", "sms"]
+    )
     return {
         "registered":  True,
         "hasEmail":    has_email,
@@ -808,8 +930,10 @@ async def forgot_password_check(payload: dict, db: Session = Depends(get_db)):
 
 @router.post("/forgot-password/send-otp", summary="Send OTP to chosen channel for password reset")
 async def forgot_password_send_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
-    channel    = _normalize_identifier(payload.get("channel") or "")
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
+    channel = _normalize_identifier(payload.get("channel") or "")
 
     if not identifier:
         raise HTTPException(status_code=400, detail="Identifier is required.")
@@ -821,29 +945,37 @@ async def forgot_password_send_otp(payload: dict, db: Session = Depends(get_db))
     if _is_email_identifier(identifier):
         channel = "email"
     elif channel.lower() not in {"whatsapp", "sms"}:
-        channel = "whatsapp" if user.PhoneNumber else "email"
+        # channel = "whatsapp" if user.PhoneNumber else "email"
+        channel = "sms" if user.PhoneNumber else "email"
 
-    response = _send_otp_for_user(db, user, purpose="forgot_password", channel=channel, identifier=identifier)
+    response = _send_otp_for_user(
+        db, user, purpose="forgot_password", channel=channel, identifier=identifier
+    )
     return {
-        "success": True,
-        "message": "OTP sent.",
+        "success":         True,
+        "message":         "OTP sent.",
         "selectedChannel": response["selectedChannel"],
-        "hasEmail": response["hasEmail"],
-        "hasPhone": response["hasPhone"],
-        "maskedEmail": response["maskedEmail"],
-        "maskedPhone": response["maskedPhone"],
-        "channels": response["channels"],
+        "hasEmail":        response["hasEmail"],
+        "hasPhone":        response["hasPhone"],
+        "maskedEmail":     response["maskedEmail"],
+        "maskedPhone":     response["maskedPhone"],
+        "channels":        response["channels"],
     }
 
 
 @router.post("/forgot-password/verify-otp", summary="Verify OTP and reset password")
 async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier   = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    identifier   = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
     otp          = (payload.get("otp")         or "").strip()
     new_password = (payload.get("newPassword") or "").strip()
 
     if not identifier or not otp or not new_password:
-        raise HTTPException(status_code=400, detail="identifier, otp and newPassword are required.")
+        raise HTTPException(
+            status_code=400,
+            detail="identifier, otp and newPassword are required.",
+        )
 
     stored = _db_otp_get(db, identifier, purpose="forgot_password")
     if not stored:
@@ -864,7 +996,11 @@ async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > expires_at:
         user = _get_identity_user_by_username(db, identifier)
-        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None):
+        for alt_identifier in _unique_identifiers(
+            identifier,
+            user.Email       if user else None,
+            user.PhoneNumber if user else None,
+        ):
             _db_otp_delete(db, alt_identifier, purpose="forgot_password")
         raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
@@ -872,12 +1008,15 @@ async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db
     if not user:
         raise HTTPException(status_code=404, detail="Account not found.")
 
-    result = reset_password_with_token(db, user.Email or user.PhoneNumber or identifier, new_password)
+    result = reset_password_with_token(
+        db, user.Email or user.PhoneNumber or identifier, new_password
+    )
     if not result["succeeded"]:
         raise HTTPException(status_code=400, detail={"errors": result["errors"]})
 
     for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
         _db_otp_delete(db, alt_identifier, purpose="forgot_password")
+
     return {"success": True, "message": "Password has been reset successfully. You can now sign in."}
 
 
@@ -887,7 +1026,9 @@ async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db
 
 @router.post("/verify-otp", summary="Verify OTP and create guest account")
 async def verify_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier = _normalize_identifier(payload.get("identifier") or payload.get("email") or payload.get("phone"))
+    identifier = _normalize_identifier(
+        payload.get("identifier") or payload.get("email") or payload.get("phone")
+    )
     otp     = (payload.get("otp") or "").strip()
     purpose = payload.get("purpose", "guest_checkout")
 
@@ -913,17 +1054,23 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if datetime.now(timezone.utc) > expires_at:
         user = _get_identity_user_by_username(db, identifier)
-        for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None, payload.get("email"), payload.get("phone")):
+        for alt_identifier in _unique_identifiers(
+            identifier,
+            user.Email        if user else None,
+            user.PhoneNumber  if user else None,
+            payload.get("email"),
+            payload.get("phone"),
+        ):
             _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
         raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
 
     if purpose == "guest_checkout":
-        existing = _get_identity_user_by_username(db, identifier)
-        DEFAULT_PASSWORD = "twam@1234"
+        existing          = _get_identity_user_by_username(db, identifier)
+        DEFAULT_PASSWORD  = "twam@1234"
 
         if not existing:
             from app.auth.schemas import RegisterUserRequest as RUR
-            first_name = payload.get("firstName") or (
+            first_name    = payload.get("firstName") or (
                 identifier.split("@")[0] if _is_email_identifier(identifier) else identifier
             )
             account_email = _normalize_identifier(payload.get("email") or "")
@@ -932,16 +1079,20 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
                 account_email = identifier
             elif not account_phone:
                 account_phone = identifier
+
             reg = RUR(
-                FirstName=first_name, LastName=payload.get("lastName") or "",
-                EmailId=account_email or None, Password=DEFAULT_PASSWORD,
-                TemporaryPassword=DEFAULT_PASSWORD,
-                PhoneNumber=account_phone or None, IsActive=True, RoleId=Roles.USER,
+                FirstName         = first_name,
+                LastName          = payload.get("lastName") or "",
+                EmailId           = account_email or None,
+                Password          = DEFAULT_PASSWORD,
+                TemporaryPassword = DEFAULT_PASSWORD,
+                PhoneNumber       = account_phone or None,
+                IsActive          = True,
+                RoleId            = Roles.USER,
             )
             result = create_identity_user(db, reg)
             if not result["succeeded"]:
                 raise HTTPException(status_code=500, detail="Account creation failed.")
-            # Welcome email + WhatsApp (if phone given) sent inside create_identity_user
         else:
             raise HTTPException(
                 status_code=409,
@@ -954,7 +1105,11 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
         user         = _get_identity_user_by_username(db, identifier)
         claims       = build_token_claims(db, user)
         access_token = create_access_token(claims)
-        for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber, payload.get("email"), payload.get("phone")):
+        for alt_identifier in _unique_identifiers(
+            identifier,
+            user.Email, user.PhoneNumber,
+            payload.get("email"), payload.get("phone"),
+        ):
             _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
 
         return {
@@ -966,8 +1121,15 @@ async def verify_otp(payload: dict, db: Session = Depends(get_db)):
         }
 
     user = _get_identity_user_by_username(db, identifier)
-    for alt_identifier in _unique_identifiers(identifier, user.Email if user else None, user.PhoneNumber if user else None, payload.get("email"), payload.get("phone")):
+    for alt_identifier in _unique_identifiers(
+        identifier,
+        user.Email        if user else None,
+        user.PhoneNumber  if user else None,
+        payload.get("email"),
+        payload.get("phone"),
+    ):
         _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
+
     return {"success": True, "message": "OTP verified."}
 
 

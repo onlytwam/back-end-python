@@ -353,19 +353,54 @@ async def create_shipment(
         tracking_id  = result.awb_number
         tracking_url = result.tracking_url
 
-    db.execute(text("""
-        UPDATE twam."Orders"
-        SET "TrackingId" = :tid, "State" = 'Processing', "IsShipped" = true,
-            "DeliveryAgent" = 'EKart', "ModifiedDate" = :now
-        WHERE "OrderId" = :order_id
-    """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
+    # db.execute(text("""
+    #     UPDATE twam."Orders"
+    #     SET "TrackingId" = :tid, "State" = 'Processing', "IsShipped" = true,
+    #         "DeliveryAgent" = 'EKart', "ModifiedDate" = :now
+    #     WHERE "OrderId" = :order_id
+    # """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
 
-    db.add(OrderTrackingStatus(
-        orderId=inp.order_id,
-        status="Processing",
-        createdDate=datetime.now(timezone.utc),
-    ))
-    db.commit()
+    # db.add(OrderTrackingStatus(
+    #     orderId=inp.order_id,
+    #     status="Processing",
+    #     createdDate=datetime.now(timezone.utc),
+    # ))
+    # db.commit()
+
+    # background_tasks.add_task(send_order_shipped_notification, db, inp.order_id)
+
+    try:
+        db.execute(text("""
+            UPDATE twam."Orders"
+            SET "TrackingId" = :tid, "State" = 'Processing', "IsShipped" = true,
+                "DeliveryAgent" = 'EKart', "ModifiedDate" = :now
+            WHERE "OrderId" = :order_id AND "DeletedInd" = false
+        """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
+
+        db.add(OrderTrackingStatus(
+            orderId=inp.order_id,
+            status="Processing",
+            createdDate=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        print(f"[Ekart]  DB commit failed for order {inp.order_id}: {e}")
+        try:
+            db.execute(text("""
+                UPDATE twam."Orders"
+                SET "TrackingId" = :tid, "State" = 'Processing',
+                    "IsShipped" = true, "DeliveryAgent" = 'EKart',
+                    "ModifiedDate" = :now
+                WHERE "OrderId" = :order_id AND "DeletedInd" = false
+            """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
+            db.commit()
+            print(f"[Ekart]  Fallback commit succeeded for order {inp.order_id}")
+        except Exception as e2:
+            db.rollback()
+            print(f"[Ekart]  Fallback also failed: {e2}")
+            raise HTTPException(500, f"Shipment created on Ekart (AWB: {tracking_id}) but DB update failed: {e2}")
 
     background_tasks.add_task(send_order_shipped_notification, db, inp.order_id)
 
