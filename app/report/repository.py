@@ -406,6 +406,36 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
     # ─────────────────────────────────────────────────────────────────────────
     # PART 2 — Physical Coupons (coupons.PhysicalCoupons — scratch-card style)
     # ─────────────────────────────────────────────────────────────────────────
+#     physical_coupon_sql = f"""
+#         SELECT
+#             'physical_coupon'                           AS "ReportType",
+#             pc."CouponCode"                             AS "Code",
+#             pc."Description"                            AS "Name",
+#             pc."Description"                            AS "Description",
+#             pc."Discount"                               AS "DiscountValue",
+#             NULL                                        AS "GiftType",
+#             'physical_coupon'                           AS "SubType",
+#             NULL                                        AS "StartDate",
+#             NULL                                        AS "EndDate",
+#             CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
+#             CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
+#             CASE WHEN pc."IsUsed" THEN pc."Discount"
+#                  ELSE 0 END                             AS "TotalDiscount",
+#             0                                           AS "TotalRevenue",
+#             NULL                                        AS "SKU",
+#             NULL                                        AS "HSNCode",
+#             NULL                                        AS "Weight"
+#         FROM coupons."PhysicalCoupons" pc
+#         WHERE 1=1
+     
+#         {f"""AND pc."OrganizationId" = {org_id}""" if org_id else ''}
+#         {f"""AND pc."UsedAt" >= '{from_date}'""" if from_date else ''}
+#         {f"""AND pc."UsedAt" <= '{to_date} 23:59:59'""" if to_date else ''}
+#     """
+#    #   {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
+#         #   {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
+#         #   {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
+
     physical_coupon_sql = f"""
         SELECT
             'physical_coupon'                           AS "ReportType",
@@ -420,21 +450,18 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
             CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
             CASE WHEN pc."IsUsed" THEN pc."Discount"
-                 ELSE 0 END                             AS "TotalDiscount",
+                ELSE 0 END                             AS "TotalDiscount",
             0                                           AS "TotalRevenue",
             NULL                                        AS "SKU",
             NULL                                        AS "HSNCode",
             NULL                                        AS "Weight"
         FROM coupons."PhysicalCoupons" pc
         WHERE 1=1
-     
-        {f"""AND pc."OrganizationId" = {org_id}""" if org_id else ''}
-        {f"""AND pc."UsedAt" >= '{from_date}'""" if from_date else ''}
-        {f"""AND pc."UsedAt" <= '{to_date} 23:59:59'""" if to_date else ''}
+
+        {'AND pc."OrganizationId" = ' + str(org_id) if org_id else ''}
+        {'AND pc."UsedAt" >= ' + "'" + str(from_date) + "'" if from_date else ''}
+        {'AND pc."UsedAt" <= ' + "'" + str(to_date) + " 23:59:59'" if to_date else ''}
     """
-   #   {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
-        #   {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
-        #   {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
     # ─────────────────────────────────────────────────────────────────────────
     # PART 3 — Surprise Gifts (twam.OrderSurpriseGift + SurpriseGiftRule)
     # ─────────────────────────────────────────────────────────────────────────
