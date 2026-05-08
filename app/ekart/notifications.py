@@ -202,6 +202,9 @@ def _render_template(content: str, positional_order: list, named_vars: dict) -> 
       ${var1}   — SmartPing positional format
       {var1}    — fallback positional format
 
+    Thread-safe: uses iter() instead of nonlocal counter so concurrent
+    FastAPI requests each get their own iterator — no shared mutable state.
+
     Example:
         content          = "Only TWAM Login OTP: {#var#}\\nValid for 10 mins."
         positional_order = ["otp"]
@@ -217,13 +220,12 @@ def _render_template(content: str, positional_order: list, named_vars: dict) -> 
     values = [str(named_vars.get(key, "") or "") for key in positional_order]
 
     # ── Step 1: Replace {#var#} one at a time in order ───────────────────────
-    # Each {#var#} maps to the next value in positional_order
-    idx = 0
-    def replace_dlt_var(match):
-        nonlocal idx
-        value = values[idx] if idx < len(values) else ""
-        idx += 1
-        return value
+    # Use iter() so each call to this function gets its own independent iterator.
+    # This is thread-safe — no shared nonlocal/global counter.
+    value_iter = iter(values)
+
+    def replace_dlt_var(match) -> str:
+        return next(value_iter, "")   # returns "" if more {#var#} than values
 
     content = re.sub(r'\{#var#\}', replace_dlt_var, content)
 
@@ -1310,4 +1312,3 @@ def send_order_status_notification(db: Session, order_id: int, new_status: str) 
     except Exception as e:
         print(f"[Notifications] send_order_status_notification failed for order {order_id}: {e}")
     return True
-# ═══════════════════════════════════════════════════════════════════════════════OTP verification, password reset, and other notifications can be implemented similarly using the _notify helper function with appropriate message templates and variables.
