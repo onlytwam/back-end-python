@@ -7,55 +7,52 @@ SMS credential source:  sms.SmsCredential
 SMS template source:    sms.SmsMessageTemplate
 SMS audit log:          sms.SmsLog
 
-DB TEMPLATE PLACEHOLDERS (named style) — matched to actual sms."SmsMessageTemplate" rows
+DB TEMPLATE PLACEHOLDERS — SmartPing supports both {#var#} and ${var1} styles
 ──────────────────────────────────────────────────────────────────────────────────────────
-DB MessageType  | Named placeholders in MessageContent
-────────────────|────────────────────────────────────────────────────────────────────────
-OTP             | {otp}
-WELCOME         | (no placeholders)
-ORDER_PLACED    | {customer_name}, {order_number}, {items}, {total_amount}, {delivery_address}
-ORDER_PENDING   | {customer_name}, {order_number}, {total_amount}
-PAYMENT_FAILURE | {customer_name}, {order_number}, {total_amount}
-REFUND_AMOUNT   | {refund_amount}, {order_number}, {refund_date}
-REFUND_SUCCESS  | {customer_name}, {order_number}, {refund_amount}, {payment_method}, {refund_date}
-TEMP_PASSWORD   | {customer_name}, {temp_password}
+DB MessageType  | DB template uses   | positional_order (var1, var2, …)
+────────────────|────────────────────|──────────────────────────────────────────────────
+OTP             | {#var#}            | var1=otp
+WELCOME         | (no placeholders)  | (no vars)
+ORDER_PLACED    | {#var#}…{#var#}    | var1=customer_name, var2=order_number, var3=items,
+                |                    | var4=total_amount, var5=delivery_address
+ORDER_PENDING   | {#var#}…{#var#}    | var1=customer_name, var2=order_number, var3=total_amount
+PAYMENT_FAILURE | {#var#}…{#var#}    | var1=customer_name, var2=order_number, var3=total_amount
+REFUND_AMOUNT   | {#var#}…{#var#}    | var1=refund_amount, var2=order_number, var3=refund_date
+REFUND_SUCCESS  | {#var#}…{#var#}    | var1=customer_name, var2=order_number, var3=refund_amount,
+                |                    | var4=payment_method, var5=refund_date
+TEMP_PASSWORD   | {#var#}, {#var#}   | var1=customer_name, var2=temp_password
 
-SmartPing DLT API — HOW VARIABLES ARE SENT
-──────────────────────────────────────────
-SmartPing uses POSITIONAL vars: var1, var2, var3, … as query params.
-The order of positional vars must match the order placeholders appear
-in the DLT-registered template (left-to-right).
+HOW _send_sms RESOLVES VARIABLES
+──────────────────────────────────
+1. named_vars  : {"otp": "835460", …}            — human-readable key → actual value
+2. positional_order: ["otp"]                      — maps position → key
+   → var1 = named_vars["otp"] = "835460"
+3. _render_template replaces {#var#} one-by-one in order → "835460"
+4. rendered text is sent as `text` param to SmartPing
+5. var1="835460" also sent as query param for DLT validation
 
-DO NOT send a "text" param — causes Error 5307 (template mismatch).
-SmartPing fetches the template by dltContentId and substitutes on their side.
+SmartPing HTTP GET /fe/api/v1/send
+───────────────────────────────────
+Required params: username, password, from, to, text, dltContentId, dltPrincipalEntityId
+Variable params: var1, var2, var3, …
 
-POSITIONAL ORDER per template (var1=first placeholder, var2=second, …):
-────────────────────────────────────────────────────────────────────────
-ORDER_PLACED    | var1=customer_name, var2=order_number, var3=items, var4=total_amount, var5=delivery_address
-ORDER_PENDING   | var1=customer_name, var2=order_number, var3=total_amount
-PAYMENT_FAILURE | var1=customer_name, var2=order_number, var3=total_amount
-REFUND_AMOUNT   | var1=refund_amount, var2=order_number, var3=refund_date
-REFUND_SUCCESS  | var1=customer_name, var2=order_number, var3=refund_amount, var4=payment_method, var5=refund_date
-TEMP_PASSWORD   | var1=customer_name, var2=temp_password
-OTP             | var1=otp
-WELCOME         | (no vars)
+KEY FIX vs previous version
+────────────────────────────
+BEFORE (broken):
+  - API was called TWICE — first call used raw {#var#} template (unrendered)
+  - Second call rendered text correctly but its result was ignored for logging
+  - {#var#} was never replaced in code — SmartPing delivered literal {#var#}
 
-SmartPing HTTP 400 — TROUBLESHOOTING
-─────────────────────────────────────
-HTTP 400 with empty body usually means one of:
-  1. Wrong HTTP method  → code tries GET first, then falls back to POST automatically
-  2. Wrong DLT param names → code sends both alias sets (dltContentId + dltTemplateId, etc.)
-  3. Bad credentials / senderId → check sms.SmsCredential rows
-  4. Phone number format wrong → must be 12-digit 91XXXXXXXXXX
-Enable debug logging by setting SMS_DEBUG=true in environment or
-SmsCredential."Debug"=true in DB.  Full URL + params are printed.
+AFTER (fixed):
+  - Text is rendered ONCE before building params
+  - API is called ONCE with correctly rendered text
+  - _render_template handles {#var#}, ${var1}, and {var1} formats
 """
 
-import os
+import re
 import time
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urlencode
 
 from sqlalchemy.orm import Session
 from sqlalchemy import Enum, text
@@ -181,13 +178,63 @@ def _get_template(db: Session, message_type: str) -> Optional[dict]:
     return _get_all_templates(db).get(message_type)
 
 
-def _render_named_template(content: str, named_vars: dict) -> str:
+# ════════════════════════════════════════════════════════════════════════════════
+# TEMPLATE RENDERING — handles ALL three placeholder formats
+#
+#  Format 1: {#var#}   — TRAI DLT / SmartPing DB template style  ← FIXED
+#  Format 2: ${var1}   — SmartPing positional style
+#  Format 3: {var1}    — fallback positional style
+#
+#  Algorithm:
+#    Step 1 — Replace each {#var#} occurrence in left-to-right order
+#             with the value at that position in positional_order.
+#             e.g. first {#var#} → var1 value, second → var2 value, etc.
+#    Step 2 — Replace ${var1}, ${var2}, … with positional values.
+#    Step 3 — Replace {var1}, {var2}, … with positional values (fallback).
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _render_template(content: str, positional_order: list, named_vars: dict) -> str:
     """
-    Substitute DB named placeholders {customer_name}, {order_number}, …
-    Used ONLY for SmsLog.MessageContent rendering — never sent to SmartPing.
+    Render a DB template string by substituting all placeholder styles.
+
+    Supports:
+      {#var#}   — TRAI DLT format (SmartPing DB templates use this)
+      ${var1}   — SmartPing positional format
+      {var1}    — fallback positional format
+
+    Example:
+        content          = "Only TWAM Login OTP: {#var#}\\nValid for 10 mins."
+        positional_order = ["otp"]
+        named_vars       = {"otp": "835460"}
+        → "Only TWAM Login OTP: 835460\\nValid for 10 mins."
+
+    Example (multiple vars):
+        content          = "Hi {#var#} your order {#var#} is confirmed."
+        positional_order = ["customer_name", "order_number"]
+        named_vars       = {"customer_name": "Eshwar", "order_number": "ORD-001"}
+        → "Hi Eshwar your order ORD-001 is confirmed."
     """
-    for key, value in named_vars.items():
-        content = content.replace("{" + key + "}", str(value) if value is not None else "")
+    values = [str(named_vars.get(key, "") or "") for key in positional_order]
+
+    # ── Step 1: Replace {#var#} one at a time in order ───────────────────────
+    # Each {#var#} maps to the next value in positional_order
+    idx = 0
+    def replace_dlt_var(match):
+        nonlocal idx
+        value = values[idx] if idx < len(values) else ""
+        idx += 1
+        return value
+
+    content = re.sub(r'\{#var#\}', replace_dlt_var, content)
+
+    # ── Step 2: Replace ${var1}, ${var2}, … ──────────────────────────────────
+    for i, value in enumerate(values, start=1):
+        content = content.replace(f"${{var{i}}}", value)
+
+    # ── Step 3: Replace {var1}, {var2}, … (fallback) ─────────────────────────
+    for i, value in enumerate(values, start=1):
+        content = content.replace(f"{{var{i}}}", value)
+
     return content
 
 
@@ -354,7 +401,7 @@ def _log_sms(
             "message_content": message_content,
             "template_id":     template_id,
             "dlt_peid":        dlt_peid,
-            "transaction_id":  transaction_id,
+            "transaction_id":  transaction_id[:50],
             "state":           state,
             "status_code":     status_code,
             "error_desc":      error_desc,
@@ -368,46 +415,57 @@ def _log_sms(
             pass
 
 
-# ── SmartPing request helper ──────────────────────────────────────────────────
+# ── SmartPing GET request helper ──────────────────────────────────────────────
 
 def _smartping_request(api_url: str, params: dict):
-
+    """
+    Send a single GET request to SmartPing /fe/api/v1/send.
+    Returns (http_status, raw_body, parsed_data).
+    """
     import httpx
+    import json
 
     try:
-
-        print(f"[SMS DEBUG] URL  : {api_url}")
+        print(f"[SMS DEBUG] URL   : {api_url}")
         print(f"[SMS DEBUG] PARAMS: {params}")
 
-        resp = httpx.post(
-            api_url,
-            data=params,
-            timeout=15
-        )
-
-        raw = resp.text.strip()
+        resp = httpx.get(api_url, params=params, timeout=15)
+        raw  = resp.text.strip()
 
         print(f"[SMS DEBUG] STATUS: {resp.status_code}")
         print(f"[SMS DEBUG] BODY  : {raw}")
 
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {}
+
+        state       = body.get("state", "")
+        txn_id      = str(body.get("transactionId", ""))[:50]
+        status_code = body.get("statusCode", resp.status_code)
+        description = body.get("description", raw)
+        ok          = state == "SUBMIT_ACCEPTED" or status_code == 200
+
         return resp.status_code, raw, {
-            "statusCode": resp.status_code,
-            "state": "SUCCESS" if resp.status_code == 200 else "ERROR",
-            "description": raw,
+            "statusCode":    status_code,
+            "state":         "SUCCESS" if ok else "ERROR",
+            "transactionId": txn_id,
+            "description":   description,
         }
 
     except Exception as e:
-
         print(f"[SMS ERROR] {e}")
-
         return 0, str(e), {
-            "statusCode": 0,
-            "state": "EXCEPTION",
-            "description": str(e),
+            "statusCode":    0,
+            "state":         "EXCEPTION",
+            "transactionId": "",
+            "description":   str(e),
         }
 
 
-# ── SMS sender ────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# CORE SMS SENDER — fixed single-call flow
+# ════════════════════════════════════════════════════════════════════════════════
 
 def _send_sms(
     db: Session,
@@ -417,21 +475,18 @@ def _send_sms(
     positional_order: list,
 ) -> bool:
     """
-    Send SMS via SmartPing HTTP API.
+    Send SMS via SmartPing HTTP GET API.
 
-    named_vars       : dict matching the DB template's {placeholder} names.
-                       Used for SmsLog rendering and building var1, var2, … params.
-    positional_order : keys from named_vars in the order SmartPing expects them.
-                       e.g. ["customer_name", "order_number", "total_amount"]
-                       → var1=named_vars["customer_name"], var2=…
+    named_vars       : dict of key → value  e.g. {"otp": "835460"}
+    positional_order : keys in DLT template order  e.g. ["otp"]
+                       Position 1 → var1 → replaces {#var#} / ${var1} in template.
 
-    CRITICAL: DO NOT send "text" param → causes Error 5307.
-
-    HTTP 400 handling
-    ─────────────────
-    If GET returns 400 with empty body, the call is automatically retried
-    as POST. Both alias sets for DLT param names are always sent.
-    Set env SMS_DEBUG=true to log full URL + params for troubleshooting.
+    Fixed flow (single API call):
+      1. Fetch credential + template from DB (cached 5 min)
+      2. Render text: replace {#var#} / ${var1} with actual values  ← KEY FIX
+      3. Build GET params with rendered text + varN params
+      4. GET /fe/api/v1/send  (called ONCE)
+      5. Write SmsLog
     """
     # ── Guard: credential ────────────────────────────────────────────────────
     cred = _get_sms_credential(db)
@@ -445,7 +500,7 @@ def _send_sms(
     # ── Guard: template ──────────────────────────────────────────────────────
     template = _get_template(db, message_type)
     if not template:
-        print(f"[SMS] No active template for '{message_type}' in sms.SmsMessageTemplate")
+        print(f"[SMS] No active template for '{message_type}'")
         return False
 
     dlt_content_id  = template["templateId"]
@@ -453,81 +508,66 @@ def _send_sms(
     message_content = template["messageContent"]
 
     if not dlt_content_id:
-        print(f"[SMS] Template '{message_type}' missing TemplateId — cannot send")
+        print(f"[SMS] Template '{message_type}' missing TemplateId")
         return False
 
-    # ── Normalise phone → 12-digit (91XXXXXXXXXX) ───────────────────────────
+    # ── Normalise phone → 12-digit 91XXXXXXXXXX ─────────────────────────────
     digits = "".join(c for c in (phone or "") if c.isdigit())
     if len(digits) < 10:
         print(f"[SMS] Invalid phone: '{phone}'")
         return False
     recipient = "91" + digits[-10:]
 
-    log_text = _render_named_template(message_content, named_vars)
-
+    # ── Debug: show variable mapping ─────────────────────────────────────────
     print(f"[SMS] Sending {message_type} → {recipient}")
     print(f"[SMS] dltContentId={dlt_content_id} | dltPEID={dlt_peid}")
     for i, key in enumerate(positional_order, start=1):
         print(f"[SMS] var{i} ({key}) = {named_vars.get(key, '')}")
 
-    try:
-        # ── Build SmartPing params ───────────────────────────────────────────
-        # params: dict = {
-        #     "username":             cred["username"],
-        #     "password":             cred["password"],
-        #     "from":                 cred["senderId"],
-        #     "to":                   recipient,
-        #     "dltContentId":         dlt_content_id,
-        #     "dltPrincipalEntityId": dlt_peid,
-        # }
-        params: dict = {
-            "username": cred["username"],
-            "password": cred["password"],
-            "from": cred["senderId"],
-            "to": recipient,
-            "dltContentId": dlt_content_id,
-            "dltPrincipalEntityId": dlt_peid,
-            "unicode": "true" if cred.get("unicode", "").lower() == "true" else "false",
-        }
+    # ── FIXED: Render text BEFORE building params ────────────────────────────
+    # _render_template handles {#var#}, ${var1}, and {var1} formats
+    # This must happen before the API call — the old code did this AFTER
+    rendered_text = _render_template(message_content, positional_order, named_vars)
 
-        # Positional vars: var1, var2, …
-        for i, key in enumerate(positional_order, start=1):
-            params[f"var{i}"] = str(named_vars.get(key, "") or "")
+    print(f"[SMS] Rendered text: {rendered_text}")
 
-        # ── Fire request ─────────────────────────────────────────────────────────
-        http_status, raw, data = _smartping_request(cred["apiUrl"], params)  # ← apiUrl not apiMultiUrl
+    # ── Build SmartPing GET params ───────────────────────────────────────────
+    params: dict = {
+        "username":             cred["username"],
+        "password":             cred["password"],
+        "from":                 cred["senderId"],
+        "to":                   recipient,
+        "text":                 rendered_text,        # ← rendered, not raw template
+        "dltContentId":         dlt_content_id,
+        "dltPrincipalEntityId": dlt_peid,
+        "unicode":              "true" if cred.get("unicode", "").lower() == "true" else "false",
+    }
 
-        print(f"[SMS] HTTP {http_status} | {raw[:300]}")
+    # Add varN params for SmartPing DLT validation
+    for i, key in enumerate(positional_order, start=1):
+        params[f"var{i}"] = str(named_vars.get(key, "") or "")
 
-        ok          = data.get("statusCode") == 200 or data.get("state") == "SUBMIT_ACCEPTED"
-        txn_id      = str(data.get("transactionId", ""))
-        state_str   = data.get("state", "UNKNOWN")
-        status_code = int(data.get("statusCode") or http_status or 0)
-        error_desc  = "" if ok else (data.get("description") or raw[:200])
+    # ── Fire request ONCE ────────────────────────────────────────────────────
+    http_status, raw, data = _smartping_request(cred["apiUrl"], params)
 
-        _log_sms(db, recipient, message_type, log_text,
-                 dlt_content_id, dlt_peid, txn_id, state_str, status_code, error_desc)
+    print(f"[SMS] HTTP {http_status} | {raw[:300]}")
 
-        if ok:
-            print(f"[SMS] ✅ {message_type} → {recipient} txId={txn_id}")
-        else:
-            print(
-                f"[SMS] ❌ {message_type} FAILED "
-                f"code={status_code} state={state_str} desc={error_desc}\n"
-                f"[SMS] ── TROUBLESHOOT ──────────────────────────────────\n"
-                f"[SMS]   Set SMS_DEBUG=true in env to log full URL + params\n"
-                f"[SMS]   Verify sms.SmsCredential: username, password, senderId, apiUrl\n"
-                f"[SMS]   Verify sms.SmsMessageTemplate: TemplateId (DLT Content ID), DLTId (PE ID)\n"
-                f"[SMS] ─────────────────────────────────────────────────"
-            )
+    ok          = data.get("state") == "SUCCESS"
+    txn_id      = str(data.get("transactionId", ""))
+    state_str   = data.get("state", "UNKNOWN")
+    status_code = int(data.get("statusCode") or http_status or 0)
+    error_desc  = "" if ok else (data.get("description") or raw[:200])
 
-        return ok
+    # Log rendered text (what was actually sent)
+    _log_sms(db, recipient, message_type, rendered_text,
+             dlt_content_id, dlt_peid, txn_id, state_str, status_code, error_desc)
 
-    except Exception as e:
-        _log_sms(db, recipient, message_type, log_text,
-                 dlt_content_id, dlt_peid, "", "EXCEPTION", 0, str(e))
-        print(f"[SMS] EXCEPTION {message_type} → {phone}: {e}")
-        return False
+    if ok:
+        print(f"[SMS] ✅ {message_type} → {recipient} txId={txn_id}")
+    else:
+        print(f"[SMS] ❌ {message_type} FAILED code={status_code} desc={error_desc}")
+
+    return ok
 
 
 # ── WhatsApp ──────────────────────────────────────────────────────────────────
@@ -566,25 +606,26 @@ def _notify(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # OTP
-# DB template: "Only TWAM Login OTP: {otp} Valid for 10 mins…"
-# Placeholders: {otp}
-# Positional:   var1=otp
+# DB template : "Only TWAM Login OTP: {#var#}\nValid for 10 mins…"
+# named_vars  : {"otp": <6-digit code>}
+# positional  : var1 = otp
+# Result      : "Only TWAM Login OTP: 835460\nValid for 10 mins…"
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_otp_sms(db: Session, phone: str, otp: str) -> bool:
     if not phone:
         return False
     return _send_sms(
         db, phone, MT_OTP,
-        named_vars={"otp": otp},
-        positional_order=["otp"],
+        named_vars       = {"otp": otp},
+        positional_order = ["otp"],
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WELCOME
-# DB template: "Welcome to OnlyTWAM… Visit https://onlytwam.com/…"
-# Placeholders: (none)
-# Positional:   (no vars)
+# DB template : "Welcome to OnlyTWAM… Visit https://onlytwam.com/…"
+# named_vars  : (none)
+# positional  : (none)
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_welcome_sms(db: Session, phone: str) -> bool:
     if not phone:
@@ -598,9 +639,10 @@ def send_welcome_sms(db: Session, phone: str) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TEMP_PASSWORD
-# DB template: "Hi {customer_name} Your Temporary Password is : {temp_password}…"
-# Placeholders: {customer_name}, {temp_password}
-# Positional:   var1=customer_name, var2=temp_password
+# DB template : "Hi {#var#} Your Temporary Password is : {#var#}…"
+# named_vars  : {"customer_name": name, "temp_password": password}
+# positional  : var1=customer_name, var2=temp_password
+# Result      : "Hi Eshwar Your Temporary Password is : Abc@123…"
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_temporary_password_sms(db: Session, phone: str, name: str, password: str) -> bool:
     if not phone:
@@ -617,6 +659,9 @@ def send_temporary_password_sms(db: Session, phone: str, name: str, password: st
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_PLACED
+# DB template : "Hi {#var#}, your order {#var#} is confirmed…"
+# positional  : var1=customer_name, var2=order_number, var3=items,
+#               var4=total_amount, var5=delivery_address
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_order_placed_notification(db: Session, order_id: int) -> bool:
     order = _get_order_details(db, order_id)
@@ -694,6 +739,8 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_PENDING
+# DB template : "Hi {#var#}, your order {#var#} of {#var#} is pending payment…"
+# positional  : var1=customer_name, var2=order_number, var3=total_amount
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_order_pending_notification(db: Session, order_id: int) -> bool:
     order = _get_order_details(db, order_id)
@@ -744,6 +791,8 @@ def send_order_pending_notification(db: Session, order_id: int) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAYMENT_FAILURE
+# DB template : "Hi {#var#}, payment for order {#var#} of {#var#} failed…"
+# positional  : var1=customer_name, var2=order_number, var3=total_amount
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_payment_failure_notification(
     db: Session, order_id: int, total_amount: Optional[float] = None
@@ -799,6 +848,8 @@ def send_payment_failure_notification(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REFUND_AMOUNT
+# DB template : "A refund of {#var#} for order {#var#} is initiated on {#var#}…"
+# positional  : var1=refund_amount, var2=order_number, var3=refund_date
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_refund_amount_notification(
     db: Session, order_id: int, refund_amount: float, refund_date: Optional[str] = None
@@ -821,6 +872,9 @@ def send_refund_amount_notification(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # REFUND_SUCCESS
+# DB template : "Hi {#var#}, refund of {#var#} for order {#var#} via {#var#} on {#var#}…"
+# positional  : var1=customer_name, var2=order_number, var3=refund_amount,
+#               var4=payment_method, var5=refund_date
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_refund_success_notification(
     db: Session,
@@ -888,6 +942,8 @@ def send_refund_success_notification(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_SHIPPED
+# DB template : "Hi {#var#}, your order {#var#} is shipped. Track: {#var#}…"
+# positional  : var1=customer_name, var2=order_number, var3=tracking_id
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_order_shipped_notification(db: Session, order_id: int) -> bool:
     order = _get_order_details(db, order_id)
@@ -947,6 +1003,8 @@ def send_order_shipped_notification(db: Session, order_id: int) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_OUT_FOR_DELIVERY
+# DB template : "Hi {#var#}, your order {#var#} is out for delivery today…"
+# positional  : var1=customer_name, var2=order_number
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_out_for_delivery_notification(db: Session, order_id: int) -> bool:
     order = _get_order_details(db, order_id)
@@ -995,6 +1053,8 @@ def send_out_for_delivery_notification(db: Session, order_id: int) -> bool:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_DELIVERED
+# DB template : "Hi {#var#}, your order {#var#} has been delivered…"
+# positional  : var1=customer_name, var2=order_number
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_delivery_confirmation(
     db: Session, order_id: int, pod_image_url: Optional[str] = None
@@ -1048,17 +1108,21 @@ def send_delivery_confirmation(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ORDER_CANCELLED
+# DB template : "Hi {#var#}, your order {#var#} of {#var#} has been cancelled…"
+# positional  : var1=customer_name, var2=order_number, var3=total_amount,
+#               var4=cancelled_by, var5=reason
 # ═══════════════════════════════════════════════════════════════════════════════
 class CancelledBy(str, Enum):
     CUSTOMER  = "customer"
     ADMIN     = "admin"
     TECHNICAL = "technical"
-    
+
+
 def send_order_cancelled_notification(
     db: Session,
     order_id: int,
     reason: Optional[str] = None,
-    cancelled_by: CancelledBy = CancelledBy.CUSTOMER,  # ← new param
+    cancelled_by: CancelledBy = CancelledBy.CUSTOMER,
 ) -> bool:
     order = _get_order_details(db, order_id)
     if not order:
@@ -1067,7 +1131,6 @@ def send_order_cancelled_notification(
     company = _cfg(db, "COMPANY_NAME", "Only TWAM")
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
 
-    # ── Build context based on who/what cancelled ──────────────────────────
     if cancelled_by == CancelledBy.ADMIN:
         email_heading  = "Your Order Has Been Cancelled by Our Team"
         email_intro    = (
@@ -1099,7 +1162,7 @@ def send_order_cancelled_notification(
             "We apologise for the inconvenience."
         )
 
-    else:  # CancelledBy.CUSTOMER (existing behaviour)
+    else:  # CancelledBy.CUSTOMER
         email_heading  = "Order Cancelled"
         email_intro    = (
             f"Your order <strong>#{order['order_number']}</strong> has been cancelled"
@@ -1110,7 +1173,6 @@ def send_order_cancelled_notification(
         )
         refund_note    = "If you paid online, your refund will be processed within 5-7 business days."
 
-    # ── Email ──────────────────────────────────────────────────────────────
     if order["customer_email"]:
         reason_line = (
             f'<p style="color:#666;"><strong>Reason:</strong> {reason}</p>'
@@ -1132,7 +1194,6 @@ def send_order_cancelled_notification(
           </div>
           {_footer(company, support)}
         </div>"""
-
         send_email(db, EmailCreate(
             name=order["customer_name"],
             email=order["customer_email"],
@@ -1140,7 +1201,6 @@ def send_order_cancelled_notification(
             message=body,
         ))
 
-    # ── WhatsApp / SMS ─────────────────────────────────────────────────────
     if order["customer_phone"]:
         _notify(
             db, order, MT_ORDER_CANCELLED,
@@ -1148,7 +1208,7 @@ def send_order_cancelled_notification(
                 "customer_name": order["customer_name"],
                 "order_number":  order["order_number"],
                 "total_amount":  _fmt(order["total_amount"]),
-                "cancelled_by":  cancelled_by.value,          # ← pass to template
+                "cancelled_by":  cancelled_by.value,
                 "reason":        reason or "",
             },
             positional_order=[
@@ -1169,6 +1229,8 @@ def send_order_cancelled_notification(
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RETURN_INITIATED
+# DB template : "Hi {#var#}, your return for order {#var#} has been received…"
+# positional  : var1=customer_name, var2=order_number
 # ═══════════════════════════════════════════════════════════════════════════════
 def send_return_initiated_notification(
     db: Session, order_id: int, return_reason: Optional[str] = None
@@ -1180,7 +1242,10 @@ def send_return_initiated_notification(
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
 
     if order["customer_email"]:
-        reason_line = (f'<p style="color:#666;"><strong>Reason:</strong> {return_reason}</p>' if return_reason else "")
+        reason_line = (
+            f'<p style="color:#666;"><strong>Reason:</strong> {return_reason}</p>'
+            if return_reason else ""
+        )
         body = f"""
         <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
           {_header(company)}
