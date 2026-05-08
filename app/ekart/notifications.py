@@ -1310,3 +1310,4 @@ def send_order_status_notification(db: Session, order_id: int, new_status: str) 
     except Exception as e:
         print(f"[Notifications] send_order_status_notification failed for order {order_id}: {e}")
     return True
+# ═══════════════════════════════════════════════════════════════════════════════OTP verification, password reset, and other notifications can be implemented similarly using the _notify helper function with appropriate message templates and variables.
