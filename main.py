@@ -59,7 +59,7 @@ from app.supplierinfo.models         import SupplierInfo
 from app.supportrequest.models       import SupportRequest
 from app.taxhsncode.models           import TaxHSNCode
 from app.userrole.models             import UserRole
-from app.userreview.models           import UserReview
+from app.userquery.models            import UserQuery
 from app.wishlist.models             import Wishlist
 from app.newsletter.models           import Newsletter
 from app.sms.models                  import SmsCredential, SmsMessageTemplate, SmsLog
@@ -161,7 +161,7 @@ from app.mdm.router                  import router as mdm_router
 from app.productvariant.router       import router as productvariant_router
 from app.productvariantdetail.router import router as pvd_router
 from app.userdashboard.router        import router as userdashboard_router
-from app.userreview.router           import router as userreview_router
+from app.userquery.router            import router as userquery_router
 from app.sendemail.router            import router as email_router
 from app.newsletter.router           import router as newsletter_router
 from app.speech.router               import router as speech_router
@@ -213,7 +213,7 @@ from app.payment.router              import router as payment_router
 for _router in (
     auth_router, connect_router, blog_router, brand_router, category_router,
     coupons_router, deliverycharge_router, mdm_router, productvariant_router,
-    pvd_router, userdashboard_router, userreview_router, email_router,
+    pvd_router, userdashboard_router, userquery_router, email_router,
     address_router, cart_router, common_router, country_router, cupsize_router,
     fabric_router, fileupload_router, integrationlocation_router, invoice_router,
     menu_router, menuroleclaim_router, notification_router,

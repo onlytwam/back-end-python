@@ -227,25 +227,8 @@ def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
         for r in rows
     ]
 
-    # ── Surprise gift: inject physical_gift into shipment at ₹0 ─────────────
-    try:
-        from app.surprisegift.repository import get_order_gift_snapshot
-        gift_snap = get_order_gift_snapshot(db, order_id)
-        if gift_snap and gift_snap.giftType == "physical_gift":
-            items.append(EkartShipmentItem(
-                name=gift_snap.giftName,
-                sku=gift_snap.sku or f"GIFT-{gift_snap.giftRuleId}",
-                quantity=1,
-                price=0.0,
-                hsn_code=gift_snap.hsnCode,
-            ))
-            print(f"[Ekart] 🎁 Added physical gift '{gift_snap.giftName}' to manual shipment")
-        elif gift_snap and gift_snap.giftType == "physical_coupon":
-            print(f"[Ekart] 🎁 Physical coupon gift — packed by inventory, no ekart item added")
-    except Exception as _gexc:
-        print(f"[Ekart] ⚠️  Could not check surprise gift for order {order_id}: {_gexc}")
-
     return items
+
 
 
 def _build_return_address_from_db(db: Session) -> EkartAddress:
