@@ -200,6 +200,7 @@ from app.sms.router                  import template_router as sms_template_rout
 from app.sms.router                  import credential_router as sms_credential_router
 from app.billing.router               import router as billing_router
 from app.saleschannel.router         import router as saleschannel_router
+from app.surprisegift.router         import router as surprisegift_router   
 
 # ── Ekart Logistics Integration ───────────────────────────────────────────────
 from app.ekart.router                import router as ekart_router
@@ -223,7 +224,7 @@ for _router in (
     userrole_router, wishlist_router, bulkimport_router,
     newsletter_router, billing_router,saleschannel_router,
     ekart_router, ekart_webhook_router,
-    payment_router, sms_template_router, sms_credential_router, speech_router,
+    payment_router, sms_template_router, sms_credential_router, speech_router,surprisegift_router,
 ):
     app.include_router(_router)
 

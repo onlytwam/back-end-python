@@ -34,45 +34,118 @@ def _safe(db: Session, sql: str, params: dict = {}):
 
 
 def get_order_report(db: Session, filters, page_index, page_size):
-    rows = _safe(db, """
+    # Extract filters
+    channel = (filters or {}).get("channel")
+
+    channel_filter = 'AND bo."Channel" = :channel' if channel else ''
+    params = {"channel": channel} if channel else {}
+
+    rows = _safe(db, f"""
         SELECT 
             o."OrderId",
             o."OrderNumber",
-            o."CreatedDate" AS "OrderDate",
+            o."CreatedDate"                         AS "OrderDate",
             o."PaymentMethod",
             o."State",
-            -- Concatenate all product names
-            STRING_AGG(p."Name", ', ') AS "ProductName",
-            -- Sum quantities across all items
-            SUM(oi."Quantity") AS "Quantity",
-            -- Total amount per order
-            SUM(oi."Quantity" * pvd."FinalPrice") AS "TotalAmount",
-            -- Window functions on aggregated data
-            COUNT(o."OrderId") OVER() AS "TotalOrders",
+
+            -- Product info from OrderItems
+            STRING_AGG(DISTINCT p."Name", ', ')     AS "ProductName",
+            SUM(oi."Quantity")                      AS "Quantity",
+            SUM(oi."Quantity" * pvd."FinalPrice")   AS "TotalAmount",
+
+            -- Billing info
+            bo."InvoiceNo",
+            bo."CustomerName",
+            bo."CustomerPhone",
+            bo."Channel",
+            bo."GSTMode",
+            bo."GrandTotal",
+            bo."Discount",
+            bo."ReceivedAmount",
+            bo."Balance",
+            bo."CGSTTotal",
+            bo."SGSTTotal",
+            bo."IGSTTotal",
+            bo."GSTTotal",
+
+            -- Window functions
+            COUNT(o."OrderId") OVER()               AS "TotalOrders",
             SUM(SUM(oi."Quantity" * pvd."FinalPrice")) OVER() AS "TotalRevenue"
+
         FROM twam."Orders" o
-        LEFT JOIN twam."OrderItems" oi 
-            ON oi."OrderId" = o."OrderId" 
+
+        LEFT JOIN twam."OrderItems" oi
+            ON oi."OrderId" = o."OrderId"
             AND oi."DeletedInd" = false
-        LEFT JOIN twam."ProductVariantDetail" pvd 
+        LEFT JOIN twam."ProductVariantDetail" pvd
             ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
-        LEFT JOIN twam."ProductVariants" pv 
+        LEFT JOIN twam."ProductVariants" pv
             ON pv."ProductVariantId" = pvd."ProductVariantId"
-        LEFT JOIN twam."Products" p 
+        LEFT JOIN twam."Products" p
             ON p."ProductId" = pv."ProductId"
+
+        -- Billing joins
+        LEFT JOIN twam."BillingOrders" bo
+            ON bo."OrderId" = o."OrderId"
+        LEFT JOIN twam."BillingOrderItems" boi
+            ON boi."OrderId" = o."OrderId"
+
         WHERE o."DeletedInd" = false
+        {channel_filter}
+
         GROUP BY 
             o."OrderId",
             o."OrderNumber",
             o."CreatedDate",
             o."PaymentMethod",
-            o."State"
+            o."State",
+            bo."InvoiceNo",
+            bo."CustomerName",
+            bo."CustomerPhone",
+            bo."Channel",
+            bo."GSTMode",
+            bo."GrandTotal",
+            bo."Discount",
+            bo."ReceivedAmount",
+            bo."Balance",
+            bo."CGSTTotal",
+            bo."SGSTTotal",
+            bo."IGSTTotal",
+            bo."GSTTotal"
+
         ORDER BY o."CreatedDate" DESC
-    """)
-    print("Total rows returned:", len(rows))
-    print("First row:", rows[0] if rows else "EMPTY")
+    """, params)
+
     return _paginate(rows, page_index, page_size)
 
+
+def get_order_report_channels(db: Session):
+    rows = _safe(db, """
+        SELECT DISTINCT "Channel"
+        FROM twam."BillingOrders"
+        WHERE "Channel" IS NOT NULL
+        ORDER BY "Channel"
+    """)
+    print("rows:", rows)          # see what _safe actually returns
+    print("type:", type(rows))    # confirm it's a list and not None
+    if not rows:
+        return []
+    print("first row:", rows[0])  # see what a single row looks like
+    print("first row type:", type(rows[0]))
+    return [r["Channel"] for r in rows]
+def get_available_order_dates(db: Session, channel: str = None) -> list[str]:
+    where = ['o."DeletedInd" = false']
+    if channel:
+        where.append(f"o.\"Channel\" ILIKE '{channel}'")
+
+    rows = _safe(db, f"""
+        SELECT DISTINCT
+            TO_CHAR(o."OrderDate", 'YYYY-MM-DD') AS "date"
+        FROM twam."Orders" o
+        WHERE {" AND ".join(where)}
+        ORDER BY "date" ASC
+    """)
+    return [r["date"] for r in rows if r.get("date")]
 
 # repository
 # repository.py — remove ALL inline -- comments from SQL
@@ -184,19 +257,47 @@ def get_products_category_report(db, type_val, id_val, from_date, to_date, filte
         return _paginate([], page_index, page_size)
     
 def get_sales_by_region(db: Session, filters, page_index, page_size):
-    rows = _safe(db, """
-        SELECT 
-            COALESCE(o."State", 'Unknown')          AS "Region",
-            COUNT(DISTINCT o."OrderId")              AS "TotalOrders",
-            COUNT(DISTINCT o."UserProfileId")        AS "Customers",
-            COALESCE(SUM(oi."Quantity"), 0)                                           AS "unitsSold",
-            COALESCE(SUM(o."TotalAmount"), 0)        AS "GrossRevenue",
-            COALESCE(SUM(o."SubTotal"),    0)        AS "TaxableValue",
-            COALESCE(SUM(o."TaxAmount"),   0)        AS "GSTAmount"
+    # ── Guard: treat None or missing filters as empty dict ──
+    if filters is None:
+        filters = {}
+
+    where_clauses = ['o."DeletedInd" = false']
+
+    from_date = filters.get("fromDate")
+    to_date   = filters.get("toDate")
+    city      = filters.get("city")
+    state     = filters.get("state")
+
+    if from_date:
+        where_clauses.append(f"o.\"OrderDate\" >= '{from_date}'")
+    if to_date:
+        where_clauses.append(f"o.\"OrderDate\" <= '{to_date} 23:59:59'")
+    if city:
+        where_clauses.append(f"a.\"City\" ILIKE '{city}'")
+    if state:
+        where_clauses.append(f"a.\"StateId\" = {state}")
+
+    where_sql = " AND ".join(where_clauses)
+
+    rows = _safe(db, f"""
+        SELECT
+            COALESCE(a."City", 'Unknown')               AS "Region",
+            COUNT(DISTINCT o."OrderId")                  AS "TotalOrders",
+            COUNT(DISTINCT o."UserProfileId")            AS "Customers",
+            COALESCE(SUM(oi."Quantity"), 0)              AS "unitsSold",
+            COALESCE(SUM(o."TotalAmount"), 0)            AS "GrossRevenue",
+            COALESCE(SUM(o."SubTotal"),    0)            AS "TaxableValue",
+            COALESCE(SUM(o."TaxAmount"),   0)            AS "GSTAmount"
         FROM twam."Orders" o
-        LEFT JOIN twam."OrderItems" oi ON oi."OrderId" = o."OrderId" AND oi."DeletedInd" = false
-        WHERE o."DeletedInd" = false
-        GROUP BY o."State"
+        LEFT JOIN twam."Address" a
+            ON  a."UserProfileId" = o."UserProfileId"
+            AND a."IsDefault"     = true
+            AND a."DeletedInd"    = false
+        LEFT JOIN twam."OrderItems" oi
+            ON  oi."OrderId"    = o."OrderId"
+            AND oi."DeletedInd" = false
+        WHERE {where_sql}
+        GROUP BY a."City"
         ORDER BY SUM(o."TotalAmount") DESC NULLS LAST
     """)
     return _paginate(rows, page_index, page_size)
@@ -246,16 +347,181 @@ def get_sales_by_platform(db: Session, filters, page_index, page_size):
 
 
 def get_coupon_usage_report(db: Session, filters, page_index, page_size):
-    rows = _safe(db, """
-        SELECT c."CouponCode", c."DiscountType", c."DiscountValue",
-               COUNT(o."OrderId") AS "TimesUsed",
-               SUM(o."DiscountAmount") AS "TotalDiscount"
-        FROM twam."Coupons" c
-        LEFT JOIN twam."Orders" o ON o."CouponCode" = c."CouponCode" AND o."DeletedInd"=false
-        WHERE c."DeletedInd"=false
-        GROUP BY c."CouponCode", c."DiscountType", c."DiscountValue"
-        ORDER BY "TimesUsed" DESC NULLS LAST
-    """)
+    if filters is None:
+        filters = {}
+
+    from_date  = filters.get("fromDate")
+    to_date    = filters.get("toDate")
+    org_id     = filters.get("organizationId")
+    report_type = filters.get("type", "all")   # "coupon" | "gift" | "all"
+
+    # ── Date clause builder ───────────────────────────────────────────────────
+    def date_clauses(table_alias: str) -> str:
+        parts = []
+        if from_date:
+            parts.append(f'{table_alias}."OrderDate" >= \'{from_date}\'')
+        if to_date:
+            parts.append(f'{table_alias}."OrderDate" <= \'{to_date} 23:59:59\'')
+        return (" AND " + " AND ".join(parts)) if parts else ""
+
+    def org_clause_coupons(table_alias: str) -> str:
+        if org_id:
+            return f' AND {table_alias}."OrganizationId" = {org_id}'
+        return ""
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 1 — Digital Coupons (coupons.Coupons → twam.Orders via CouponId)
+    # ─────────────────────────────────────────────────────────────────────────
+    coupon_sql = f"""
+        SELECT
+            'coupon'                                    AS "ReportType",
+            c."CouponCode"                              AS "Code",
+            c."CouponName"                              AS "Name",
+            c."Description"                             AS "Description",
+            c."Discount"                                AS "DiscountValue",
+            NULL                                        AS "GiftType",
+            c."CouponType"                              AS "SubType",
+            c."StartDate"                               AS "StartDate",
+            c."EndDate"                                 AS "EndDate",
+            c."IsActive"                                AS "IsActive",
+            COUNT(o."OrderId")                          AS "TimesUsed",
+            COALESCE(SUM(o."CouponAmount"), 0)          AS "TotalDiscount",
+            COALESCE(SUM(o."TotalAmount"), 0)           AS "TotalRevenue",
+            NULL                                        AS "SKU",
+            NULL                                        AS "HSNCode",
+            NULL                                        AS "Weight"
+        FROM coupons."Coupons" c
+        LEFT JOIN twam."Orders" o
+            ON  o."CouponId"    = c."CouponId"
+            AND o."DeletedInd"  = false
+            {date_clauses('o')}
+        WHERE c."DeletedInd" = false
+          {org_clause_coupons('c')}
+        GROUP BY
+            c."CouponCode", c."CouponName", c."Description",
+            c."Discount", c."CouponType",
+            c."StartDate", c."EndDate", c."IsActive"
+    """
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 2 — Physical Coupons (coupons.PhysicalCoupons — scratch-card style)
+    # ─────────────────────────────────────────────────────────────────────────
+#     physical_coupon_sql = f"""
+#         SELECT
+#             'physical_coupon'                           AS "ReportType",
+#             pc."CouponCode"                             AS "Code",
+#             pc."Description"                            AS "Name",
+#             pc."Description"                            AS "Description",
+#             pc."Discount"                               AS "DiscountValue",
+#             NULL                                        AS "GiftType",
+#             'physical_coupon'                           AS "SubType",
+#             NULL                                        AS "StartDate",
+#             NULL                                        AS "EndDate",
+#             CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
+#             CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
+#             CASE WHEN pc."IsUsed" THEN pc."Discount"
+#                  ELSE 0 END                             AS "TotalDiscount",
+#             0                                           AS "TotalRevenue",
+#             NULL                                        AS "SKU",
+#             NULL                                        AS "HSNCode",
+#             NULL                                        AS "Weight"
+#         FROM coupons."PhysicalCoupons" pc
+#         WHERE 1=1
+     
+#         {f"""AND pc."OrganizationId" = {org_id}""" if org_id else ''}
+#         {f"""AND pc."UsedAt" >= '{from_date}'""" if from_date else ''}
+#         {f"""AND pc."UsedAt" <= '{to_date} 23:59:59'""" if to_date else ''}
+#     """
+#    #   {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
+#         #   {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
+#         #   {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
+
+    physical_coupon_sql = f"""
+        SELECT
+            'physical_coupon'                           AS "ReportType",
+            pc."CouponCode"                             AS "Code",
+            pc."Description"                            AS "Name",
+            pc."Description"                            AS "Description",
+            pc."Discount"                               AS "DiscountValue",
+            NULL                                        AS "GiftType",
+            'physical_coupon'                           AS "SubType",
+            NULL                                        AS "StartDate",
+            NULL                                        AS "EndDate",
+            CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
+            CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
+            CASE WHEN pc."IsUsed" THEN pc."Discount"
+                ELSE 0 END                             AS "TotalDiscount",
+            0                                           AS "TotalRevenue",
+            NULL                                        AS "SKU",
+            NULL                                        AS "HSNCode",
+            NULL                                        AS "Weight"
+        FROM coupons."PhysicalCoupons" pc
+        WHERE 1=1
+
+        {'AND pc."OrganizationId" = ' + str(org_id) if org_id else ''}
+        {'AND pc."UsedAt" >= ' + "'" + str(from_date) + "'" if from_date else ''}
+        {'AND pc."UsedAt" <= ' + "'" + str(to_date) + " 23:59:59'" if to_date else ''}
+    """
+    # ─────────────────────────────────────────────────────────────────────────
+    # PART 3 — Surprise Gifts (twam.OrderSurpriseGift + SurpriseGiftRule)
+    # ─────────────────────────────────────────────────────────────────────────
+    gift_sql = f"""
+        SELECT
+            'surprise_gift'                             AS "ReportType",
+            r."SKU"                                     AS "Code",
+            r."GiftName"                                AS "Name",
+            r."GiftDescription"                         AS "Description",
+            0                                           AS "DiscountValue",
+            r."GiftType"                                AS "GiftType",
+            r."GiftType"                                AS "SubType",
+            NULL                                        AS "StartDate",
+            NULL                                        AS "EndDate",
+            r."IsActive"                                AS "IsActive",
+            COUNT(osg."OrderSurpriseGiftId")            AS "TimesUsed",
+            0                                           AS "TotalDiscount",
+            COALESCE(SUM(o."TotalAmount"), 0)           AS "TotalRevenue",
+            r."SKU"                                     AS "SKU",
+            r."HSNCode"                                 AS "HSNCode",
+            r."Weight"                                  AS "Weight"
+        FROM twam."SurpriseGiftRule" r
+        LEFT JOIN twam."OrderSurpriseGift" osg
+            ON  osg."GiftRuleId"  = r."GiftRuleId"
+            AND osg."DeletedInd"  = false
+        LEFT JOIN twam."Orders" o
+            ON  o."OrderId"       = osg."OrderId"
+            AND o."DeletedInd"    = false
+            {date_clauses('o')}
+        WHERE r."DeletedInd" = false
+          {f'AND r."OrganizationId" = {org_id}' if org_id else ''}
+        GROUP BY
+            r."GiftRuleId", r."SKU", r."GiftName", r."GiftDescription",
+            r."GiftType", r."IsActive", r."HSNCode", r."Weight"
+    """
+
+    # ── Combine based on filter type ─────────────────────────────────────────
+    if report_type == "coupon":
+        final_sql = f"""
+            SELECT * FROM ({coupon_sql}) coupon_data
+            UNION ALL
+            SELECT * FROM ({physical_coupon_sql}) phys_data
+            ORDER BY "TimesUsed" DESC NULLS LAST
+        """
+    elif report_type == "gift":
+        final_sql = f"""
+            SELECT * FROM ({gift_sql}) gift_data
+            ORDER BY "TimesUsed" DESC NULLS LAST
+        """
+    else:  # "all" — default
+        final_sql = f"""
+            SELECT * FROM ({coupon_sql}) coupon_data
+            UNION ALL
+            SELECT * FROM ({physical_coupon_sql}) phys_data
+            UNION ALL
+            SELECT * FROM ({gift_sql}) gift_data
+            ORDER BY "TimesUsed" DESC NULLS LAST
+        """
+
+    rows = _safe(db, final_sql)
     return _paginate(rows, page_index, page_size)
 
 
@@ -365,12 +631,22 @@ def get_order_summary(db: Session, filters, page_index, page_size):
 
 def get_order_shipping_status(db: Session, filters, page_index, page_size):
     rows = _safe(db, """
-        SELECT o."OrderId", o."CreatedDate", o."State" AS "OrderState",
-               s."TrackingNumber", s."ShipmentStatus", s."CourierName",
-               s."EstimatedDeliveryDate"
+        SELECT o."OrderId",
+               o."CreatedDate",
+               o."State"        AS "OrderState",
+               s."TrackingId"   AS "TrackingNumber",
+               s."State"        AS "ShipmentStatus",
+               s."PaymentMode",
+               s."TotalAmount"  AS "ShipmentAmount",
+               s."Quantity",
+               s."InvoiceNumber",
+               s."InvoiceDate"
         FROM twam."Orders" o
-        LEFT JOIN shipment."Shipment" s ON s."OrderId" = o."OrderId" AND s."DeletedInd"=false
-        WHERE o."DeletedInd"=false ORDER BY o."CreatedDate" DESC
+        LEFT JOIN shipment."Shipment" s
+               ON s."OrderId" = o."OrderId"
+              AND s."DeletedInd" = false
+        WHERE o."DeletedInd" = false
+        ORDER BY o."CreatedDate" DESC
     """)
     return _paginate(rows, page_index, page_size)
 
@@ -430,25 +706,41 @@ def get_payment_method_usage(db: Session, filters, page_index, page_size):
     return _paginate(rows, page_index, page_size)
 
 
-def get_return_rate_reason(db: Session, filters, page_index, page_size):
-    rows = _safe(db, """
-        SELECT ori."ReturnReason", COUNT(ori."ReturnInfoId") AS "TotalReturns",
+def get_return_rate_reason(db, filters, page_index, page_size):
+    sql = """
+        SELECT ori."Reason" AS "ReturnReason", 
+               COUNT(*) AS "TotalReturns",
                SUM(o."TotalAmount") AS "ReturnValue"
         FROM twam."OrderReturnInfo" ori
         LEFT JOIN twam."Orders" o ON o."OrderId" = ori."OrderId"
-        WHERE ori."DeletedInd"=false
-        GROUP BY ori."ReturnReason" ORDER BY "TotalReturns" DESC
-    """)
+        WHERE ori."DeletedInd" = false
+        GROUP BY ori."Reason" 
+        ORDER BY "TotalReturns" DESC
+    """
+    rows = db.execute(text(sql)).mappings().all()
+    rows = [dict(r) for r in rows]
     return _paginate(rows, page_index, page_size)
 
 
 def get_failed_payment_report(db: Session, filters, page_index, page_size):
     rows = _safe(db, """
-        SELECT o."OrderId", o."CreatedDate", o."TotalAmount",
-               o."PaymentMethod", o."PaymentStatus", o."State"
+        SELECT 
+            o."OrderId",
+            o."CreatedDate",
+            o."TotalAmount",
+            o."PaymentMethod",
+            CASE r."PaymentStatus"
+                WHEN 0 THEN 'Failed'
+                WHEN 1 THEN 'Approved'
+                WHEN 2 THEN 'Pending'
+                ELSE 'Unknown'
+            END AS "PaymentStatus",
+            o."State"
         FROM twam."Orders" o
-        WHERE o."DeletedInd"=false
-          AND o."PaymentStatus" IN ('Failed', 'Pending', 'Cancelled')
+        INNER JOIN payment."OrderRefund" r ON r."OrderId" = o."OrderId"
+        WHERE o."DeletedInd" = false
+          AND r."DeletedInd" = false
+          AND r."PaymentStatus" IN (0, 2)
         ORDER BY o."CreatedDate" DESC
     """)
     return _paginate(rows, page_index, page_size)
@@ -456,14 +748,15 @@ def get_failed_payment_report(db: Session, filters, page_index, page_size):
 
 def get_tax_by_region(db: Session, filters, page_index, page_size):
     rows = _safe(db, """
-        SELECT a."State" AS "Region",
-               SUM(i."TaxAmount") AS "TotalTax",
-               COUNT(DISTINCT i."InvoiceId") AS "InvoiceCount"
-        FROM twam."Invoice" i
-        LEFT JOIN twam."Orders" o ON o."OrderId" = i."OrderId"
-        LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
-        WHERE i."DeletedInd"=false
-        GROUP BY a."State" ORDER BY "TotalTax" DESC NULLS LAST
+        SELECT 
+            o."State" AS "Region",
+            SUM(o."TaxAmount") AS "TotalTax",
+            COUNT(DISTINCT i."InvoiceId") AS "InvoiceCount"
+        FROM twam."Orders" o
+        LEFT JOIN twam."Invoice" i ON i."OrderId" = o."OrderId"
+        WHERE o."DeletedInd" = false
+        GROUP BY o."State" 
+        ORDER BY "TotalTax" DESC NULLS LAST
     """)
     return _paginate(rows, page_index, page_size)
 
@@ -557,54 +850,56 @@ def get_customer_acquisition_report(db: Session, filters, page_index, page_size)
     group_by   = filters.get("group_by", "month")
     start_date = filters.get("start_date") or None
     end_date   = filters.get("end_date")   or None
-
+ 
     trunc_map = {"day": "day", "week": "week", "month": "month", "year": "year"}
     trunc = trunc_map.get(group_by, "month")
-
+ 
     start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '1 year')::date"
     end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
-
+ 
     params: dict = {}
     if start_date: params["start_date"] = start_date
     if end_date:   params["end_date"]   = end_date
-
+ 
     rows = _safe(db, f"""
         SELECT
-            DATE_TRUNC('{trunc}', u."CreatedDate")                          AS "Period",
-            COUNT(u."UserId")                                                AS "NewCustomers",
-            COUNT(u."UserId") FILTER (WHERE u."EmailConfirmed" = true)      AS "VerifiedCustomers",
-            SUM(COUNT(u."UserId")) OVER ()                                   AS "TotalNewCustomers"
-        FROM auth."Users" u
+            DATE_TRUNC('{trunc}', u."CreatedDate")                               AS "Period",
+            COUNT(u."Id")                                                          AS "NewCustomers",
+            COUNT(u."Id") FILTER (WHERE u."EmailConfirmed" = true)               AS "VerifiedCustomers",
+            SUM(COUNT(u."Id")) OVER ()                                             AS "TotalNewCustomers"
+        FROM auth."IdentityUser" u
         WHERE u."DeletedInd" = false
+          AND u."UserRoleId" = 2
           AND u."CreatedDate" >= {start_expr}
           AND u."CreatedDate" <= {end_expr}
-          AND u."RoleId" = 2
         GROUP BY DATE_TRUNC('{trunc}', u."CreatedDate")
         ORDER BY "Period" DESC
     """, params)
-
+ 
     return _paginate(rows, page_index, page_size)
  
  
 def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
-    """
-    Splits customers in a date window into new (first ever order) vs repeat.
-    Filters accepted: start_date, end_date
-    """
-    start_date = (filters or {}).get("start_date", (
-        "NOW() - INTERVAL '90 days'"
-    ))
-    end_date = (filters or {}).get("end_date", "NOW()")
+    filters    = filters or {}
+    start_date = filters.get("start_date") or None
+    end_date   = filters.get("end_date")   or None
  
-    rows = _safe(db, """
+    start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '90 days')::date"
+    end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
+ 
+    params: dict = {}
+    if start_date: params["start_date"] = start_date
+    if end_date:   params["end_date"]   = end_date
+ 
+    rows = _safe(db, f"""
         WITH period_orders AS (
             SELECT
                 o."UserId",
                 MIN(o."CreatedDate") AS "FirstInPeriod"
             FROM twam."Orders" o
             WHERE o."DeletedInd" = false
-              AND o."CreatedDate" >= :start_date ::date
-              AND o."CreatedDate" <= :end_date   ::date
+              AND o."CreatedDate" >= {start_expr}
+              AND o."CreatedDate" <= {end_expr}
             GROUP BY o."UserId"
         ),
         all_time_first AS (
@@ -619,7 +914,7 @@ def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
             SELECT
                 p."UserId",
                 CASE
-                    WHEN a."FirstEver" >= :start_date ::date THEN 'New'
+                    WHEN a."FirstEver" >= {start_expr} THEN 'New'
                     ELSE 'Repeat'
                 END AS "CustomerType"
             FROM period_orders p
@@ -627,42 +922,39 @@ def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
         )
         SELECT
             "CustomerType",
-            COUNT("UserId")                              AS "CustomerCount",
-            ROUND(COUNT("UserId") * 100.0 / SUM(COUNT("UserId")) OVER (), 2) AS "Percentage",
-            SUM(COUNT("UserId")) OVER ()                 AS "TotalCustomers"
+            COUNT("UserId")                                                        AS "CustomerCount",
+            ROUND(COUNT("UserId") * 100.0 / NULLIF(SUM(COUNT("UserId")) OVER (), 0), 2) AS "Percentage",
+            SUM(COUNT("UserId")) OVER ()                                           AS "TotalCustomers"
         FROM classified
         GROUP BY "CustomerType"
         ORDER BY "CustomerCount" DESC
-    """, {"start_date": start_date, "end_date": end_date})
+    """, params)
  
     return _paginate(rows, page_index, page_size)
  
  
 def get_customer_lifetime_value(db: Session, filters, page_index, page_size):
-    """
-    CLV per customer: total revenue, avg order value, order count, days active.
-    Filters accepted: min_orders (default 1), top_n (default 20)
-    """
     min_orders = int((filters or {}).get("min_orders", 1))
-    top_n = int((filters or {}).get("top_n", 20))
+    top_n      = int((filters or {}).get("top_n", 20))
  
     rows = _safe(db, """
         SELECT
-            u."UserId",
-            u."Name"                                          AS "CustomerName",
+            u."Id"                                                                 AS "UserId",
+            TRIM(COALESCE(u."FirstName", '') || ' ' || COALESCE(u."LastName", '')) AS "CustomerName",
             u."Email",
-            u."MobileNumber"                                  AS "Phone",
-            COUNT(o."OrderId")                                AS "OrderCount",
-            SUM(o."TotalAmount")                              AS "TotalRevenue",
-            ROUND(AVG(o."TotalAmount"), 2)                    AS "AvgOrderValue",
-            MIN(o."CreatedDate")::date                        AS "FirstOrderDate",
-            MAX(o."CreatedDate")::date                        AS "LastOrderDate",
-            EXTRACT(DAY FROM NOW() - MIN(o."CreatedDate"))    AS "DaysAsCustomer"
-        FROM auth."Users" u
-        JOIN twam."Orders" o ON o."UserId" = u."UserId" AND o."DeletedInd" = false
+            u."PhoneNumber"                                                        AS "Phone",
+            COUNT(o."OrderId")                                                     AS "OrderCount",
+            SUM(o."TotalAmount")                                                   AS "TotalRevenue",
+            ROUND(AVG(o."TotalAmount"), 2)                                         AS "AvgOrderValue",
+            MIN(o."OrderDate")::date                                               AS "FirstOrderDate",
+            MAX(o."OrderDate")::date                                               AS "LastOrderDate",
+            EXTRACT(DAY FROM NOW() - MIN(o."OrderDate"))                           AS "DaysAsCustomer"
+        FROM auth."IdentityUser" u
+        JOIN twam."Orders" o ON o."UserProfileId" = u."Id" AND o."DeletedInd" = false
         WHERE u."DeletedInd" = false
+          AND u."UserRoleId" = 2
           AND o."State" NOT IN ('Cancelled', 'Returned')
-        GROUP BY u."UserId", u."Name", u."Email", u."MobileNumber"
+        GROUP BY u."Id", u."FirstName", u."LastName", u."Email", u."PhoneNumber"
         HAVING COUNT(o."OrderId") >= :min_orders
         ORDER BY "TotalRevenue" DESC
         LIMIT :top_n
@@ -672,36 +964,28 @@ def get_customer_lifetime_value(db: Session, filters, page_index, page_size):
  
  
 def get_customer_segmentation(db: Session, filters, page_index, page_size):
-    """
-    Returns three segmentation breakdowns in one call:
-      by_location, by_spending_tier, by_frequency.
-    The 'segment_by' filter controls which view: location | spending | frequency
-    Filters accepted: segment_by (default: location)
-    """
     segment_by = (filters or {}).get("segment_by", "location")
- 
+
     if segment_by == "spending":
         rows = _safe(db, """
             SELECT
                 CASE
-                    WHEN SUM(o."TotalAmount") >= 10000 THEN 'High (≥10k)'
-                    WHEN SUM(o."TotalAmount") >= 2000  THEN 'Mid (2k–10k)'
+                    WHEN total >= 10000 THEN 'High (≥10k)'
+                    WHEN total >= 2000  THEN 'Mid (2k–10k)'
                     ELSE 'Low (<2k)'
-                END                        AS "SpendingTier",
-                COUNT(DISTINCT o."UserId") AS "CustomerCount"
-            FROM twam."Orders" o
-            WHERE o."DeletedInd" = false
-              AND o."State" NOT IN ('Cancelled', 'Returned')
-            GROUP BY o."UserId"
-            -- Wrap in outer query to group the tiers
+                END                AS "SpendingTier",
+                COUNT(*)           AS "CustomerCount"
+            FROM (
+                SELECT o."UserProfileId", SUM(o."TotalAmount") AS total
+                FROM twam."Orders" o
+                WHERE o."DeletedInd" = false
+                  AND o."State" NOT IN ('Cancelled', 'Returned')
+                GROUP BY o."UserProfileId"
+            ) sub
+            GROUP BY 1
+            ORDER BY "CustomerCount" DESC
         """)
-        # Reaggregate tiers in Python since SQL can't GROUP BY a CASE on aggregated subquery easily
-        from collections import defaultdict
-        tier_map = defaultdict(int)
-        for r in rows:
-            tier_map[r["SpendingTier"]] += 1
-        rows = [{"SpendingTier": t, "CustomerCount": c} for t, c in tier_map.items()]
- 
+
     elif segment_by == "frequency":
         rows = _safe(db, """
             SELECT
@@ -709,71 +993,66 @@ def get_customer_segmentation(db: Session, filters, page_index, page_size):
                     WHEN "OrderCount" >= 10 THEN 'Frequent (10+)'
                     WHEN "OrderCount" >= 3  THEN 'Occasional (3–9)'
                     ELSE 'One-time (1–2)'
-                END                AS "FrequencySegment",
-                COUNT("UserId")    AS "CustomerCount"
+                END                        AS "FrequencySegment",
+                COUNT("UserProfileId")     AS "CustomerCount"
             FROM (
-                SELECT o."UserId", COUNT(o."OrderId") AS "OrderCount"
+                SELECT o."UserProfileId", COUNT(o."OrderId") AS "OrderCount"
                 FROM twam."Orders" o
                 WHERE o."DeletedInd" = false
                   AND o."State" NOT IN ('Cancelled', 'Returned')
-                GROUP BY o."UserId"
+                GROUP BY o."UserProfileId"
             ) sub
             GROUP BY "FrequencySegment"
             ORDER BY "CustomerCount" DESC
         """)
+
     else:  # location (default)
         rows = _safe(db, """
             SELECT
-                COALESCE(a."State", 'Unknown')     AS "Location",
-                COUNT(DISTINCT o."UserId")          AS "CustomerCount",
-                SUM(o."TotalAmount")                AS "TotalRevenue",
-                COUNT(o."OrderId")                  AS "TotalOrders"
+                COALESCE(o."State", 'Unknown')          AS "Location",
+                COUNT(DISTINCT o."UserProfileId")        AS "CustomerCount",
+                SUM(o."TotalAmount")                     AS "TotalRevenue",
+                COUNT(o."OrderId")                       AS "TotalOrders"
             FROM twam."Orders" o
-            LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
             WHERE o."DeletedInd" = false
               AND o."State" NOT IN ('Cancelled', 'Returned')
-            GROUP BY a."State"
+            GROUP BY o."State"
             ORDER BY "CustomerCount" DESC
             LIMIT 20
         """)
- 
+
     return _paginate(rows, page_index, page_size)
  
  
 def get_customer_churn_rate(db: Session, filters, page_index, page_size):
-    """
-    Churn = customers who ordered in the analysis window but whose
-    last order is older than `inactive_days`.
-    Filters accepted: inactive_days (default 90), period_months (default 12)
-    """
     inactive_days = int((filters or {}).get("inactive_days", 90))
     period_months = int((filters or {}).get("period_months", 12))
  
     rows = _safe(db, """
         WITH active_customers AS (
-            SELECT DISTINCT o."UserId"
+            SELECT DISTINCT o."UserProfileId"
             FROM twam."Orders" o
             WHERE o."DeletedInd" = false
-              AND o."CreatedDate" >= NOW() - (:period_months || ' months')::INTERVAL
+              AND o."OrderDate" >= NOW() - (:period_months || ' months')::INTERVAL
         ),
         last_order AS (
             SELECT
-                o."UserId",
-                MAX(o."CreatedDate") AS "LastOrderDate"
+                o."UserProfileId",
+                MAX(o."OrderDate") AS "LastOrderDate"
             FROM twam."Orders" o
             WHERE o."DeletedInd" = false
-              AND o."UserId" IN (SELECT "UserId" FROM active_customers)
-            GROUP BY o."UserId"
+              AND o."UserProfileId" IN (SELECT "UserProfileId" FROM active_customers)
+            GROUP BY o."UserProfileId"
         )
         SELECT
-            EXTRACT(YEAR  FROM "LastOrderDate")::int    AS "Year",
-            EXTRACT(MONTH FROM "LastOrderDate")::int    AS "Month",
-            COUNT("UserId")                              AS "ChurnedCustomers",
-            (SELECT COUNT(*) FROM active_customers)      AS "TotalActiveCustomers",
+            EXTRACT(YEAR  FROM "LastOrderDate")::int               AS "Year",
+            EXTRACT(MONTH FROM "LastOrderDate")::int               AS "Month",
+            COUNT("UserProfileId")                                  AS "ChurnedCustomers",
+            (SELECT COUNT(*) FROM active_customers)                 AS "TotalActiveCustomers",
             ROUND(
-                COUNT("UserId") * 100.0 /
+                COUNT("UserProfileId") * 100.0 /
                 NULLIF((SELECT COUNT(*) FROM active_customers), 0), 2
-            )                                            AS "ChurnRatePct"
+            )                                                       AS "ChurnRatePct"
         FROM last_order
         WHERE "LastOrderDate" < NOW() - (:inactive_days || ' days')::INTERVAL
         GROUP BY "Year", "Month"
@@ -784,39 +1063,122 @@ def get_customer_churn_rate(db: Session, filters, page_index, page_size):
  
  
 def get_top_customers_by_revenue(db: Session, filters, page_index, page_size):
-    """
-    Revenue leaderboard with rank, revenue share %, and last order date.
-    Filters accepted: start_date, end_date, top_n (default 10)
-    """
-    start_date = (filters or {}).get("start_date", "NOW() - INTERVAL '1 year'")
-    end_date = (filters or {}).get("end_date", "NOW()")
-    top_n = int((filters or {}).get("top_n", 10))
+    filters    = filters or {}
+    start_date = filters.get("start_date") or None
+    end_date   = filters.get("end_date")   or None
+    top_n      = int(filters.get("top_n", 10))
  
-    rows = _safe(db, """
+    start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '1 year')::date"
+    end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
+ 
+    params: dict = {"top_n": top_n}
+    if start_date: params["start_date"] = start_date
+    if end_date:   params["end_date"]   = end_date
+ 
+    rows = _safe(db, f"""
         SELECT
-            RANK() OVER (ORDER BY SUM(o."TotalAmount") DESC) AS "Rank",
-            u."UserId",
-            u."Name"                                          AS "CustomerName",
+            RANK() OVER (ORDER BY SUM(o."TotalAmount") DESC)                       AS "Rank",
+            u."Id"                                                                  AS "UserId",
+            TRIM(COALESCE(u."FirstName", '') || ' ' || COALESCE(u."LastName", '')) AS "CustomerName",
             u."Email",
-            u."MobileNumber"                                  AS "Phone",
-            COUNT(o."OrderId")                                AS "OrderCount",
-            SUM(o."TotalAmount")                              AS "TotalRevenue",
+            u."PhoneNumber"                                                         AS "Phone",
+            COUNT(o."OrderId")                                                      AS "OrderCount",
+            SUM(o."TotalAmount")                                                    AS "TotalRevenue",
             ROUND(
                 SUM(o."TotalAmount") * 100.0 /
                 NULLIF(SUM(SUM(o."TotalAmount")) OVER (), 0), 2
-            )                                                 AS "RevenueSharePct",
-            MAX(o."CreatedDate")::date                        AS "LastOrderDate",
-            SUM(SUM(o."TotalAmount")) OVER ()                 AS "GrandTotalRevenue"
-        FROM auth."Users" u
-        JOIN twam."Orders" o ON o."UserId" = u."UserId" AND o."DeletedInd" = false
+            )                                                                       AS "RevenueSharePct",
+            MAX(o."OrderDate")::date                                                AS "LastOrderDate",
+            SUM(SUM(o."TotalAmount")) OVER ()                                       AS "GrandTotalRevenue"
+        FROM auth."IdentityUser" u
+        JOIN twam."Orders" o ON o."UserProfileId" = u."Id" AND o."DeletedInd" = false
         WHERE u."DeletedInd" = false
+          AND u."UserRoleId" = 2
           AND o."State" NOT IN ('Cancelled', 'Returned')
-          AND o."CreatedDate" >= :start_date ::date
-          AND o."CreatedDate" <= :end_date   ::date
-        GROUP BY u."UserId", u."Name", u."Email", u."MobileNumber"
+          AND o."OrderDate" >= {start_expr}
+          AND o."OrderDate" <= {end_expr}
+        GROUP BY u."Id", u."FirstName", u."LastName", u."Email", u."PhoneNumber"
         ORDER BY "TotalRevenue" DESC
         LIMIT :top_n
-    """, {"start_date": start_date, "end_date": end_date, "top_n": top_n})
+    """, params)
+ 
+    return _paginate(rows, page_index, page_size)
+ 
+ 
+def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
+    filters    = filters or {}
+    start_date = filters.get("start_date") or None
+    end_date   = filters.get("end_date")   or None
+ 
+    date_filter = ""
+    params: dict = {}
+    if start_date:
+        date_filter += " AND o.\"OrderDate\" >= :start_date ::date"
+        params["start_date"] = start_date
+    if end_date:
+        date_filter += " AND o.\"OrderDate\" <= :end_date ::date"
+        params["end_date"] = end_date
+ 
+    rows = _safe(db, f"""
+        WITH customer_orders AS (
+            SELECT
+                o."UserProfileId",
+                COUNT(o."OrderId") AS "OrderCount"
+            FROM twam."Orders" o
+            WHERE o."DeletedInd" = false
+              AND o."State" NOT IN ('Cancelled', 'Returned')
+              {date_filter}
+            GROUP BY o."UserProfileId"
+        ),
+        classified AS (
+            SELECT
+                CASE WHEN "OrderCount" = 1 THEN 'New' ELSE 'Repeat' END AS "CustomerType",
+                COUNT(*) AS "CustomerCount"
+            FROM customer_orders
+            GROUP BY 1
+        )
+        SELECT
+            "CustomerType",
+            "CustomerCount",
+            ROUND("CustomerCount" * 100.0 / NULLIF(SUM("CustomerCount") OVER (), 0), 2) AS "Percentage",
+            SUM("CustomerCount") OVER () AS "TotalCustomers"
+        FROM classified
+        ORDER BY "CustomerType"
+    """, params)
+ 
+    return _paginate(rows, page_index, page_size)
+ 
+ 
+def get_customer_acquisition_report(db: Session, filters, page_index, page_size):
+    group_by = (filters or {}).get("group_by", "month")
+ 
+    trunc_map = {
+        "day":   "day",
+        "week":  "week",
+        "month": "month",
+        "year":  "year",
+    }
+    trunc = trunc_map.get(group_by, "month")
+ 
+    rows = _safe(db, f"""
+        WITH period_customers AS (
+            SELECT
+                DATE_TRUNC('{trunc}', u."CreatedDate")  AS "Period",
+                u."Id"                                   AS "UserId",
+                u."EmailConfirmed"                       AS "IsVerified"
+            FROM auth."IdentityUser" u
+            WHERE u."DeletedInd" = false
+              AND u."UserRoleId" = 2
+        )
+        SELECT
+            "Period",
+            COUNT("UserId")                          AS "NewCustomers",
+            COUNT("UserId") FILTER (WHERE "IsVerified" = true) AS "VerifiedCustomers",
+            SUM(COUNT("UserId")) OVER ()              AS "TotalNewCustomers"
+        FROM period_customers
+        GROUP BY "Period"
+        ORDER BY "Period" DESC
+    """)
  
     return _paginate(rows, page_index, page_size)
 

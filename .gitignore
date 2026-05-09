@@ -9,3 +9,4 @@ venv/
 uploads/
 image/
 *.zip
+azure-pipelines.yml
