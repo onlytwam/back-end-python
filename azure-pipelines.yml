@@ -1,12 +1,14 @@
 trigger:
   branches:
     include:
-      - feature/Eshwar                  # ✅ Merge → Build + Push + Deploy
+      - develop                    # ✅ merge → build + push + deploy
+      - backend-setup/Vishnu       # ✅ push → build only
+      - feature/*                  # ✅ any future feature branch → build only
 
 pr:
   branches:
     include:
-      - feature/Eshwar                  # ✅ PR raised → Build only
+      - develop                    # ✅ PR raised → build only, no push, no deploy
 
 pool:
   vmImage: ubuntu-latest
@@ -16,12 +18,12 @@ variables:
   containerRegistry: 'twamregistry.azurecr.io'
 
 steps:
-  # ✅ Always runs — both on PR and on merge
+  # ✅ Build only — runs on feature branch push AND PR raised
   - task: Docker@2
-    displayName: Build only (PR validation)
-    condition: eq(variables['Build.Reason'], 'PullRequest')
+    displayName: Build only (feature branch and PR validation)
+    condition: or(eq(variables['Build.Reason'], 'PullRequest'), and(ne(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.Reason'], 'IndividualCI')))
     inputs:
-      command: build             # ❌ No push on PR
+      command: build
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
@@ -30,12 +32,12 @@ steps:
         $(Build.BuildId)
       arguments: '--no-cache'
 
-  # ✅ Only runs on actual merge to develop
+  # ✅ Build + Push — runs ONLY on merge to develop
   - task: Docker@2
-    displayName: Build and Push to ACR (merge only)
-    condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    displayName: Build and Push to ACR (develop merge only)
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
     inputs:
-      command: buildAndPush      # ✅ Push to ACR only after merge
+      command: buildAndPush
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
@@ -44,10 +46,10 @@ steps:
         $(Build.BuildId)
       arguments: '--no-cache'
 
-  # ✅ Deploy only after successful push to ACR on merge
+  # ✅ Deploy — runs ONLY on merge to develop after successful push
   - task: AzureCLI@2
     displayName: Deploy to Container Apps
-    condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
     inputs:
       azureSubscription: twam-azure-connection
       scriptType: bash
