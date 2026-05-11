@@ -3,7 +3,8 @@ trigger:
     include:
       - develop                    # ✅ merge → build + push + deploy
       - backend-setup/Vishnu       # ✅ push → build only
-      - feature/*                  # ✅ any future feature branch → build only
+      - feature/* 
+      - backend/v2/mamatha                 # ✅ any future feature branch → build only
 
 pr:
   branches:
