@@ -23,7 +23,8 @@ def _to_dict(r: ProductReview) -> dict:
         "state":            r.state,
         "itemId":           r.itemId,
         # Return full URL if photo is a relative path, otherwise return as-is
-        "photo":            f"{BASE_URL}{r.photo}" if r.photo and not r.photo.startswith("http") else r.photo,
+        # "photo":            f"{BASE_URL}{r.photo}" if r.photo and not r.photo.startswith("http") else r.photo,
+        "photo":            r.photo,
         "createdDate":      r.createdDate,
         "modifiedDate":     r.modifiedDate,
     }
