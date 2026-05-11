@@ -65,7 +65,6 @@ def get_admin_order_list(
     Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
     Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
     db: Session = Depends(get_db),
-    # Only staff roles may access the admin order list
     _: CurrentUser = Depends(require_roles(
         Roles.SUPER_ADMIN, Roles.ORDER_MANAGER, Roles.CUSTOMER_SUPPORT,
         Roles.INVENTORY_MANAGER, Roles.PRODUCT_MANAGER,
@@ -79,7 +78,6 @@ def get_admin_order_list(
             elif f.get("property") == "endDate": ed = f.get("value")
             else: clean.append(f)
     return repository.get_admin_order_list(db, clean or None, Order_Ascending, Order_Property, Page_Index, Page_Size, sd, ed)
-
 
 @router.get("/GetReturnOrderItems", response_model=schemas.ReturnOrderItemsResponse)
 def get_return_order_items(

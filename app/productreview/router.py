@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from . import schemas, repository
 from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
+from app.shared.azure_storage import upload_image
 
 router = APIRouter(prefix="/api/ProductReview", tags=["ProductReview"])
 
@@ -29,19 +30,7 @@ def parse_filters(raw):
 
 
 def _save_photo(file: UploadFile) -> str:
-    """Save the uploaded photo to disk and return its relative path."""
-    if file.content_type not in ALLOWED_IMAGE_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported image type '{file.content_type}'. Allowed: jpeg, png, webp, gif."
-        )
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "jpg"
-    unique_name = f"{uuid.uuid4().hex}.{ext}"
-    disk_path = os.path.join(UPLOAD_DIR, unique_name)
-    with open(disk_path, "wb") as f:
-        f.write(file.file.read())
-    return f"/{UPLOAD_DIR}/{unique_name}"
+    return upload_image(file, container_key="reviews")
 
 
 # ---------------------------------------------------------------------------

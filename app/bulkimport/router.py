@@ -464,12 +464,32 @@ def _fetch_ref_data(db: Session) -> dict:
                  "cgst": float(r.CGST or 0), "sgst": float(r.SGST or 0)}
                 for r in hsn]
 
+
+    sizes = db.execute(text("""
+        SELECT "SizeId", "SizeLabel", "SizeCode"
+        FROM   mdm."Size"
+        WHERE  "IsActive" = true AND "DeletedInd" = false
+        ORDER  BY "OrderNo", "SizeLabel"
+    """))
+    size_rows = [{"id": r.SizeId, "label": r.SizeLabel, "code": r.SizeCode} for r in sizes]
+
+    cup_sizes = db.execute(text("""
+        SELECT "CupSizeId", "SizeLabel"
+        FROM   mdm."CupSize"
+        WHERE  "IsActive" = true AND "DeletedInd" = false
+        ORDER  BY "SizeLabel"
+    """))
+    cup_size_rows = [{"id": r.CupSizeId, "label": r.SizeLabel} for r in cup_sizes]
+
+
     return {
         "categories":      [r for r in cat_rows if not r["parent"]],
         "childCategories": [r for r in cat_rows if r["parent"]],
         "brands":          brand_rows,
         "fabrics":         fabric_rows,
         "hsnCodes":        hsn_rows,
+        "sizes":           size_rows,
+        "cupSizes":        cup_size_rows,
     }
 
 # ==============================================================================
@@ -512,8 +532,8 @@ _V_FIELDS: list[tuple[str, int, str, bool]] = [
 # Store OR Warehouse must be provided — enforced in parser
 _S_FIELDS: list[tuple[str, int, str, bool]] = [
     ("stockId",           16, "str",   False), # Q  Stock ID
-    ("sizeId",            17, "int",   True),  # R  Size ID*
-    ("cupSizeId",         18, "int",   False), # S  Cup Size ID
+    ("sizeName",            17, "str",   True),  # R  Size ID*
+    ("cupSizeName",         18, "str",   False), # S  Cup Size ID
     ("purchasePrice",     19, "int",   True),  # T  Purchase Price* (required)
     ("mrpPrice",          20, "float", True),  # U  MRP Price*
     ("finalPrice",        21, "float", True),  # V  Final Price*
@@ -639,8 +659,8 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
 
     _S_LABELS = {
         "stockId":           "Stock ID",
-        "sizeId":            "Size ID*",
-        "cupSizeId":         "Cup Size ID",
+        "sizeName":    "Size*",      
+        "cupSizeName": "Cup Size",
         "purchasePrice":     "Purchase Price*",
         "mrpPrice":          "MRP Price*",
         "finalPrice":        "Final Price*",
@@ -813,6 +833,14 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
     hsn_codes = _refs["hsnCodes"]
     _make_ref_sheet("HSN_REF", ["TaxHSNCodeId", "HSNCode", "CGST", "SGST"],
                     [[r["id"], r["code"], r["cgst"], r["sgst"]] for r in hsn_codes])
+    
+    sizes = _refs["sizes"]
+    _make_ref_sheet("SIZE_REF", ["SizeId", "SizeLabel"],
+                [[r["id"], r["label"]] for r in sizes])
+
+    cup_sizes = _refs["cupSizes"]
+    _make_ref_sheet("CUP_SIZE_REF", ["CupSizeId", "CupSizeLabel"],
+                    [[r["id"], r["label"]] for r in cup_sizes])
 
     # Store ref sheet
     ws_st = wb.create_sheet("STORES_REF")
@@ -854,6 +882,8 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
     brand_col      = get_column_letter(6 + 1)   # G  Brand
     fabric_col     = get_column_letter(10 + 1)  # K  Fabric
     hsn_col        = get_column_letter(15 + 1)  # P  HSN Code
+    size_col     = get_column_letter(17 + 1)   # R  Size
+    cup_size_col = get_column_letter(18 + 1)   # S  Cup Size
 
     _add_list_dv(cat_col,       "CAT_REF",       len(cats),        "Invalid Category",   "Select a category.")
     _add_list_dv(child_cat_col, "CHILD_CAT_REF", len(child_cats),  "Invalid Child Cat",  "Select a child category.")
@@ -862,6 +892,8 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
     _add_list_dv(hsn_col,       "HSN_REF",       len(hsn_codes),   "Invalid HSN Code",   "Select an HSN code.")
     _add_list_dv(store_col,     "STORES_REF",    num_stores,       "Invalid Store",      "Select a store (or leave blank and fill Warehouse).")
     _add_list_dv(wh_col,        "WAREHOUSE_REF", num_warehouses,   "Invalid Warehouse",  "Select a warehouse (or leave blank and fill Store).")  # ← NEW
+    _add_list_dv(size_col,     "SIZE_REF",     len(sizes),     "Invalid Size",     "Select a size.")
+    _add_list_dv(cup_size_col, "CUP_SIZE_REF", len(cup_sizes), "Invalid Cup Size", "Select a cup size.")
 
     # ── Hidden VLOOKUP columns for IDs ────────────────────────────────────────
     # Col AD (30): CategoryId
@@ -878,7 +910,9 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
         (33, fabric_col,    "FABRIC_REF",    len(fabrics),     "FabricId"),
         (34, hsn_col,       "HSN_REF",       len(hsn_codes),   "TaxHSNCodeId"),
         (35, store_col,     "STORES_REF",    num_stores,       "StoreId"),
-        (36, wh_col,        "WAREHOUSE_REF", num_warehouses,   "WarehouseId"),   # ← NEW
+        (36, wh_col,        "WAREHOUSE_REF", num_warehouses,   "WarehouseId"),  
+        (37, size_col,     "SIZE_REF",     len(sizes),     "SizeId"),      # AK
+        (38, cup_size_col, "CUP_SIZE_REF", len(cup_sizes), "CupSizeId"), 
     ]
     for abs_col, src_col, ref_sheet, n_rows, label in hidden_lookups:
         col_letter = get_column_letter(abs_col)
@@ -1191,7 +1225,7 @@ def _parse_hierarchical_excel(file_bytes: bytes) -> list[dict]:
                 is_cup = is_cup.strip().upper() == "TRUE"
             elif is_cup is None:
                 is_cup = False
-            cup_id = rec.get("cupSizeId")
+            cup_id = rec.get("cupSizeName") 
             if is_cup and not cup_id:
                 errors.append(f"Row {row_num}: Is Cup Size = TRUE but Cup Size ID is missing")
             if not is_cup and cup_id:
@@ -1222,6 +1256,8 @@ def _build_hierarchical_chains(
     cat_map: dict[str, int] | None = None,
     child_cat_map: dict[str, int] | None = None,
     brand_map: dict[str, int] | None = None,
+    size_map=None,        # ← NEW: {sizeLabel -> sizeId}
+    cup_size_map=None, 
 ) -> dict[str, dict]:
     chains: dict[str, dict] = {}
 
@@ -1267,8 +1303,8 @@ def _build_hierarchical_chains(
             chains[pkey]["variants"][vkey] = {"rec": v_rec, "slots": []}
 
         chains[pkey]["variants"][vkey]["slots"].append({
-            "sizeId":            rec["sizeId"],
-            "cupSizeId":         rec.get("cupSizeId"),
+            "sizeId":    size_map.get(rec.get("sizeName") or "") if size_map else None,
+            "cupSizeId": cup_size_map.get(rec.get("cupSizeName") or "") if cup_size_map else None,
             "stockId":           rec.get("stockId"),
             "mrpPrice":          rec["mrpPrice"],
             "finalPrice":        rec["finalPrice"],
@@ -1650,9 +1686,12 @@ async def preview_product_bulk(
     cat_map         = {r["name"]: r["id"] for r in refs["categories"]}
     child_cat_map   = {r["name"]: r["id"] for r in refs["childCategories"]}
     brand_map       = {r["name"]: r["id"] for r in refs["brands"]}
+    size_map     = {r["label"]: r["id"] for r in refs["sizes"]}
+    cup_size_map = {r["label"]: r["id"] for r in refs["cupSizes"]}
     chains = _build_hierarchical_chains(
         size_records, fabric_map, hsn_map_by_code,
-        cat_map, child_cat_map, brand_map,
+        cat_map, child_cat_map, brand_map,size_map=size_map,
+        cup_size_map=cup_size_map,
     )
 
     hsn_ids      = _collect_hsn_ids(chains)
@@ -1767,9 +1806,11 @@ async def import_product_bulk(
     cat_map         = {r["name"]: r["id"] for r in refs["categories"]}
     child_cat_map   = {r["name"]: r["id"] for r in refs["childCategories"]}
     brand_map       = {r["name"]: r["id"] for r in refs["brands"]}
+    size_map     = {r["label"]: r["id"] for r in refs["sizes"]}
+    cup_size_map = {r["label"]: r["id"] for r in refs["cupSizes"]}
     chains = _build_hierarchical_chains(
         size_records, fabric_map, hsn_map_by_code,
-        cat_map, child_cat_map, brand_map,
+        cat_map, child_cat_map, brand_map, size_map=size_map, cup_size_map=cup_size_map
     )
 
     hsn_ids      = _collect_hsn_ids(chains)

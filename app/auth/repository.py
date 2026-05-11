@@ -365,8 +365,8 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
 
     if person is not None and person.StoreId is not None:
         from app.stores.models import Stores
-        st = db.query(Stores).filter(Stores.StoreId == person.StoreId).first()
-        store_name = str(st.StoreName) if st and st.StoreName else ""
+        st = db.query(Stores).filter(Stores.storeId == person.StoreId).first()
+        store_name = str(st.storeName) if st and st.storeName else ""
 
     return {
         "sub":                user.Id,

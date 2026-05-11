@@ -1,14 +1,7 @@
 trigger:
   branches:
     include:
-      - develop                    # ✅ merge → build + push + deploy
-      - backend-setup/Vishnu       # ✅ push → build only
-      - feature/*                  # ✅ any future feature branch → build only
-
-pr:
-  branches:
-    include:
-      - develop                    # ✅ PR raised → build only, no push, no deploy
+      - backend/v2/mamatha    # ✅ Build only on every push
 
 pool:
   vmImage: ubuntu-latest
@@ -18,12 +11,10 @@ variables:
   containerRegistry: 'twamregistry.azurecr.io'
 
 steps:
-  # ✅ Build only — runs on feature branch push AND PR raised
   - task: Docker@2
-    displayName: Build only (feature branch and PR validation)
-    condition: or(eq(variables['Build.Reason'], 'PullRequest'), and(ne(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.Reason'], 'IndividualCI')))
+    displayName: Build only (no push)
     inputs:
-      command: build
+      command: build              # ✅ build only, not buildAndPush
       repository: $(imageRepository)
       dockerfile: $(Build.SourcesDirectory)/Dockerfile
       containerRegistry: twamregistry
@@ -32,31 +23,8 @@ steps:
         $(Build.BuildId)
       arguments: '--no-cache'
 
-  # ✅ Build + Push — runs ONLY on merge to develop
-  - task: Docker@2
-    displayName: Build and Push to ACR (develop merge only)
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
-    inputs:
-      command: buildAndPush
-      repository: $(imageRepository)
-      dockerfile: $(Build.SourcesDirectory)/Dockerfile
-      containerRegistry: twamregistry
-      tags: |
-        latest
-        $(Build.BuildId)
-      arguments: '--no-cache'
+  # ❌ No push to ACR
+  # ❌ No deploy
 
-  # ✅ Deploy — runs ONLY on merge to develop after successful push
-  - task: AzureCLI@2
-    displayName: Deploy to Container Apps
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
-    inputs:
-      azureSubscription: twam-azure-connection
-      scriptType: bash
-      scriptLocation: inlineScript
-      inlineScript: |
-        az containerapp update \
-          --name twam-backend \
-          --resource-group twam-production \
-          --image twamregistry.azurecr.io/twam-backend:$(Build.BuildId) \
-          --revision-suffix build$(Build.BuildId)
+
+  

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import text, asc, desc
+from app import orders
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import (
@@ -126,43 +127,100 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
     if not order_ids:
         return []
     ids_str = ",".join(str(i) for i in order_ids)
+    print("DEBUG ids_str:", ids_str)
     sql = f"""
         SELECT
-            oi."OrderItemId", oi."OrderId", oi."ProductVariantDetailId",
-            oi."ProductId", oi."ProductVariantId", oi."Quantity", oi."Price",
+            oi."OrderItemId",
+            oi."OrderId",
+            oi."ProductVariantDetailId",
+            oi."ProductId",
+            oi."ProductVariantId",
+            oi."Quantity",
+            oi."Price",
             oi."OrderItemNumber",
+
             p."Name" AS product_name,
+            b."brandName" AS brand_name,
+
             s."SizeLabel" AS size_label,
             cs."SizeLabel" AS cup_size_label,
+
             pv."Color" AS color,
             pv."IsReturnAvailable" AS is_return_available,
-            (SELECT CONCAT('{BASE_URL}', pi2."FilePath")
-             FROM twam."ProductImage" pi2
-             WHERE pi2."ProductVariantId" = oi."ProductVariantId"
-               AND pi2."DeletedInd" = false
-               AND pi2."FilePath" IS NOT NULL
-               AND pi2."FilePath" != ''
-             LIMIT 1) AS product_image
+
+            pvd."ProductCode" AS sku,
+                (
+                    SELECT CONCAT('{BASE_URL}', '/', pi2."FilePath")
+                    FROM twam."ProductImage" pi2
+                    WHERE (
+                        (
+                            pi2."ProductVariantId" = pv."ProductVariantId"
+                            AND pv."ProductVariantId" IS NOT NULL
+                        )
+                        OR
+                        (
+                            pi2."ProductId" = oi."ProductId"
+                            AND pv."ProductVariantId" IS NULL
+                        )
+                    )
+                    AND pi2."DeletedInd" = false
+                    AND pi2."FilePath" IS NOT NULL
+                    AND pi2."FilePath" != ''
+                    LIMIT 1
+                ) AS product_image
+
         FROM twam."OrderItems" oi
-        LEFT JOIN twam."Products" p ON p."ProductId" = oi."ProductId"
-        LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
-        LEFT JOIN mdm."Size" s ON s."SizeId" = pvd."Size"
-        LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
-        LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
-        WHERE oi."DeletedInd" = false AND oi."OrderId" IN ({ids_str})
-    """
-    rows = db.execute(text(sql)).fetchall()
+
+        LEFT JOIN twam."Products" p
+            ON p."ProductId" = oi."ProductId"
+
+        LEFT JOIN twam."ProductVariantDetail" pvd
+            ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
+
+        LEFT JOIN twam."ProductVariants" pv
+            ON pv."ProductVariantId" = pvd."ProductVariantId"
+
+        LEFT JOIN mdm."Size" s
+            ON s."SizeId" = pvd."Size"
+
+        LEFT JOIN mdm."CupSize" cs
+            ON cs."CupSizeId" = pvd."CupSize"
+
+        LEFT JOIN mdm."Brand" b
+            ON b."brandId" = p."BrandId"
+
+        WHERE
+            oi."DeletedInd" = false
+            AND oi."OrderId" IN ({ids_str})
+        """
+    try:
+        rows = db.execute(text(sql)).fetchall()
+        print("DEBUG rows count:", len(rows))
+    except Exception as e:
+        print("DEBUG SQL ERROR:", e)  
+        return []
     items = []
     for r in rows:
-        items.append({
-            "orderItemId": r[0], "orderId": r[1], "productVariantDetailId": r[2],
-            "productId": r[3], "productVariantId": r[4], "quantity": r[5],
-            "price": float(r[6]) if r[6] else None,
-            "orderItemNumber": r[7], "productName": r[8],
-            "size": r[9], "cupSize": r[10], "color": r[11],
-            "isReturnAvailable": r[12], "productImage": r[13] or "",
-            "rating": 0, "comment": None
-        })
+           items.append({
+                    "orderItemId":            r[0],
+                    "orderId":                r[1],
+                    "productVariantDetailId": r[2],
+                    "productId":              r[3],
+                    "productVariantId":       r[4],
+                    "quantity":               r[5],
+                    "price":                  float(r[6]) if r[6] else None,
+                    "orderItemNumber":        r[7],
+                    "productName":            r[8],
+                    "brandName":              r[9],   
+                    "size":                   r[10],  
+                    "cupSize":                r[11],  
+                    "color":                  r[12],  
+                    "isReturnAvailable":      r[13],  
+                    "sku":                    r[14],  
+                    "productImage":           r[15] or "", 
+                    "rating": 0,
+                    "comment": None
+                })
 
     if include_reviews and items:
         item_ids = [i["orderItemId"] for i in items]
@@ -1039,11 +1097,14 @@ def get_admin_order_list(db: Session, filters, order_ascending, order_property,
     if ref_ids:
         ref_orders = db.query(Orders).filter(Orders.orderId.in_(ref_ids)).all()
         ref_agent_map = {o.orderId: o.deliveryAgent for o in ref_orders}
-
+        
     order_ids = [o.orderId for o in orders]
+    print("DEBUG order_ids:", order_ids)
     items_map = {}
     for item in _get_order_items_with_details(db, order_ids):
         items_map.setdefault(item["orderId"], []).append(item)
+    print("DEBUG items_map keys:", list(items_map.keys()))
+    print(orders[0].__dict__)
 
     result = []
     for o in orders:
