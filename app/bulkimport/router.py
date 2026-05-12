@@ -1063,20 +1063,20 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
                 cell.protection = openpyxl.styles.Protection(locked=False)
 
     # ── Instruction note in row below data ────────────────────────────────────
-    note_row = row_n
-    note_cell = ws.cell(
-        row=note_row,
-        column=27,  # AB
-        value="⚠ Fill EITHER Store Name OR Warehouse Name (not both). Date is required.",
-    )
-    note_cell.font      = Font(italic=True, color="92400E", size=9, bold=True)
-    note_cell.fill      = PatternFill("solid", fgColor="FEF3C7")
-    note_cell.alignment = Alignment(horizontal="left", wrap_text=True)
-    ws.merge_cells(
-        start_row=note_row, start_column=27,
-        end_row=note_row,   end_column=29,
-    )
-    ws.row_dimensions[note_row].height = 28
+    # note_row = row_n
+    # note_cell = ws.cell(
+    #     row=note_row,
+    #     column=27,  # AB
+    #     value="⚠ Fill EITHER Store Name OR Warehouse Name (not both). Date is required.",
+    # )
+    # note_cell.font      = Font(italic=True, color="92400E", size=9, bold=True)
+    # note_cell.fill      = PatternFill("solid", fgColor="FEF3C7")
+    # note_cell.alignment = Alignment(horizontal="left", wrap_text=True)
+    # ws.merge_cells(
+    #     start_row=note_row, start_column=27,
+    #     end_row=note_row,   end_column=29,
+    # )
+    # ws.row_dimensions[note_row].height = 28
 
     buf = io.BytesIO()
     wb.save(buf)
