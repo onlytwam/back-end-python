@@ -24,7 +24,10 @@ import logging
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
-import azure.cognitiveservices.speech as speechsdk
+try:
+    import azure.cognitiveservices.speech as speechsdk
+except ImportError:
+    speechsdk = None  # type: ignore
 
 from app.speech.repository import get_speech_credentials, build_phrase_hints
 

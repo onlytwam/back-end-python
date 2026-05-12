@@ -4,12 +4,12 @@ from email.mime import text
 import json
 import logging
 import os
-import shutil
 from typing import Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.shared.azure_storage import upload_image, delete_image
 from database import get_db
 from . import repository, schemas
 
@@ -21,22 +21,14 @@ router = APIRouter(
     redirect_slashes=True,
 )
 
-UPLOAD_DIR = "uploads/brands"
-
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 
 def _save_upload(file: UploadFile, subfolder: str = "") -> str:
-    """Persist an uploaded file and return its URL-safe relative path."""
-    dest_dir = os.path.join(UPLOAD_DIR, subfolder)
-    os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, file.filename)
-    with open(dest_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    # Return forward-slash URL path
-    return "/" + dest_path.replace("\\", "/")
+    """Upload a brand image to Azure Blob (prod) or local disk (dev)."""
+    return upload_image(file, container_key="brands", folder=subfolder)
 
 
 def _to_url(path: Optional[str]) -> Optional[str]:

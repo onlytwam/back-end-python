@@ -29,10 +29,14 @@ logger = logging.getLogger(__name__)
 
 PEOPLE_SEQ = 'twam."People_PersonalId_seq"'
 # Resolve uploads dir relative to this file so it works regardless of cwd
-_REPO_ROOT      = Path(__file__).resolve().parent.parent.parent  # project root
-PROFILE_IMAGE_DIR = _REPO_ROOT / "uploads" / "profile-images"
-PROFILE_IMAGE_PREFIX = "/uploads/profile-images/"
+_REPO_ROOT        = Path(__file__).resolve().parent.parent.parent  # project root
+# Local fallback paths (used only when AZURE_STORAGE_CONNECTION_STRING is absent)
+PROFILE_IMAGE_DIR    = _REPO_ROOT / "uploads" / "profiles"
+PROFILE_IMAGE_PREFIX = "/uploads/profiles/"
 MAX_PROFILE_IMAGE_BYTES = 5 * 1024 * 1024
+
+# Azure storage helper (imported here; auto-falls-back to local when Azure not configured)
+from app.shared.azure_storage import upload_bytes, delete_image as _azure_delete_image, _is_azure_mode
 ALLOWED_PROFILE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 PROFILE_IMAGE_MIME_TO_EXTENSION = {
     "image/jpeg": ".jpg",
@@ -433,9 +437,11 @@ def _normalize_profile_image_url(path: Optional[str]) -> Optional[str]:
     if not normalized:
         return None
 
+    # Full URL (Azure blob or external) — return as-is
     if normalized.startswith("http://") or normalized.startswith("https://"):
         return normalized
 
+    # Local relative path — ensure leading slash
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
 
@@ -444,37 +450,15 @@ def _normalize_profile_image_url(path: Optional[str]) -> Optional[str]:
 
 def _delete_profile_image_file(path: Optional[str]) -> None:
     """
-    Hard-delete the profile image file from disk.
-    Uses absolute path so it works regardless of cwd.
-    DB is cleared by the caller before this is called.
+    Delete a profile image from Azure Blob (prod) or local disk (dev).
+    The path may be a full Azure URL or a local /uploads/… path.
     """
     normalized = _normalize_profile_image_url(path)
-    if not normalized or not normalized.startswith(PROFILE_IMAGE_PREFIX):
+    if not normalized:
         return
 
-    # Extract just the filename and build absolute path from PROFILE_IMAGE_DIR
-    filename     = normalized.replace(PROFILE_IMAGE_PREFIX, "", 1)
-    absolute_path = PROFILE_IMAGE_DIR / filename
-
-    try:
-        if absolute_path.exists() and absolute_path.is_file():
-            absolute_path.unlink()
-            print(f"[ProfileImage] Deleted file: {absolute_path}")
-        else:
-            print(f"[ProfileImage] File not found on disk (already gone?): {absolute_path}")
-    except OSError as e:
-        logger.warning("Could not delete profile image file %s: %s", absolute_path, e, exc_info=True)
-
-
-def _profile_image_paths_for_extension(user_id: str, extension: str) -> tuple[Path, str]:
-    safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"})
-    if not safe_user_id:
-        safe_user_id = uuid.uuid4().hex
-
-    file_name = f"{safe_user_id}-{uuid.uuid4().hex}{extension}"
-    absolute_path = PROFILE_IMAGE_DIR / file_name
-    relative_path = f"{PROFILE_IMAGE_PREFIX}{file_name}"
-    return absolute_path, relative_path
+    # Delegate to the unified azure_storage helper — it handles both modes
+    _azure_delete_image(normalized)
 
 
 def _detect_profile_image_extension(image_bytes: bytes) -> Optional[str]:
@@ -543,6 +527,11 @@ def _decode_base64_profile_image_payload(image_payload: str) -> tuple[bytes, str
 
 
 def _save_profile_image_file(upload: UploadFile, user_id: str) -> str:
+    """
+    Save an uploaded profile image.
+    On Azure (prod): uploads to the 'profiles' container and returns the full blob URL.
+    Locally (dev):   saves to uploads/profiles/ and returns a /uploads/profiles/… path.
+    """
     original_name = (upload.filename or "").strip()
     extension = Path(original_name).suffix.lower()
     if extension not in ALLOWED_PROFILE_IMAGE_EXTENSIONS:
@@ -555,53 +544,57 @@ def _save_profile_image_file(upload: UploadFile, user_id: str) -> str:
     if content_type and not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid profile image file type.")
 
-    PROFILE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    absolute_path, relative_path = _profile_image_paths_for_extension(user_id, extension)
-
+    # Read file bytes (enforcing size limit)
+    chunks: list[bytes] = []
     total_size = 0
     try:
-        with absolute_path.open("wb") as output_file:
-            while True:
-                chunk = upload.file.read(1024 * 1024)
-                if not chunk:
-                    break
-
-                total_size += len(chunk)
-                if total_size > MAX_PROFILE_IMAGE_BYTES:
-                    raise HTTPException(status_code=400, detail="Profile image must be 5MB or smaller.")
-
-                output_file.write(chunk)
-    except HTTPException:
-        if absolute_path.exists():
-            absolute_path.unlink()
-        raise
-    except Exception as exc:
-        if absolute_path.exists():
-            absolute_path.unlink()
-        raise HTTPException(status_code=500, detail="Failed to save profile image.") from exc
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_PROFILE_IMAGE_BYTES:
+                raise HTTPException(status_code=400, detail="Profile image must be 5MB or smaller.")
+            chunks.append(chunk)
     finally:
         try:
             upload.file.close()
         except Exception:
             pass
 
-    return relative_path
+    file_bytes = b"".join(chunks)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Profile image is empty.")
+
+    safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"}) or uuid.uuid4().hex
+    filename = f"{safe_user_id}_{uuid.uuid4().hex[:8]}{extension}"
+
+    return upload_bytes(
+        file_bytes=file_bytes,
+        filename=filename,
+        content_type=content_type or f"image/{extension.lstrip('.')}",
+        container_key="profiles",
+    )
 
 
 def _save_profile_image_data(image_payload: str, user_id: str) -> str:
-    PROFILE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-
+    """
+    Save a base-64-encoded profile image (e.g. from a cropped canvas export).
+    Returns the Azure URL or local path.
+    """
     image_bytes, extension = _decode_base64_profile_image_payload(image_payload)
-    absolute_path, relative_path = _profile_image_paths_for_extension(user_id, extension)
 
-    try:
-        absolute_path.write_bytes(image_bytes)
-    except Exception as exc:
-        if absolute_path.exists():
-            absolute_path.unlink()
-        raise HTTPException(status_code=500, detail="Failed to save profile image.") from exc
+    safe_user_id = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"}) or uuid.uuid4().hex
+    filename     = f"{safe_user_id}_{uuid.uuid4().hex[:8]}{extension}"
+    content_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".png": "image/png",  ".webp": "image/webp"}.get(extension, "image/jpeg")
 
-    return relative_path
+    return upload_bytes(
+        file_bytes=image_bytes,
+        filename=filename,
+        content_type=content_type,
+        container_key="profiles",
+    )
 
 
 def update_identity_user_profile(

@@ -1,10 +1,10 @@
 import os
-from uuid import uuid4
 from typing import Optional, Annotated
 
 from fastapi import APIRouter, Depends, File, UploadFile, Form, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.shared.azure_storage import upload_image, delete_image
 from database import get_db
 from . import repository, schemas
 
@@ -12,9 +12,6 @@ router = APIRouter(
     prefix="/api/Blog",
     tags=["Blog"]
 )
-
-UPLOAD_DIR = "uploads/blog"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # ---------------- GET ALL (with optional pagination params) ----------------
@@ -65,14 +62,8 @@ def create_blog(
     image:       Annotated[UploadFile, File(...)],
     db: Session = Depends(get_db)
 ):
-    ext      = image.filename.split(".")[-1].lower() if image.filename else "jpg"
-    filename = f"{uuid4()}.{ext}"
-    file_path = os.path.join(UPLOAD_DIR, filename)
-
-    with open(file_path, "wb") as buffer:
-        buffer.write(image.file.read())
-
-    image_url = f"/uploads/blog/{filename}"
+    # Upload image to Azure Blob (or local disk in dev) — container: blogs
+    image_url = upload_image(image, container_key="blogs")
 
     blog_data = schemas.BlogCreate(
         blogTitle=blogTitle,
@@ -111,14 +102,12 @@ def update_blog(
     if description is not None: update_data["description"] = description
 
     if image is not None and image.filename:
-        ext       = image.filename.split(".")[-1].lower()
-        filename  = f"{uuid4()}.{ext}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        # Delete old image from Azure/local before saving new one
+        old_image_url = getattr(blog, "imageUrl", None)
+        if old_image_url:
+            delete_image(old_image_url)
 
-        with open(file_path, "wb") as buffer:
-            buffer.write(image.file.read())
-
-        update_data["imageUrl"] = f"/uploads/blog/{filename}"
+        update_data["imageUrl"] = upload_image(image, container_key="blogs")
 
     updated_blog = repository.update_blog(db, id, update_data)
 

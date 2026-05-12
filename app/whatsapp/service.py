@@ -29,7 +29,10 @@ FIXES APPLIED:
 """
 
 import time
-import httpx
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
 from typing import Optional
 from sqlalchemy.orm import Session
 from .models import WhatsAppCredential, WhatsAppLog
