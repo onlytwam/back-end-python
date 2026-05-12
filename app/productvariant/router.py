@@ -7,40 +7,19 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from sqlalchemy.orm import Session
-from dotenv import load_dotenv, find_dotenv
-from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from database import get_db
 from . import schemas, repository
 from .models import ProductImage, ProductVariant
 from app.products.models import Products
+from app.shared.azure_storage import upload_image, delete_image, AZURE_BASE_URL, CONTAINERS
 
-# Load environment variables
-load_dotenv(find_dotenv(usecwd=True))
-
-# Constants
-AZURE_CONTAINER_NAME = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "product-images")
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 router = APIRouter(
     prefix="/api/ProductVariants",
     tags=["ProductVariants"]
 )
-
-# ─────────────────────────────────────────────────────────────
-# AZURE CONFIG
-# ─────────────────────────────────────────────────────────────
-
-def get_blob_service() -> BlobServiceClient:
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-
-    if not connection_string:
-        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is missing")
-
-    try:
-        return BlobServiceClient.from_connection_string(connection_string)
-    except Exception as e:
-        raise RuntimeError(f"Failed to connect to Azure Blob Storage: {str(e)}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -125,12 +104,13 @@ def get_variant_images(variant_id: int, db: Session = Depends(get_db)):
 
     return [
         {
-            "productImageId": img.productImageId,
-            "productId": img.productId,
+            "productImageId":  img.productImageId,
+            "productId":       img.productId,
             "productVariantId": img.productVariantId,
-            "fileName": img.fileName,
-            "filePath": img.filePath,
-            "fileType": img.fileType,
+            "fileName":        img.fileName,
+            "filePath":        img.filePath,   # full Azure URL or /uploads/… path
+            "imageUrl":        img.filePath,   # alias for frontend convenience
+            "fileType":        img.fileType,
         }
         for img in images
     ]
@@ -146,8 +126,6 @@ def upload_variant_images(
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db)
 ):
-    blob_service = get_blob_service()
-
     variant = db.query(ProductVariant).filter(
         ProductVariant.productVariantId == variant_id
     ).first()
@@ -168,41 +146,22 @@ def upload_variant_images(
         if not f.content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="Only image files are allowed")
 
+        # Validate size before uploading
         content = f.file.read()
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(status_code=400, detail="File too large (max 5MB)")
         f.file.seek(0)
 
-        original_name = (f.filename or "image.jpg").replace(" ", "-")
-        fname = f"{uuid.uuid4().hex[:8]}_{original_name}"
-
-        blob_path = f"image/{product_folder}/{fname}"
-
-        try:
-            blob_client = blob_service.get_blob_client(
-                container=AZURE_CONTAINER_NAME,
-                blob=blob_path
-            )
-
-            blob_client.upload_blob(
-                f.file,
-                overwrite=True,
-                content_settings=ContentSettings(
-                    content_type=f.content_type or "image/jpeg"
-                )
-            )
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        # upload_image handles container auto-creation + local fallback
+        file_url = upload_image(f, container_key="products", folder=f"image/{product_folder}")
 
         img = ProductImage(
-            productId=variant.productId,
-            productVariantId=variant_id,
-            fileName=fname,
-            fileType=f.content_type,
-            filePath=blob_path,
+            productId        = variant.productId,
+            productVariantId = variant_id,
+            fileName         = f.filename,
+            fileType         = f.content_type,
+            filePath         = file_url,
         )
-
         db.add(img)
         saved_images.append(img)
 
@@ -213,10 +172,10 @@ def upload_variant_images(
         "images": [
             {
                 "productImageId": img.productImageId,
-                "filePath": img.filePath
+                "filePath":       img.filePath,
             }
             for img in saved_images
-        ]
+        ],
     }
 
 
@@ -230,8 +189,6 @@ def delete_variant_image(
     image_id: int,
     db: Session = Depends(get_db)
 ):
-    blob_service = get_blob_service()
-
     img = db.query(ProductImage).filter(
         ProductImage.productImageId == image_id,
         ProductImage.productVariantId == variant_id
@@ -240,15 +197,9 @@ def delete_variant_image(
     if not img:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    try:
-        blob_client = blob_service.get_blob_client(
-            container=AZURE_CONTAINER_NAME,
-            blob=img.filePath
-        )
-        blob_client.delete_blob()
-
-    except Exception:
-        pass  # Ignore if already deleted
+    # delete_image handles both Azure URLs and local /uploads/… paths
+    if img.filePath:
+        delete_image(img.filePath)
 
     db.delete(img)
     db.commit()

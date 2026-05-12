@@ -32,7 +32,10 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-import httpx
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore
 
 
 # ── API base URLs ──────────────────────────────────────────────────────────
