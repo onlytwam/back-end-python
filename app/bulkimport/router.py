@@ -531,7 +531,7 @@ _V_FIELDS: list[tuple[str, int, str, bool]] = [
 # Size field positions (Q=16 ... AC=28)
 # Store OR Warehouse must be provided — enforced in parser
 _S_FIELDS: list[tuple[str, int, str, bool]] = [
-    ("stockId",           16, "str",   False), # Q  Stock ID
+    ("stockId",           16, "int",   True), # Q  Stock ID
     ("sizeName",            17, "str",   True),  # R  Size ID*
     ("cupSizeName",         18, "str",   False), # S  Cup Size ID
     ("purchasePrice",     19, "int",   True),  # T  Purchase Price* (required)
@@ -658,7 +658,7 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
         hdr_cell(col, _V_LABELS[field], C_VAR_HDR)
 
     _S_LABELS = {
-        "stockId":           "Stock ID",
+        "stockId":           "Stock ID*",
         "sizeName":    "Size*",      
         "cupSizeName": "Cup Size",
         "purchasePrice":     "Purchase Price*",
@@ -863,6 +863,7 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
     num_warehouses = len(_warehouses)
 
     # ── Dropdown helper ───────────────────────────────────────────────────────
+
     def _add_list_dv(col_letter, sheet_name, num_rows, title="", err=""):
         if num_rows == 0:
             return
@@ -921,8 +922,8 @@ def _build_hierarchical_template(_stores: list[dict], _refs: dict, _warehouses: 
         if n_rows > 0:
             for vrow in range(2, 501):
                 formula = (
-                    f'=IFERROR(VLOOKUP({src_col}{vrow},'
-                    f'{ref_sheet}!$B$2:$A${n_rows+1},2,0),"")'
+                    f'=IFERROR(INDEX({ref_sheet}!$A$2:$A${n_rows+1},'
+                    f'MATCH({src_col}{vrow},{ref_sheet}!$B$2:$B${n_rows+1},0)),"")'
                 )
                 c = ws.cell(row=vrow, column=abs_col, value=formula)
                 c.font = Font(color="FFFFFF", size=8)
@@ -1469,7 +1470,7 @@ def _pb_insert_detail(
         "productCode":       variant_code,
         "size":              int(slot["sizeId"]) if slot.get("sizeId") else None,
         "cupSize":           slot.get("cupSizeId"),
-        "stockId":           slot.get("stockId"),
+        "stockId": int(slot["stockId"]) if slot.get("stockId") is not None else None,       
         "availableQuantity": slot["availableQuantity"],
         "mrpPrice":          slot["mrpPrice"],
         "finalPrice":        slot["finalPrice"],
@@ -1652,6 +1653,21 @@ async def list_warehouses(db: Session = Depends(get_db)):
     warehouses = _fetch_all_warehouses(db)
     return {"warehouses": warehouses, "total": len(warehouses)}
 
+def _fetch_existing_stock_ids(db: Session, stock_ids: list[str]) -> set[str]:
+        """Return the set of stockIds already present in ProductVariantDetail."""
+        if not stock_ids:
+            return set()
+        result = db.execute(
+            text("""
+                SELECT DISTINCT "StockId"
+                FROM   twam."ProductVariantDetail"
+                WHERE  "StockId" = ANY(:ids)
+                AND  "DeletedInd" = false
+            """),
+            {"ids": stock_ids},
+        )
+        return {str(row.StockId) for row in result}
+
 
 @router.get(
     "/product-bulk/template",
@@ -1667,7 +1683,6 @@ def download_product_bulk_template(db: Session = Depends(get_db)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="twam_product_bulk_template.xlsx"'},
     )
-
 
 @router.post(
     "/product-bulk/preview",
@@ -1686,11 +1701,13 @@ async def preview_product_bulk(
     cat_map         = {r["name"]: r["id"] for r in refs["categories"]}
     child_cat_map   = {r["name"]: r["id"] for r in refs["childCategories"]}
     brand_map       = {r["name"]: r["id"] for r in refs["brands"]}
-    size_map     = {r["label"]: r["id"] for r in refs["sizes"]}
-    cup_size_map = {r["label"]: r["id"] for r in refs["cupSizes"]}
+    size_map        = {r["label"]: r["id"] for r in refs["sizes"]}
+    cup_size_map    = {r["label"]: r["id"] for r in refs["cupSizes"]}
+
     chains = _build_hierarchical_chains(
         size_records, fabric_map, hsn_map_by_code,
-        cat_map, child_cat_map, brand_map,size_map=size_map,
+        cat_map, child_cat_map, brand_map,
+        size_map=size_map,
         cup_size_map=cup_size_map,
     )
 
@@ -1698,15 +1715,15 @@ async def preview_product_bulk(
     hsn_map      = await _fetch_hsn_rates(db, hsn_ids)
     hsn_warnings = _apply_hsn_rates(chains, hsn_map)
 
-    # Resolve storeName -> storeId
-    store_map = _fetch_store_map(db)
-    store_warnings: list[dict] = []
-    seen_bad_stores: set[str] = set()
+    # ── Resolve storeName -> storeId ──────────────────────────────────────────
+    store_map          = _fetch_store_map(db)
+    store_warnings:    list[dict] = []
+    seen_bad_stores:   set[str]   = set()
 
-    # Resolve warehouseName -> warehouseId  ← NEW
-    warehouse_map = _fetch_warehouse_map(db)
-    warehouse_warnings: list[dict] = []
-    seen_bad_warehouses: set[str] = set()
+    # ── Resolve warehouseName -> warehouseId ──────────────────────────────────
+    warehouse_map          = _fetch_warehouse_map(db)
+    warehouse_warnings:    list[dict] = []
+    seen_bad_warehouses:   set[str]   = set()
 
     for chain in chains.values():
         for var in chain["variants"]:
@@ -1724,7 +1741,7 @@ async def preview_product_bulk(
                             "message":     f"Store '{sname}' not found in DB — StoreId will be NULL.",
                         })
 
-                # Warehouse resolution  ← NEW
+                # Warehouse resolution
                 wname = slot.get("warehouseName") or ""
                 if wname:
                     wid = warehouse_map.get(wname)
@@ -1737,53 +1754,81 @@ async def preview_product_bulk(
                             "message":       f"Warehouse '{wname}' not found in DB — WarehouseId will be NULL.",
                         })
 
+    # ── Duplicate Stock ID check ───────────────────────────────────────────────
+    duplicate_stock_rows: list[dict] = []
+    seen_dup_stock:       set[str]   = set()
+
+    all_stock_ids = [
+        str(rec.get("stockId"))          # convert int -> str for set ops
+        for rec in size_records
+        if rec.get("stockId") is not None and rec["_valid"]
+    ]
+
+    existing_stock_ids = _fetch_existing_stock_ids(db, all_stock_ids) if all_stock_ids else set()
+
+    for rec in size_records:
+        sid = rec.get("stockId") or ""
+        if sid and sid in existing_stock_ids:
+            rec["_duplicate_stock"] = True
+            if sid not in seen_dup_stock:
+                seen_dup_stock.add(sid)
+                duplicate_stock_rows.append({
+                    "stockId": sid,
+                    "row":     rec["_row"],
+                    "message": f"Stock ID '{sid}' already exists in the database — this row will be skipped.",
+                })
+        else:
+            rec["_duplicate_stock"] = False
+
+    # ── Build preview rows ────────────────────────────────────────────────────
     preview_rows = []
     for rec in size_records:
         preview_rows.append({
-            "row":            rec["_row"],
-            "status":         "OK" if rec["_valid"] else "Error",
-            "issues":         rec["_errors"],
-            "productCode":    rec.get("productCode"),
-            "productName":    rec.get("name"),
-            "variantCode":    rec.get("variantCode"),
-            "variantName":    rec.get("variantName"),
-            "fabricName":     rec.get("fabricName"),
-            "hsnCode":        rec.get("hsnCode"),
-            "stockId":        rec.get("stockId"),
-            "color":          rec.get("color"),
-            "sizeId":         rec.get("sizeId"),
-            "cupSizeId":      rec.get("cupSizeId"),
-            "mrpPrice":       rec.get("mrpPrice"),
-            "finalPrice":     rec.get("finalPrice"),
-            "purchasePrice":  rec.get("purchasePrice"),
-            "stockQty":       rec.get("availableQuantity"),
-            "cgst":           rec.get("cgst"),
-            "sgst":           rec.get("sgst"),
-            "storeName":      rec.get("storeName"),
-            "warehouseName":  rec.get("warehouseName"),   # ← NEW
-            "entryDate":      str(rec["entryDate"]) if rec.get("entryDate") else None,  # ← NEW
-            "isLowStock":     rec.get("isLowStock", False),
-            "isOutOfStock":   rec.get("isOutOfStock", False),
+            "row":              rec["_row"],
+            "status":           "OK" if rec["_valid"] else "Error",
+            "issues":           rec["_errors"],
+            "productCode":      rec.get("productCode"),
+            "productName":      rec.get("name"),
+            "variantCode":      rec.get("variantCode"),
+            "variantName":      rec.get("variantName"),
+            "fabricName":       rec.get("fabricName"),
+            "hsnCode":          rec.get("hsnCode"),
+            "stockId":          rec.get("stockId"),
+            "color":            rec.get("color"),
+            "sizeId":           rec.get("sizeId"),
+            "cupSizeId":        rec.get("cupSizeId"),
+            "mrpPrice":         rec.get("mrpPrice"),
+            "finalPrice":       rec.get("finalPrice"),
+            "purchasePrice":    rec.get("purchasePrice"),
+            "stockQty":         rec.get("availableQuantity"),
+            "cgst":             rec.get("cgst"),
+            "sgst":             rec.get("sgst"),
+            "storeName":        rec.get("storeName"),
+            "warehouseName":    rec.get("warehouseName"),
+            "entryDate":        str(rec["entryDate"]) if rec.get("entryDate") else None,
+            "isLowStock":       rec.get("isLowStock", False),
+            "isOutOfStock":     rec.get("isOutOfStock", False),
+            "duplicateStockId": rec.get("_duplicate_stock", False),
         })
 
     return {
-        "totalSizeRows":       len(size_records),
-        "validRows":           sum(1 for r in size_records if r["_valid"]),
-        "errorRows":           sum(1 for r in size_records if not r["_valid"]),
-        "willImportProducts":  len(chains),
-        "willImportVariants":  sum(len(v["variants"]) for v in chains.values()),
-        "willImportDetails":   sum(
+        "totalSizeRows":          len(size_records),
+        "validRows":              sum(1 for r in size_records if r["_valid"]),
+        "errorRows":              sum(1 for r in size_records if not r["_valid"]),
+        "willImportProducts":     len(chains),
+        "willImportVariants":     sum(len(v["variants"]) for v in chains.values()),
+        "willImportDetails":      sum(
             len(var["slots"])
             for v in chains.values()
             for var in v["variants"]
         ),
-        "canImport":           len(chains) > 0,
-        "hsnWarnings":         hsn_warnings,
-        "storeWarnings":       store_warnings,
-        "warehouseWarnings":   warehouse_warnings,   # ← NEW
-        "rows":                preview_rows[:500],
+        "canImport":              len(chains) > 0,
+        "hsnWarnings":            hsn_warnings,
+        "storeWarnings":          store_warnings,
+        "warehouseWarnings":      warehouse_warnings,
+        "duplicateStockWarnings": duplicate_stock_rows,
+        "rows":                   preview_rows[:500],
     }
-
 
 @router.post(
     "/product-bulk/import",
@@ -1853,6 +1898,44 @@ async def import_product_bulk(
                             "variantCode":   var["rec"].get("variantCode"),
                             "message":       f"Warehouse '{wname}' not found in DB — WarehouseId will be NULL.",
                         })
+                        # ── Duplicate Stock ID check — block insertion of duplicates ─────────────────
+    all_stock_ids = [
+        str(rec.get("stockId"))          # convert int -> str for set ops
+        for rec in size_records
+        if rec.get("stockId") is not None and rec["_valid"]
+    ]
+    existing_stock_ids = _fetch_existing_stock_ids(db, all_stock_ids)
+    duplicate_stock_warnings: list[dict] = []
+    seen_dup: set[str] = set()
+
+    # Remove duplicate-stockId slots from chains
+    for chain in chains.values():
+        for var in chain["variants"]:
+            clean_slots = []
+            for slot in var["slots"]:
+                sid = slot.get("stockId") or ""
+                if sid and sid in existing_stock_ids:
+                    skipped_rows += 1
+                    if sid not in seen_dup:
+                        seen_dup.add(sid)
+                        duplicate_stock_warnings.append({
+                            "stockId":     sid,
+                            "variantCode": var["rec"].get("variantCode"),
+                            "message":     f"Stock ID '{sid}' already exists — row skipped.",
+                        })
+                else:
+                    clean_slots.append(slot)
+            var["slots"] = clean_slots
+
+    # Prune chains that now have no slots
+    chains = {
+        pk: {
+            "rec": ch["rec"],
+            "variants": [v for v in ch["variants"] if v["slots"]],
+        }
+        for pk, ch in chains.items()
+    }
+    chains = {pk: ch for pk, ch in chains.items() if ch["variants"]}
 
     skipped_rows = sum(1 for r in size_records if not r["_valid"])
 
@@ -1865,6 +1948,7 @@ async def import_product_bulk(
             "skippedRows":      skipped_rows,
             "hsnWarnings":      hsn_warnings,
             "warehouseWarnings": warehouse_warnings,
+            "duplicateStockWarnings": [],
         }
 
     inserted_products = inserted_variants = inserted_details = 0
@@ -1909,5 +1993,6 @@ async def import_product_bulk(
         "skippedRows":       skipped_rows,
         "hsnWarnings":       hsn_warnings,
         "storeWarnings":     store_warnings,
-        "warehouseWarnings": warehouse_warnings,   # ← NEW
+        "warehouseWarnings": warehouse_warnings, 
+        
     }
