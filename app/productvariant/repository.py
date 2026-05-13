@@ -29,16 +29,7 @@ def _upsert_product_color(db, color_name: str):
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/") + "/"
 
-# Product types that should NEVER use cup-size logic even if isCupSize=True in DB
-ALPHA_SIZE_PRODUCT_KEYWORDS = [
-    't-shirt bra', 't shirt bra', 'tshirt bra',
-    'sports bra',  'sport bra',
-]
 
-def _is_alpha_size_product(name: str) -> bool:
-    """Returns True for T-shirt bras and sports bras — these use alpha sizes."""
-    lower = (name or '').lower()
-    return any(kw in lower for kw in ALPHA_SIZE_PRODUCT_KEYWORDS)
 
 # def _get_images(db: Session, product_variant_id: int) -> list:
 #     rows = db.execute(
@@ -317,15 +308,29 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     else:
         return None
 
+    # Join the CHILD category (immediate category the product is assigned to) first;
+    # fall back to the parent/root CategoryId when ChildCategoryId is NULL.
+    # This ensures bandSizeType and hasCupSize come from the most specific category.
     sql = f"""
         SELECT
             pv."ProductVariantId", pv."ProductId",
             p."Name", p."Description", p."ProductCode", p."Tag", p."CategoryId",
             pv."IsCupSize", pv."IsReturnAvailable",
-            b."brandName"
+            b."brandName",
+            COALESCE(child_c."BandSizeType", parent_c."BandSizeType") AS band_size_type,
+            COALESCE(child_c."HasCupSize",   parent_c."HasCupSize")   AS has_cup_size,
+            p."ChildCategoryId"
         FROM twam."ProductVariants" pv
         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
         LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
+        -- child category (immediate assignment)
+        LEFT JOIN twam."Category" child_c
+               ON child_c."CategoryId" = p."ChildCategoryId"
+              AND (child_c."DeletedInd" = false OR child_c."DeletedInd" IS NULL)
+        -- parent category (fallback)
+        LEFT JOIN twam."Category" parent_c
+               ON parent_c."CategoryId" = p."CategoryId"
+              AND (parent_c."DeletedInd" = false OR parent_c."DeletedInd" IS NULL)
         WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL) AND {where}
         LIMIT 1
     """
@@ -337,7 +342,9 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     prod_id   = row[1]
     prod_name = row[2] or ""
 
-    is_cup_size = bool(row[7]) and not _is_alpha_size_product(prod_name)
+    # isCupSize on the variant is kept for reference but display is driven purely
+    # by the category's HasCupSize field resolved below — no keyword overrides.
+    is_cup_size = bool(row[7])
 
     img_rows = db.execute(text(
         'SELECT CONCAT(:base, "FilePath") FROM twam."ProductImage" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
@@ -389,11 +396,25 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     for r in pvd_matrix_rows:
         if r[0] and r[0] not in pvd_by_size: pvd_by_size[r[0]] = r[2]
 
+    # ── Band sizes: filter by category's bandSizeType ────────────────────────
+    # row[10] = band_size_type  ('alpha' | 'numerical' | None)
+    # row[11] = has_cup_size    (True | False | None)
+    band_size_type = row[10]
+    has_cup_size   = bool(row[11]) if row[11] is not None else False
+
+    if band_size_type == "numerical":
+        _size_type_clause = "AND \"SizeType\" = 'numerical'"
+    elif band_size_type == "alpha":
+        _size_type_clause = "AND \"SizeType\" = 'alphabetical'"
+    else:
+        _size_type_clause = ""   # no restriction → all band sizes
+
     try:
-        all_sizes_rows = db.execute(text("""
+        all_sizes_rows = db.execute(text(f"""
             SELECT "SizeId", "SizeLabel", "SizeCode" FROM mdm."Size"
             WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
               AND ("IsActive" = true OR "IsActive" IS NULL)
+              {_size_type_clause}
             ORDER BY "OrderNo" NULLS LAST, "SizeId"
         """)).fetchall()
     except Exception:
@@ -405,21 +426,24 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
               AND (pvd2."DeletedInd" = false OR pvd2."DeletedInd" IS NULL)
         """), {"pvid": pv_id}).fetchall()
 
-    try:
-        all_cup_rows = db.execute(text("""
-            SELECT "CupSizeId", "SizeLabel" FROM mdm."CupSize"
-            WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
-              AND ("IsActive" = true OR "IsActive" IS NULL)
-            ORDER BY "CupSizeId"
-        """)).fetchall()
-    except Exception:
-        all_cup_rows = db.execute(text("""
-            SELECT DISTINCT cs."CupSizeId", cs."SizeLabel"
-            FROM mdm."CupSize" cs
-            JOIN twam."ProductVariantDetail" pvd2 ON pvd2."CupSize" = cs."CupSizeId"
-            WHERE pvd2."ProductVariantId" = :pvid
-              AND (pvd2."DeletedInd" = false OR pvd2."DeletedInd" IS NULL)
-        """), {"pvid": pv_id}).fetchall()
+    # ── Cup sizes: only fetch when the category has hasCupSize = True ─────────
+    all_cup_rows = []
+    if has_cup_size:
+        try:
+            all_cup_rows = db.execute(text("""
+                SELECT "CupSizeId", "SizeLabel" FROM mdm."CupSize"
+                WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
+                  AND ("IsActive" = true OR "IsActive" IS NULL)
+                ORDER BY "CupSizeId"
+            """)).fetchall()
+        except Exception:
+            all_cup_rows = db.execute(text("""
+                SELECT DISTINCT cs."CupSizeId", cs."SizeLabel"
+                FROM mdm."CupSize" cs
+                JOIN twam."ProductVariantDetail" pvd2 ON pvd2."CupSize" = cs."CupSizeId"
+                WHERE pvd2."ProductVariantId" = :pvid
+                  AND (pvd2."DeletedInd" = false OR pvd2."DeletedInd" IS NULL)
+            """), {"pvid": pv_id}).fetchall()
 
     color_rows = db.execute(text("""
         SELECT pv2."ProductVariantId", pv2."Color",
@@ -441,6 +465,8 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         "tag":                row[5],
         "categoryId":         row[6],
         "isCupSize":          is_cup_size,
+        "bandSizeType":       band_size_type,   # from child category (or parent fallback)
+        "hasCupSize":         has_cup_size,     # from child category (or parent fallback)
         "isReturnAvailable":  row[8],
         "brandName":          row[9],
         "price":              float(pvd_row[0]) if pvd_row and pvd_row[0] is not None else None,

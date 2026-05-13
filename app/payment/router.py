@@ -6,6 +6,7 @@ PayG payment endpoints wired into FastAPI.
   GET  /api/Payment/Callback          – browser redirect from PayG (success/fail)
   POST /api/Payment/Callback          – some PayG flows POST the result
   GET  /api/Payment/Status/{order_id} – frontend polls for payment status
+  POST /api/Payment/Expire/{order_id} – frontend calls on 10-min timeout to mark order PaymentFailed
   GET  /api/Payment/Debug/{order_id}  – admin: instant full diagnosis
   GET  /api/Payment/Config            – admin: view current PayG settings (masked)
   PUT  /api/Payment/Config            – admin: update PayG settings in the DB
@@ -632,6 +633,56 @@ def get_payment_status(
         "paymentResponseCode":  payg_detail.get("PaymentResponseCode"),
         "paygStatus":           payg_detail.get("OrderStatus"),
     }
+
+
+# ── Payment expiry (frontend timeout) ─────────────────────────────────────
+
+@router.post("/Expire/{order_id}")
+def expire_payment(
+    order_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Called by the frontend when the 10-minute payment window expires without
+    a confirmed payment.  Marks the order as 'PaymentFailed' so it is hidden
+    from the user's order list.  Only the order's owner (or staff) may call this.
+
+    Safe to call even if the payment already succeeded — the guard below
+    prevents overwriting a Confirmed/Processing/Delivered state.
+    """
+    order = db.query(Orders).filter(
+        Orders.orderId    == order_id,
+        Orders.deletedInd == False,
+    ).first()
+
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    if current_user.role_id not in Roles.STAFF and order.userProfileId != current_user.user_id:
+        raise HTTPException(403, "Not authorised")
+
+    # Only expire orders that are still waiting for payment — do NOT
+    # overwrite a state that PayG has already resolved.
+    SAFE_TO_EXPIRE = {"AwaitingPayment", "Pending", "Payment Pending"}
+    if order.state not in SAFE_TO_EXPIRE:
+        print(
+            f"[Payment/Expire] Order {order_id} is in state '{order.state}' "
+            f"— not expiring (payment may have succeeded)."
+        )
+        return {"success": False, "state": order.state, "message": "Order already resolved"}
+
+    order.state        = "PaymentFailed"
+    order.modifiedDate = datetime.now(timezone.utc)
+    db.add(order)
+    db.add(OrderTrackingStatus(
+        orderId     = order_id,
+        status      = "PaymentFailed",
+        createdDate = datetime.now(timezone.utc),
+    ))
+    db.commit()
+    print(f"[Payment/Expire] Order {order_id} expired → PaymentFailed")
+    return {"success": True, "state": "PaymentFailed"}
 
 
 # ── Admin: view / update PayG config ──────────────────────────────────────

@@ -10,6 +10,7 @@ class SizeCreate(BaseModel):
     state: Optional[str] = None
     isActive: bool = True
     isCupSize: Optional[bool] = None
+    sizeType: Optional[str] = None   # 'alphabetical' | 'numerical'
     userProfileId: Optional[str] = None
     orderNo: Optional[int] = None
 
@@ -22,6 +23,7 @@ class SizeUpdate(BaseModel):
     state: Optional[str] = None
     isActive: Optional[bool] = None
     isCupSize: Optional[bool] = None
+    sizeType: Optional[str] = None   # 'alphabetical' | 'numerical'
     orderNo: Optional[int] = None
 
 
@@ -34,6 +36,7 @@ class SizeResponse(BaseModel):
     state: Optional[str] = None
     isActive: bool
     isCupSize: Optional[bool] = None
+    sizeType: Optional[str] = None   # 'alphabetical' | 'numerical'
     userProfileId: Optional[str] = None
     orderNo: Optional[int] = None
     filters: Optional[Any] = None

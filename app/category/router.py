@@ -58,12 +58,10 @@ def get_category_product_counts(db: Session = Depends(get_db)):
 @router.get("/GetProductDetailCategory", response_model=schemas.CategoryListResponse)
 def get_product_detail_categories(
     request: Request,
-    # Accept both Angular (page.index) and old-style (Page.Index) params
     page_index:      Optional[int]  = Query(None, alias="page.index"),
     page_size:       Optional[int]  = Query(None, alias="page.size"),
     order_property:  Optional[str]  = Query(None, alias="order.property"),
     order_ascending: Optional[bool] = Query(None, alias="order.ascending"),
-    # Old-style fallback
     Page_Index:      Optional[int]  = Query(None, alias="Page.Index"),
     Page_Size:       Optional[int]  = Query(None, alias="Page.Size"),
     Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
@@ -71,7 +69,6 @@ def get_product_detail_categories(
     Filters:         Optional[str]  = Query(None, alias="Filters"),
     db: Session = Depends(get_db)
 ):
-    # Prefer Angular-style params, fall back to old-style
     p_index = (page_index or Page_Index) if ((page_index or Page_Index) or 0) > 0 else None
     p_size  = (page_size  or Page_Size)  if ((page_size  or Page_Size)  or 0) > 0 else None
     o_prop  = order_property or Order_Property
@@ -133,6 +130,21 @@ def update_category(category_id: int, command: schemas.CategoryUpdate, db: Sessi
 def delete_category(category_id: int, db: Session = Depends(get_db)):
     if not repository.delete_category(db, category_id):
         raise HTTPException(404, "Category not found.")
+
+
+# ── Sizes for a category (public — used by admin modal preview AND product pages) ──
+@router.get("/{category_id}/sizes")
+def get_category_sizes(category_id: int, db: Session = Depends(get_db)):
+    """
+    Returns bandSizes (filtered by the category's bandSizeType) and cupSizes
+    (only if hasCupSize=True).  Used by:
+      - Admin category modal to preview sizes when bandSizeType / hasCupSize is toggled
+      - Product detail / QuickShop to render the correct size grid
+    """
+    result = repository.get_category_sizes(db, category_id)
+    if not result:
+        raise HTTPException(404, "Category not found.")
+    return result
 
 
 # /{category_id} MUST be last — catch-all for integer path

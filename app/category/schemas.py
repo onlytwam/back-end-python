@@ -14,6 +14,8 @@ class CategoryCreate(BaseModel):
     isActive:         Optional[bool] = True   # default active
     userProfileId:    Optional[str]  = None
     categoryImage:    Optional[str]  = None
+    bandSizeType:     Optional[str]  = None   # 'alpha' | 'numerical'
+    hasCupSize:       Optional[bool] = False
 
 
 class CategoryUpdate(BaseModel):
@@ -26,6 +28,8 @@ class CategoryUpdate(BaseModel):
     groupCategoryId:  Optional[bool] = None   # auto-set in repository
     isActive:         Optional[bool] = True   # default active
     categoryImage:    Optional[str]  = None
+    bandSizeType:     Optional[str]  = None   # 'alpha' | 'numerical'
+    hasCupSize:       Optional[bool] = None
 
 
 class CategoryResponse(BaseModel):
@@ -40,6 +44,8 @@ class CategoryResponse(BaseModel):
     groupCategoryId:    Optional[bool]     = None
     isActive:           Optional[bool]     = None
     categoryImage:      Optional[str]      = None
+    bandSizeType:       Optional[str]      = None
+    hasCupSize:         Optional[bool]     = None
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
 
