@@ -570,7 +570,7 @@ def create_order(db: Session, data) -> dict:
         totalAmount=getattr(data, "totalAmount", None),
         orderDate=getattr(data, "orderDate", None) or datetime.now(timezone.utc),
         userProfileId=getattr(data, "userProfileId", None),
-        state="Pending",
+        state="AwaitingPayment",
         createdDate=datetime.now(timezone.utc),
         deletedInd=False,
         shippingAddressId=getattr(data, "shippingAddressId", None),
@@ -628,7 +628,7 @@ def create_order(db: Session, data) -> dict:
     # Add initial tracking status
     db.add(OrderTrackingStatus(
         orderId=order_id,
-        status="Pending",
+        status="AwaitingPayment",
         createdDate=datetime.now(timezone.utc)
     ))
 
@@ -1018,7 +1018,14 @@ def create_return_order(db: Session, data) -> bool:
 # ── Get Order List ────────────────────────────────────────────────────────────
 
 def get_order_list(db: Session, filters, order_ascending, order_property, page_index, page_size) -> dict:
-    query = db.query(Orders).filter(Orders.deletedInd == False)
+    query = db.query(Orders).filter(
+        Orders.deletedInd == False,
+        # Hide orders that were initiated but never paid for.
+        # "AwaitingPayment" = payment page opened but gateway not yet confirmed.
+        # "PaymentFailed"   = timed out or explicitly failed/expired by frontend.
+        # Both are invisible to the user; only confirmed/processing/delivered etc. appear.
+        Orders.state.notin_(["AwaitingPayment", "PaymentFailed"]),
+    )
 
     days_value, remaining_filters = None, []
     if filters:

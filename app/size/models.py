@@ -14,6 +14,7 @@ class Size(Base):
     state = Column("State", String, nullable=True)
     isActive = Column("IsActive", Boolean, default=True)
     isCupSize = Column("IsCupSize", Boolean, nullable=True)
+    sizeType  = Column("SizeType",  String,  nullable=True)   # 'alphabetical' | 'numerical'
     userProfileId = Column("UserProfileId", String, nullable=True)
     orderNo = Column("OrderNo", Integer, nullable=True)
     createdDate = Column("CreatedDate", DateTime(timezone=True), nullable=True)
