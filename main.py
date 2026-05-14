@@ -10,6 +10,8 @@ Changes vs previous version:
   - AppSettings seeded and cache loaded at startup so every secret that was
     previously hardcoded (OAuth client_id/secret, password cipher, AES key,
     webhook secret) is read from the DB at runtime.
+  - app/branding removed; replaced by app/images — a single module that serves
+    all page images (login background, home sections, etc.) from one table.
 """
 
 import os
@@ -66,8 +68,10 @@ from app.sms.models                  import SmsCredential, SmsMessageTemplate, S
 from app.whatsapp.models             import WhatsAppLog, WhatsAppCredential
 from app.auth.models                 import OtpStore
 from app.speech.models               import AzureSpeechConfig
-from app.billing.models              import   Warehouse, Inventory  , BillingOrder, BillingOrderItem
+from app.billing.models              import Warehouse, Inventory, BillingOrder, BillingOrderItem
 from app.saleschannel.models         import SalesChannel
+from app.images.models               import PageImage
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -101,6 +105,12 @@ async def lifespan(app: FastAPI):
         # 6. Auto-create ProductColor table and populate hex values
         from app.shared.color_init import init_product_color_table
         init_product_color_table(db)
+
+        # 7. Seed PageImages defaults (inserts a row for every known page-image
+        #    slot using the static asset path as the initial value; skips rows
+        #    that already exist so admin uploads are never overwritten).
+        from app.images.repository import seed_page_images
+        seed_page_images(db)
 
     finally:
         db.close()
@@ -165,6 +175,7 @@ from app.userquery.router            import router as userquery_router
 from app.sendemail.router            import router as email_router
 from app.newsletter.router           import router as newsletter_router
 from app.speech.router               import router as speech_router
+from app.images.router               import router as images_router
 # ── Routers — Protected ───────────────────────────────────────────────────────
 from app.address.router              import router as address_router
 from app.cart.router                 import router as cart_router
@@ -198,9 +209,9 @@ from app.wishlist.router             import router as wishlist_router
 from app.bulkimport.router           import router as bulkimport_router
 from app.sms.router                  import template_router as sms_template_router
 from app.sms.router                  import credential_router as sms_credential_router
-from app.billing.router               import router as billing_router
+from app.billing.router              import router as billing_router
 from app.saleschannel.router         import router as saleschannel_router
-from app.surprisegift.router         import router as surprisegift_router   
+from app.surprisegift.router         import router as surprisegift_router
 
 # ── Ekart Logistics Integration ───────────────────────────────────────────────
 from app.ekart.router                import router as ekart_router
@@ -222,9 +233,10 @@ for _router in (
     shippingtype_router, size_router, state_router, stores_router,
     supplierinfo_router, supportrequest_router, taxhsncode_router,
     userrole_router, wishlist_router, bulkimport_router,
-    newsletter_router, billing_router,saleschannel_router,
+    newsletter_router, billing_router, saleschannel_router,
     ekart_router, ekart_webhook_router,
-    payment_router, sms_template_router, sms_credential_router, speech_router,surprisegift_router,
+    payment_router, sms_template_router, sms_credential_router, speech_router,
+    surprisegift_router, images_router,
 ):
     app.include_router(_router)
 

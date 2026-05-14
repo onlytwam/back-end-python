@@ -48,11 +48,23 @@ def get_review_by_id(db, review_id: int) -> Optional[dict]:
     return _to_dict(r) if r else None
 
 
+def get_review_by_item_id(db, item_id: int) -> Optional[dict]:
+    """Lookup a review by its order-item ID — used before create_or_update to find old photo."""
+    r = db.query(ProductReview).filter(
+        ProductReview.itemId == item_id
+    ).first()
+    return _to_dict(r) if r else None
+
+
 def create_or_update_review(db, data) -> int:
     """
     Mirrors CreateProductReviewCommandHandler:
     - If itemId already has a review → update rating/comment/photo
     - Otherwise → create new
+
+    Returns the productReviewId.
+    The caller (router) is responsible for deleting the old blob photo when
+    a new one is provided — use get_review_by_id() before calling this.
     """
     existing = db.query(ProductReview).filter(
         ProductReview.itemId == data.itemId
@@ -106,6 +118,21 @@ def update_review(db, review_id: int, data) -> Optional[int]:
     r.modifiedDate = datetime.now(timezone.utc)
     db.commit()
     return r.productReviewId
+
+
+def delete_review(db, review_id: int) -> bool:
+    """
+    Hard-delete the review record from the DB.
+    The caller (router) must delete the blob photo AFTER this returns True.
+    """
+    r = db.query(ProductReview).filter(
+        ProductReview.productReviewId == review_id,
+    ).first()
+    if not r:
+        return False
+    db.delete(r)
+    db.commit()
+    return True
 
 
 def get_review_stats(db, product_variant_id: int) -> dict:

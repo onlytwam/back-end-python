@@ -55,8 +55,6 @@ def get_all_categories(
             "groupCategoryId":    r.groupCategoryId,
             "isActive":           r.isActive,
             "categoryImage":      r.categoryImage,
-            "bandSizeType":       r.bandSizeType,
-            "hasCupSize":         r.hasCupSize,
             "createdDate":        r.createdDate,
             "modifiedDate":       r.modifiedDate,
         })
@@ -81,8 +79,6 @@ def get_category_by_id(db: Session, category_id: int) -> Optional[dict]:
         "groupCategoryId":  cat.groupCategoryId,
         "isActive":         cat.isActive,
         "categoryImage":    cat.categoryImage,
-        "bandSizeType":     cat.bandSizeType,
-        "hasCupSize":       cat.hasCupSize,
         "createdDate":      cat.createdDate,
         "modifiedDate":     cat.modifiedDate,
     }
@@ -101,8 +97,6 @@ def create_category(db: Session, data) -> int:
         groupCategoryId  = data.groupCategoryId if data.groupCategoryId is not None else auto_group,
         isActive         = data.isActive if data.isActive is not None else True,
         categoryImage    = data.categoryImage,
-        bandSizeType     = data.bandSizeType,
-        hasCupSize       = data.hasCupSize if data.hasCupSize is not None else False,
         createdDate      = datetime.now(timezone.utc),
         deletedInd       = False,
     )
@@ -127,10 +121,10 @@ def update_category(db: Session, category_id: int, data) -> Optional[int]:
     cat.displayOrder     = data.displayOrder
     cat.parentCategoryId = data.parentCategoryId
     cat.isActive         = data.isActive if data.isActive is not None else True
-    cat.categoryImage    = data.categoryImage
-    cat.bandSizeType     = data.bandSizeType
-    if data.hasCupSize is not None:
-        cat.hasCupSize   = data.hasCupSize
+    # Only overwrite the stored image URL when the caller sends an explicit
+    # non-None value.  None means "field was not supplied" — leave DB intact.
+    if data.categoryImage is not None:
+        cat.categoryImage = data.categoryImage
     cat.modifiedDate     = datetime.now(timezone.utc)
 
     if data.groupCategoryId is not None:
@@ -153,69 +147,6 @@ def delete_category(db: Session, category_id: int) -> bool:
     cat.modifiedDate = datetime.now(timezone.utc)
     db.commit()
     return True
-
-
-# ── Category sizes ────────────────────────────────────────────────────────────
-
-def get_category_sizes(db: Session, category_id: int) -> Optional[dict]:
-    """
-    Returns the band sizes (filtered by bandSizeType) and cup sizes
-    (if hasCupSize=True) that apply to every product in this category.
-    bandSizeType: 'alpha' -> SizeType='alphabetical', 'numerical' -> SizeType='numerical'
-    """
-    cat = db.query(Category).filter(
-        Category.categoryId == category_id,
-        Category.deletedInd == False
-    ).first()
-    if not cat:
-        return None
-
-    band_size_type = cat.bandSizeType
-    has_cup_size   = bool(cat.hasCupSize) if cat.hasCupSize is not None else False
-
-    if band_size_type == "numerical":
-        size_type_clause = "AND \"SizeType\" = 'numerical'"
-    elif band_size_type == "alpha":
-        size_type_clause = "AND \"SizeType\" = 'alphabetical'"
-    else:
-        size_type_clause = ""
-
-    size_rows = db.execute(text(f"""
-        SELECT "SizeId", "SizeLabel", "SizeCode", "SizeType", "OrderNo"
-        FROM mdm."Size"
-        WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
-          AND ("IsActive" = true OR "IsActive" IS NULL)
-          {size_type_clause}
-        ORDER BY "OrderNo" NULLS LAST, "SizeId"
-    """)).fetchall()
-
-    cup_rows = []
-    if has_cup_size:
-        cup_rows = db.execute(text("""
-            SELECT "CupSizeId", "SizeLabel"
-            FROM mdm."CupSize"
-            WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
-              AND ("IsActive" = true OR "IsActive" IS NULL)
-            ORDER BY "CupSizeId"
-        """)).fetchall()
-
-    return {
-        "categoryId":   cat.categoryId,
-        "bandSizeType": band_size_type,
-        "hasCupSize":   has_cup_size,
-        "bandSizes": [{
-            "sizeId":    r[0],
-            "sizeLabel": r[1],
-            "sizeCode":  r[2],
-            "sizeType":  r[3],
-        } for r in size_rows],
-        "cupSizes": [{
-            "cupSizeId": r[0],
-            "sizeLabel": r[1],
-        } for r in cup_rows],
-    }
-
-
 # ── User-facing: nested category menu tree ────────────────────────────────────
 
 def get_category_menu(db: Session) -> dict:
@@ -236,6 +167,7 @@ def get_category_menu(db: Session) -> dict:
                 "name":             child.name,
                 "url":              child.url,
                 "about":            child.about,
+                "categoryImage":    child.categoryImage,
                 "parentCategoryId": child.parentCategoryId,
                 "groupCategoryId":  child.groupCategoryId,
                 "children":         _build(child.categoryId),

@@ -5,7 +5,7 @@ from database import Base
 
 class Category(Base):
     __tablename__ = "Category"
-    __table_args__ = {"schema": "twam", "extend_existing": True}
+    __table_args__ = {"schema": "twam"}
 
     categoryId      = Column("CategoryId",       BigInteger, primary_key=True, index=True, autoincrement=True)
     name            = Column("Name",             String,     nullable=True)
@@ -17,11 +17,9 @@ class Category(Base):
     groupCategoryId = Column("GroupCategoryId",  Boolean,    nullable=True)
     isActive        = Column("IsActive",         Boolean,    nullable=True)
     categoryImage   = Column("CategoryImage",    String,     nullable=True)
-    bandSizeType    = Column("BandSizeType",     String,     nullable=True)   # 'alpha' | 'numerical'
-    hasCupSize      = Column("HasCupSize",       Boolean,    nullable=True, default=False)
     createdDate     = Column("CreatedDate",      DateTime(timezone=True), server_default=func.now())
     modifiedDate    = Column("ModifiedDate",     DateTime(timezone=True), onupdate=func.now(), nullable=True)
     deletedInd      = Column("DeletedInd",       Boolean,    default=False)
-    createdBy      = Column("CreatedBy",      String,  nullable=True)
-    modifiedBy     = Column("ModifiedBy",     String,  nullable=True)
-    organizationId = Column("OrganizationId", Integer, nullable=True)
+    createdBy       = Column("CreatedBy",        String,     nullable=True)
+    modifiedBy      = Column("ModifiedBy",       String,     nullable=True)
+    organizationId  = Column("OrganizationId",   Integer,    nullable=True)
