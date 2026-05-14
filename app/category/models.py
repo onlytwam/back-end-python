@@ -5,7 +5,7 @@ from database import Base
 
 class Category(Base):
     __tablename__ = "Category"
-    __table_args__ = {"schema": "twam", "extend_existing": True}
+    __table_args__ = {"schema": "twam"}
 
     categoryId      = Column("CategoryId",       BigInteger, primary_key=True, index=True, autoincrement=True)
     name            = Column("Name",             String,     nullable=True)
