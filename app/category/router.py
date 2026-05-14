@@ -1,10 +1,11 @@
 import re
 import json
 from typing import Optional, List, Dict
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy.orm import Session
 from database import get_db
 from app.auth.dependencies import get_current_user, require_roles, Roles
+from app.shared.azure_storage import upload_image, delete_image
 from . import schemas, repository
 
 router = APIRouter(prefix="/api/Category", tags=["Category"])
@@ -130,24 +131,51 @@ def update_category(category_id: int, command: schemas.CategoryUpdate, db: Sessi
 def delete_category(category_id: int, db: Session = Depends(get_db)):
     if not repository.delete_category(db, category_id):
         raise HTTPException(404, "Category not found.")
-
-
-# ── Sizes for a category (public — used by admin modal preview AND product pages) ──
-@router.get("/{category_id}/sizes")
-def get_category_sizes(category_id: int, db: Session = Depends(get_db)):
-    """
-    Returns bandSizes (filtered by the category's bandSizeType) and cupSizes
-    (only if hasCupSize=True).  Used by:
-      - Admin category modal to preview sizes when bandSizeType / hasCupSize is toggled
-      - Product detail / QuickShop to render the correct size grid
-    """
-    result = repository.get_category_sizes(db, category_id)
+@router.get("/GetCategory/{category_id}", response_model=schemas.CategoryResponse)
+def get_category_public(category_id: int, db: Session = Depends(get_db)):
+    """Public endpoint — fetch a single category by ID (no auth required)."""
+    result = repository.get_category_by_id(db, category_id)
     if not result:
         raise HTTPException(404, "Category not found.")
     return result
 
 
-# /{category_id} MUST be last — catch-all for integer path
+@router.put(
+    "/{category_id}/image",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def upload_category_image(
+    category_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload / replace the image for a category (admin only)."""
+    cat = db.query(repository.Category).filter(
+        repository.Category.categoryId == category_id,
+        repository.Category.deletedInd == False,
+    ).first()
+    if not cat:
+        raise HTTPException(404, "Category not found.")
+
+    old_url = cat.categoryImage or ""
+    new_url = upload_image(file, container_key="category", folder=f"category_{category_id}")
+
+    # Resolve to absolute URL for local /uploads/ paths
+    if new_url and new_url.startswith("/uploads/"):
+        new_url = str(request.base_url).rstrip("/") + new_url
+
+    cat.categoryImage = new_url
+    from datetime import datetime, timezone
+    cat.modifiedDate = datetime.now(timezone.utc)
+    db.commit()
+
+    if old_url and old_url != new_url:
+        delete_image(old_url)
+
+    return {"success": True, "categoryId": category_id, "imageUrl": new_url}
+
+
 @router.get("/{category_id}", response_model=schemas.CategoryResponse,
             dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def get_category(category_id: int, db: Session = Depends(get_db)):

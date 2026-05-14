@@ -11,11 +11,9 @@ class CategoryCreate(BaseModel):
     displayOrder:     Optional[int]  = None
     parentCategoryId: Optional[int]  = None
     groupCategoryId:  Optional[bool] = None   # auto-set in repository
-    isActive:         Optional[bool] = True   # default active
+    isActive:         Optional[bool] = True
     userProfileId:    Optional[str]  = None
     categoryImage:    Optional[str]  = None
-    bandSizeType:     Optional[str]  = None   # 'alpha' | 'numerical'
-    hasCupSize:       Optional[bool] = False
 
 
 class CategoryUpdate(BaseModel):
@@ -26,10 +24,8 @@ class CategoryUpdate(BaseModel):
     displayOrder:     Optional[int]  = None
     parentCategoryId: Optional[int]  = None
     groupCategoryId:  Optional[bool] = None   # auto-set in repository
-    isActive:         Optional[bool] = True   # default active
+    isActive:         Optional[bool] = True
     categoryImage:    Optional[str]  = None
-    bandSizeType:     Optional[str]  = None   # 'alpha' | 'numerical'
-    hasCupSize:       Optional[bool] = None
 
 
 class CategoryResponse(BaseModel):
@@ -44,8 +40,6 @@ class CategoryResponse(BaseModel):
     groupCategoryId:    Optional[bool]     = None
     isActive:           Optional[bool]     = None
     categoryImage:      Optional[str]      = None
-    bandSizeType:       Optional[str]      = None
-    hasCupSize:         Optional[bool]     = None
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
 
@@ -66,6 +60,7 @@ class CategoryMenu(BaseModel):
     name:             Optional[str]  = None
     url:              Optional[str]  = None
     about:            Optional[str]  = None
+    categoryImage:    Optional[str]  = None
     parentCategoryId: Optional[int]  = None
     groupCategoryId:  Optional[bool] = None
     children:         List["CategoryMenu"] = []

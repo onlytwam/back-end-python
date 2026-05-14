@@ -181,7 +181,8 @@ def update_brand(
     brandImage:       Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ) -> schemas.BrandResponse:
-    if not repository.get_brand_by_id(db, brand_id):
+    existing = repository.get_brand_by_id(db, brand_id)
+    if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
     # Validate supplied fields through schema
@@ -202,10 +203,16 @@ def update_brand(
     }
 
     if brandLogo and brandLogo.filename:
+        # Permanently delete old logo from blob before saving the replacement
+        if existing.brandLogo:
+            delete_image(existing.brandLogo)
         data["brandLogo"] = _save_upload(brandLogo)
         logger.info("Updated brand logo: %s", data["brandLogo"])
 
     if brandImage and brandImage.filename:
+        # Permanently delete old image from blob before saving the replacement
+        if existing.brandImage:
+            delete_image(existing.brandImage)
         data["brandImage"] = _save_upload(brandImage)
         logger.info("Updated brand image: %s", data["brandImage"])
 
@@ -225,5 +232,19 @@ def delete_brand(
     brand_id: int,
     db: Session = Depends(get_db),
 ) -> None:
+    # Fetch first so we have image URLs before the record is gone
+    existing = repository.get_brand_by_id(db, brand_id)
+    if not existing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
+
+    old_logo  = existing.brandLogo
+    old_image = existing.brandImage
+
     if not repository.delete_brand(db, brand_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
+
+    # Permanently remove both blobs from storage
+    if old_logo:
+        delete_image(old_logo)
+    if old_image:
+        delete_image(old_image)

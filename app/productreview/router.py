@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from . import schemas, repository
 from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
-from app.shared.azure_storage import upload_image
+from app.shared.azure_storage import upload_image, delete_image
 
 router = APIRouter(prefix="/api/ProductReview", tags=["ProductReview"])
 
@@ -81,8 +81,20 @@ def create_review(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     photo_path: Optional[str] = None
-    if photo and photo.filename:          # file was actually attached
+    old_photo:  Optional[str] = None
+
+    if photo and photo.filename:
+        # If an existing review for this itemId already has a photo, remember it
+        # so we can delete the old blob after the new upload succeeds
+        if itemId:
+            existing = repository.get_review_by_item_id(db, itemId)
+            old_photo = existing.get("photo") if existing else None
+
         photo_path = _save_photo(photo)
+
+        # Permanently remove the replaced photo from blob storage
+        if old_photo:
+            delete_image(old_photo)
 
     command = schemas.ProductReviewCreate(
         productId=productId,
@@ -124,7 +136,15 @@ def update_review(
 ):
     photo_path: Optional[str] = None
     if photo and photo.filename:
+        # Fetch existing review to get the old photo URL before overwriting
+        existing = repository.get_review_by_id(db, review_id)
+        old_photo = existing.get("photo") if existing else None
+
         photo_path = _save_photo(photo)
+
+        # Permanently delete the old photo from blob storage now that new one is saved
+        if old_photo:
+            delete_image(old_photo)
 
     command = schemas.ProductReviewUpdate(
         productReviewId=review_id,
@@ -144,6 +164,34 @@ def update_review(
     if not result:
         raise HTTPException(status_code=404, detail="Review not found.")
     return {"productReviewId": result}
+
+
+# ---------------------------------------------------------------------------
+# DELETE  — permanently removes the review and its blob photo
+# ---------------------------------------------------------------------------
+
+@router.delete("/{review_id}", status_code=204)
+def delete_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(
+        require_roles(Roles.SUPER_ADMIN, Roles.CUSTOMER_SUPPORT, Roles.ORDER_MANAGER)
+    ),
+):
+    # Fetch before deleting so we have the photo URL
+    existing = repository.get_review_by_id(db, review_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Review not found.")
+
+    old_photo = existing.get("photo")
+
+    deleted = repository.delete_review(db, review_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Review not found.")
+
+    # Permanently delete the photo from blob storage
+    if old_photo:
+        delete_image(old_photo)
 
 
 # ---------------------------------------------------------------------------

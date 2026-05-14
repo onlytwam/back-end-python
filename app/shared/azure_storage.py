@@ -51,16 +51,23 @@ LOCAL_UPLOAD_ROOT = _APP_ROOT / "uploads"
 # ── Container registry ────────────────────────────────────────────────────────
 # Add new containers here; they are created automatically on first use.
 CONTAINERS: dict[str, str] = {
-    "profiles":       "profiles",        # user profile pictures
-    "products":       "product-images",  # product / variant images
-    "reviews":        "reviews",         # customer review photos
-    "brands":         "brands",          # brand logos / banners
-    "blogs":          "blogs",           # blog article images
-    "uploads":        "uploads",         # general / contact-us attachments
+    "profiles":         "profiles",          # user profile pictures
+    "products":         "product-images",    # product / variant images
+    "reviews":          "reviews",           # customer review photos
+    "brands":           "brands",            # brand logos / banners
+    "blogs":            "blogs",             # blog article images
+    "uploads":          "uploads",           # general / contact-us attachments
+    "home":             "home",              # home page images & hero video
+    "category":         "category",          # category banner / hero images
 }
 
 # Mime types accepted for image-only endpoints
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg"}
+
+# Mime types accepted for page-level media slots (hero video, section images, etc.)
+# Videos are only allowed here — not on product/brand/review image endpoints.
+ALLOWED_VIDEO_TYPES = {"video/mp4", "video/webm"}
+ALLOWED_SITE_MEDIA_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_VIDEO_TYPES
 
 # Mime types accepted for the general-purpose upload endpoint (contact us, etc.)
 ALLOWED_UPLOAD_TYPES = ALLOWED_IMAGE_TYPES | {"application/pdf"}
@@ -81,7 +88,7 @@ def _safe_blob_name(filename: str, prefix: str = "") -> str:
     else:
         stem, ext = filename, "jpg"
 
-    if ext not in ("jpg", "jpeg", "png", "webp", "gif", "pdf"):
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif", "pdf", "mp4", "webm"):
         ext = "jpg"
 
     stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)[:40].strip("_") or "file"
@@ -184,6 +191,29 @@ def upload_file(
             ),
         )
     return _do_upload(file, container_key, folder, allowed_types=ALLOWED_UPLOAD_TYPES)
+
+
+def upload_media(
+    file: UploadFile,
+    container_key: str,
+    folder: str = "",
+) -> str:
+    """
+    Upload an image OR a video file — used exclusively by page-image slots
+    such as the home hero video.  All other image endpoints continue to use
+    upload_image() which does not allow video.
+
+    Returns the public URL / local path identical to upload_image().
+    """
+    if file.content_type not in ALLOWED_SITE_MEDIA_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{file.content_type}'. "
+                "Allowed: jpeg, png, webp, gif, mp4, webm."
+            ),
+        )
+    return _do_upload(file, container_key, folder, allowed_types=ALLOWED_SITE_MEDIA_TYPES)
 
 
 def upload_bytes(

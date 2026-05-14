@@ -130,9 +130,20 @@ def get_blog_by_id(id: int, db: Session = Depends(get_db)):
 # ---------------- DELETE ----------------
 @router.delete("/{id}", response_model=schemas.BlogWrappedResponse)
 def delete_blog(id: int, db: Session = Depends(get_db)):
+    # Fetch image URL BEFORE the record is deleted so we can clean up the blob
+    existing = repository.get_blog_by_id(db, id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    old_image_url = getattr(existing, "imageUrl", None)
+
     deleted_blog = repository.delete_blog(db, id)
     if not deleted_blog:
         raise HTTPException(status_code=404, detail="Blog not found")
+
+    # Permanently remove the image from blob storage
+    if old_image_url:
+        delete_image(old_image_url)
 
     return {
         "success": True,
