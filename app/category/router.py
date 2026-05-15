@@ -76,7 +76,11 @@ def get_product_detail_categories(
     o_asc   = order_ascending if order_ascending is not None else Order_Ascending
 
     filters = parse_angular_filters(request) or parse_filters(Filters) or []
-    return repository.get_all_categories(db, filters, o_asc, o_prop, p_index, p_size)
+    # Public endpoint: never show categories that have no approved products
+    return repository.get_all_categories(
+        db, filters, o_asc, o_prop, p_index, p_size,
+        with_products_only=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,6 +128,49 @@ def update_category(category_id: int, command: schemas.CategoryUpdate, db: Sessi
     result = repository.update_category(db, category_id, command)
     if not result: raise HTTPException(404, "Category not found.")
     return {"categoryId": result}
+
+
+@router.get(
+    "/{category_id}/check-delete",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def check_category_delete(category_id: int, db: Session = Depends(get_db)):
+    """
+    Pre-flight check before deletion.
+    Returns whether the category is a parent, how many children it has,
+    and how many products (across itself and all children) will be hidden.
+    The frontend uses this to show a confirmation popup before calling DELETE.
+    """
+    cat = db.query(repository.Category).filter(
+        repository.Category.categoryId == category_id,
+        repository.Category.deletedInd == False,
+    ).first()
+    if not cat:
+        raise HTTPException(404, "Category not found.")
+
+    children = repository.get_children(db, category_id)
+    child_ids = [c.categoryId for c in children]
+    all_ids   = [category_id] + child_ids
+
+    # Count products linked to this category or any of its children
+    from sqlalchemy import text
+    product_count_row = db.execute(text("""
+        SELECT COUNT(DISTINCT p."ProductId")
+        FROM twam."Products" p
+        JOIN twam."ProductVariantDetail" pvd ON pvd."ProductId" = p."ProductId"
+        WHERE p."DeletedInd"   = false
+          AND pvd."DeletedInd" = false
+          AND (p."CategoryId" = ANY(:ids) OR p."ChildCategoryId" = ANY(:ids))
+    """), {"ids": all_ids}).fetchone()
+
+    return {
+        "categoryId":    category_id,
+        "name":          cat.name,
+        "isParent":      len(child_ids) > 0,
+        "childCount":    len(child_ids),
+        "productCount":  int(product_count_row[0]) if product_count_row else 0,
+        "children":      [{"categoryId": c.categoryId, "name": c.name} for c in children],
+    }
 
 
 @router.delete("/{category_id}",

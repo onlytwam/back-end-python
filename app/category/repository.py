@@ -17,11 +17,35 @@ def get_all_categories(
     page_index: Optional[int] = None,
     page_size: Optional[int] = None,
     only_child: bool = False,
+    with_products_only: bool = False,
 ) -> dict:
-    query = db.query(Category).filter(Category.deletedInd == False)
+    query = db.query(Category).filter(Category.deletedInd == False, Category.isActive == True)
 
     if only_child:
         query = query.filter(Category.groupCategoryId != True)
+
+    # ── Filter to only categories (and their parents) that have products ──────
+    if with_products_only:
+        counts_raw = get_category_product_counts(db)
+        cats_with_products: set = {row["categoryId"] for row in counts_raw if row["count"] > 0}
+
+        # Expand upward: mark every ancestor of a populated child as included
+        all_cats = db.query(Category).filter(Category.deletedInd == False).all()
+        cat_map  = {c.categoryId: c for c in all_cats}
+        expanded: set = set(cats_with_products)
+        for cat_id in list(cats_with_products):
+            cat = cat_map.get(cat_id)
+            while cat and cat.parentCategoryId:
+                parent = cat_map.get(cat.parentCategoryId)
+                if parent:
+                    expanded.add(parent.categoryId)
+                cat = parent
+
+        if expanded:
+            query = query.filter(Category.categoryId.in_(expanded))
+        else:
+            # No products at all — return empty result set
+            return build_paged_response(0, [])
 
     query = apply_filters(query, Category, filters)
     if order_property:
@@ -292,20 +316,34 @@ def get_category_menu(db: Session) -> dict:
 # ── Category product counts ───────────────────────────────────────────────────
 
 def get_category_product_counts(db: Session) -> List[dict]:
+    # Join the Category table so we only count products whose category is
+    # still alive (DeletedInd=false) AND visible (IsActive=true).
+    # Without this join, deleting or hiding a category would still make its
+    # product counts appear in the menu/storefront.
     child_sql = text("""
         SELECT p."ChildCategoryId" AS category_id, COUNT(*) AS cnt
         FROM twam."ProductVariantDetail" pvd
-        JOIN twam."Products" p ON p."ProductId" = pvd."ProductId"
-        WHERE pvd."DeletedInd" = false AND p."DeletedInd" = false AND pvd."State" = 'Approved'
+        JOIN twam."Products"  p  ON p."ProductId"   = pvd."ProductId"
+        JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
+        WHERE pvd."DeletedInd" = false
+          AND p."DeletedInd"   = false
+          AND pvd."State"      = 'Approved'
           AND p."ChildCategoryId" IS NOT NULL
+          AND cc."DeletedInd"  = false
+          AND cc."IsActive"    = true
         GROUP BY p."ChildCategoryId"
     """)
     parent_sql = text("""
         SELECT p."CategoryId" AS category_id, COUNT(*) AS cnt
         FROM twam."ProductVariantDetail" pvd
-        JOIN twam."Products" p ON p."ProductId" = pvd."ProductId"
-        WHERE pvd."DeletedInd" = false AND p."DeletedInd" = false AND pvd."State" = 'Approved'
-          AND p."CategoryId" IS NOT NULL
+        JOIN twam."Products"  p  ON p."ProductId"  = pvd."ProductId"
+        JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
+        WHERE pvd."DeletedInd" = false
+          AND p."DeletedInd"   = false
+          AND pvd."State"      = 'Approved'
+          AND p."CategoryId"   IS NOT NULL
+          AND pc."DeletedInd"  = false
+          AND pc."IsActive"    = true
         GROUP BY p."CategoryId"
     """)
     rows  = db.execute(child_sql).fetchall()
