@@ -7,7 +7,7 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import Products
 
 def _to_response(db: Session, product: Products) -> dict:
-    """Attach brandName from public.Brand join."""
+    """Attach brandName from public.Brand join and categoryName + isActive from Category."""
     brand_name = None
     if product.brandId:
         row = db.execute(
@@ -16,6 +16,20 @@ def _to_response(db: Session, product: Products) -> dict:
         ).fetchone()
         if row:
             brand_name = row[0]
+
+    # Resolve category name and active status (child category takes priority for name)
+    category_name = None
+    category_is_active = None
+    cat_id = product.childCategoryId or product.categoryId
+    if cat_id:
+        row = db.execute(
+            text('SELECT "Name", "IsActive" FROM twam."Category" WHERE "CategoryId" = :id AND "DeletedInd" = false LIMIT 1'),
+            {"id": cat_id}
+        ).fetchone()
+        if row:
+            category_name = row[0]
+            category_is_active = bool(row[1])
+
     return {
         "productId":        product.productId,
         "productCode":      product.productCode,
@@ -23,6 +37,8 @@ def _to_response(db: Session, product: Products) -> dict:
         "description":      product.description,
         "categoryId":       product.categoryId,
         "childCategoryId":  product.childCategoryId,
+        "categoryName":     category_name,
+        "categoryIsActive": category_is_active,
         "brandId":          product.brandId,
         "brandName":        brand_name,
         "personalId":       product.personalId,
