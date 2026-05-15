@@ -602,7 +602,7 @@ def _save_profile_image_file(upload: UploadFile, user_id: str) -> str:
         file_bytes=file_bytes,
         filename=filename,
         content_type=content_type or f"image/{extension.lstrip('.')}",
-        container_key="profile_images",
+        container_key="profiles",
     )
 
 
@@ -622,7 +622,7 @@ def _save_profile_image_data(image_payload: str, user_id: str) -> str:
         file_bytes=image_bytes,
         filename=filename,
         content_type=content_type,
-        container_key="profile_images",
+        container_key="profiles",
     )
 
 
