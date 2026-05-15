@@ -8,7 +8,7 @@ import binascii
 import logging
 import re
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
@@ -242,17 +242,29 @@ def _get_role_name(db: Session, role_id: int) -> str:
     
     return role.RoleName if role else ""
 
+_MAX_FAILED_ATTEMPTS  = 5                  # lock after this many consecutive failures
+_LOCKOUT_DURATION_MIN = 10                 # auto-unlock after this many minutes
+
+
 def _increment_access_failed(db: Session, user: IdentityUser):
+    """
+    Increment the failed-login counter.
+    After _MAX_FAILED_ATTEMPTS failures, set a timed LockoutEnd instead of
+    permanently disabling the account — the account auto-unlocks after
+    _LOCKOUT_DURATION_MIN minutes without any admin action required.
+    """
     user.AccessFailedCount = (user.AccessFailedCount or 0) + 1
-    if user.AccessFailedCount >= 3:
-        user.IsActive = False
+    if user.AccessFailedCount >= _MAX_FAILED_ATTEMPTS:
+        user.LockoutEnd = datetime.now(timezone.utc) + timedelta(minutes=_LOCKOUT_DURATION_MIN)
+        # NOTE: IsActive is NOT set to False — the account unlocks automatically
     db.commit()
     db.refresh(user)
 
 
 def _reset_access_failed(db: Session, user: IdentityUser):
-    """Reset failed access count using ORM"""
+    """Reset failed access count and clear any lockout on successful login."""
     user.AccessFailedCount = 0
+    user.LockoutEnd        = None       # clear timed lockout on successful login
     db.commit()
 
 
@@ -262,40 +274,53 @@ def _reset_access_failed(db: Session, user: IdentityUser):
 
 class AuthResult:
     """Authentication result container"""
-    def __init__(self, success: bool, error: str = "", user: IdentityUser = None):
+    def __init__(self, success: bool, error: str = "", user: IdentityUser = None, lockout_remaining_minutes: int = None):
         self.success = success
         self.error = error
         self.user = user
+        self.lockout_remaining_minutes = lockout_remaining_minutes
 
 
 def authenticate_user(db: Session, username: str, encrypted_password: str) -> AuthResult:
     user = _get_identity_user_by_username(db, username)
-    
+
     if not user:
         return AuthResult(False, "not_allowed")
-    
+
     if not user.IsActive:
         return AuthResult(False, "locked_out")
 
-    
+    # ── Timed lockout check with auto-unlock ──────────────────────────────────
+    if user.LockoutEnd is not None:
+        lockout_end = user.LockoutEnd
+        if lockout_end.tzinfo is None:
+            lockout_end = lockout_end.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) < lockout_end:
+            # Still within the lockout window
+            remaining = int((lockout_end - datetime.now(timezone.utc)).total_seconds() / 60) + 1
+            return AuthResult(False, "locked_out", lockout_remaining_minutes=remaining)
+        else:
+            # Lockout window has passed — auto-unlock the account
+            _reset_access_failed(db, user)
+
     logger.debug(f"[Auth] stored hash prefix: {user.PasswordHash[:20] if user.PasswordHash else 'NULL'}")
     logger.debug(f"[Auth] AccessFailedCount: {user.AccessFailedCount}")
-    
+
     is_valid = verify_password(
-        encrypted_password, 
-        user.PasswordHash, 
+        encrypted_password,
+        user.PasswordHash,
         is_client_encrypted=True
     )
-    
+
     if not is_valid:
         _increment_access_failed(db, user)
-        
-        if user.AccessFailedCount >= 3:
+
+        if user.AccessFailedCount >= _MAX_FAILED_ATTEMPTS:
             return AuthResult(False, "locked_out")
-        
+
         return AuthResult(False, "invalid_credentials")
-    
-    # Success - reset failed count
+
+    # Success — reset failed count and clear any leftover lockout
     _reset_access_failed(db, user)
     return AuthResult(True, user=user)
 
@@ -352,7 +377,11 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
     Build JWT token claims from user object.
     IMPROVED: Uses ORM model properties instead of dictionary keys.
     """
-    role_name = _get_role_name(db, user.UserRoleId or 2)
+    # Bug 4 fix: do NOT default UserRoleId to 2 — that silently downgrades
+    # admin/staff accounts (role 1, 3+) to customer role when UserRoleId is NULL.
+    # If UserRoleId is genuinely NULL in the DB, fix the data; don't mask the problem.
+    role_id   = user.UserRoleId          # use exact value from DB, no fallback
+    role_name = _get_role_name(db, role_id) if role_id is not None else ""
     session   = str(uuid.uuid4())
     full_name = user.full_name
 
@@ -386,7 +415,7 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
         "MiddleName":         user.MiddleName or "",
         "LastName":           user.LastName or "",
         "ProfileImageUrl":    _normalize_profile_image_url(user.ProfileImageUrl) or "",
-        "RoleId":             str(user.UserRoleId or 2),
+        "RoleId":             str(role_id) if role_id is not None else "",
         "RoleName":           role_name,
         "role":               role_name,
         "family_name":        user.LastName or "",
@@ -573,7 +602,7 @@ def _save_profile_image_file(upload: UploadFile, user_id: str) -> str:
         file_bytes=file_bytes,
         filename=filename,
         content_type=content_type or f"image/{extension.lstrip('.')}",
-        container_key="profiles",
+        container_key="profile_images",
     )
 
 
@@ -593,7 +622,7 @@ def _save_profile_image_data(image_payload: str, user_id: str) -> str:
         file_bytes=image_bytes,
         filename=filename,
         content_type=content_type,
-        container_key="profiles",
+        container_key="profile_images",
     )
 
 

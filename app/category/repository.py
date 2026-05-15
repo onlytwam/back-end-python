@@ -136,17 +136,109 @@ def update_category(db: Session, category_id: int, data) -> Optional[int]:
     return cat.categoryId
 
 
-def delete_category(db: Session, category_id: int) -> bool:
+def delete_category(db: Session, category_id: int, cascade_children: bool = True):
     cat = db.query(Category).filter(
         Category.categoryId == category_id,
         Category.deletedInd == False
     ).first()
     if not cat:
-        return False
+        return None
+
+    is_parent = cat.parentCategoryId is None or bool(cat.groupCategoryId)
+
+    now = datetime.now(timezone.utc)
     cat.deletedInd   = True
-    cat.modifiedDate = datetime.now(timezone.utc)
+    cat.modifiedDate = now
+
+    children_deleted = 0
+    if cascade_children:
+        children = db.query(Category).filter(
+            Category.parentCategoryId == category_id,
+            Category.deletedInd       == False,
+        ).all()
+        for child in children:
+            child.deletedInd   = True
+            child.modifiedDate = now
+            children_deleted  += 1
+
     db.commit()
-    return True
+    return {"categoryId": category_id, "isParent": is_parent, "childrenDeleted": children_deleted}
+
+
+def get_children(db: Session, category_id: int) -> list:
+    """Return all direct child categories of a given category."""
+    return db.query(Category).filter(
+        Category.parentCategoryId == category_id,
+        Category.deletedInd       == False,
+    ).all()
+
+
+def toggle_category_visibility(
+    db: Session,
+    category_id: int,
+    unhide_children: bool = False,
+) -> Optional[dict]:
+    """Toggle isActive (visible/hidden) for a category.
+
+    Hiding a parent also hides all its children so the entire branch
+    disappears from the storefront in one click.
+
+    When un-hiding (new_state=True) and unhide_children=True, all children
+    are restored to visible as well. If unhide_children=False the children
+    remain hidden and the admin can manually restore them.
+    """
+    cat = db.query(Category).filter(
+        Category.categoryId == category_id,
+        Category.deletedInd == False
+    ).first()
+    if not cat:
+        return None
+
+    new_state = not bool(cat.isActive)
+    cat.isActive     = new_state
+    cat.modifiedDate = datetime.now(timezone.utc)
+
+    children = db.query(Category).filter(
+        Category.parentCategoryId == category_id,
+        Category.deletedInd       == False,
+    ).all()
+
+    child_count = len(children)
+
+    # If hiding → always cascade hide to all children
+    if not new_state:
+        for child in children:
+            child.isActive     = False
+            child.modifiedDate = datetime.now(timezone.utc)
+    # If un-hiding and caller opted in → restore children too
+    elif unhide_children:
+        for child in children:
+            child.isActive     = True
+            child.modifiedDate = datetime.now(timezone.utc)
+
+    db.commit()
+    return {
+        "categoryId":  category_id,
+        "isActive":    new_state,
+        "childCount":  child_count,
+        "isParent":    child_count > 0,
+    }
+
+
+def delete_category_image(db: Session, category_id: int) -> Optional[str]:
+    """Clear the categoryImage field and return the old URL for blob deletion."""
+    cat = db.query(Category).filter(
+        Category.categoryId == category_id,
+        Category.deletedInd == False
+    ).first()
+    if not cat:
+        return None
+    old_url = cat.categoryImage
+    cat.categoryImage = None
+    cat.modifiedDate  = datetime.now(timezone.utc)
+    db.commit()
+    return old_url
+
 # ── User-facing: nested category menu tree ────────────────────────────────────
 
 def get_category_menu(db: Session) -> dict:
@@ -158,10 +250,29 @@ def get_category_menu(db: Session) -> dict:
         asc(Category.displayOrder)
     ).all()
 
+    # Build the set of category IDs that have at least one approved product.
+    # A parent category must have products in itself OR in any descendant to be shown.
+    counts_raw = get_category_product_counts(db)
+    categories_with_products: set = {row["categoryId"] for row in counts_raw if row["count"] > 0}
+
+    # Expand upward: if a child has products, mark every ancestor as having products too.
+    cat_map = {c.categoryId: c for c in categories}
+    expanded: set = set(categories_with_products)
+    for cat_id in list(categories_with_products):
+        cat = cat_map.get(cat_id)
+        while cat and cat.parentCategoryId:
+            parent = cat_map.get(cat.parentCategoryId)
+            if parent:
+                expanded.add(parent.categoryId)
+            cat = parent
+
     def _build(parent_id):
         result = []
         children = [c for c in categories if c.parentCategoryId == parent_id]
         for child in children:
+            # Skip this entire branch if it has no products
+            if child.categoryId not in expanded:
+                continue
             node = {
                 "categoryId":       child.categoryId,
                 "name":             child.name,

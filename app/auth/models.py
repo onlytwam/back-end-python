@@ -12,7 +12,6 @@ from sqlalchemy.sql import func
 
 from database import Base
 from app.userrole.models import UserRole
-from app.stores.models import Stores
 from sqlalchemy.orm import relationship
 
 
@@ -50,11 +49,12 @@ class IdentityUser(Base):
     OrganizationId       = Column("OrganizationId",       Integer, nullable=True)
     DeletedInd           = Column("DeletedInd",           Boolean, default=False)
     IsRandomPassword     = Column("IsRandomPassword",     Boolean, default=False)
-    StoreId              = Column("StoreId",              Integer, ForeignKey("twam.Stores.StoreId"),nullable=True)
-    warehouseId          = Column("WarehouseId",          Integer, ForeignKey("twam.Warehouses.WarehouseId"), nullable=True)
-
-    store = relationship("Stores")
-    warehouse = relationship("Warehouse")
+    StoreId              = Column("StoreId",     Integer, ForeignKey("twam.Stores.StoreId"),        nullable=True)
+    WarehouseId          = Column("WarehouseId", Integer, ForeignKey("twam.Warehouses.WarehouseId"), nullable=True)
+    # NOTE: No relationship() here — store/warehouse data is read from the
+    # People table (which has properly-paired back_populates relationships).
+    # Adding relationships here caused SQLAlchemy overlap conflicts with
+    # Stores.people and Warehouse.people which both back_populates to People.
 
     def __repr__(self):
         return f"<IdentityUser(Id={self.Id}, UserName={self.UserName}, Email={self.Email})>"

@@ -63,7 +63,7 @@ def create_blog(
     db: Session = Depends(get_db)
 ):
     # Upload image to Azure Blob (or local disk in dev) — container: blogs
-    image_url = upload_image(image, container_key="blogs")
+    image_url = upload_image(image, container_key="blog")
 
     blog_data = schemas.BlogCreate(
         blogTitle=blogTitle,
@@ -107,7 +107,7 @@ def update_blog(
         if old_image_url:
             delete_image(old_image_url)
 
-        update_data["imageUrl"] = upload_image(image, container_key="blogs")
+        update_data["imageUrl"] = upload_image(image, container_key="blog")
 
     updated_blog = repository.update_blog(db, id, update_data)
 

@@ -22,8 +22,6 @@ from app.images.models import PageImage
 
 # ── Known page keys ────────────────────────────────────────────────────────
 # key → (initial_url, human description)
-# Initial URL is empty — admin must upload via /api/images/{page_key}.
-# The app renders nothing (or a neutral placeholder) until an image is uploaded.
 PAGE_IMAGE_DEFAULTS: dict[str, tuple[str, str]] = {
     "login_background": (
         "",
@@ -67,9 +65,10 @@ def get_by_key(db: Session, page_key: str) -> Optional[PageImage]:
 
 
 def get_all(db: Session) -> list[PageImage]:
+    """Return ALL rows (active and hidden) — used by admin panel."""
     return (
         db.query(PageImage)
-        .filter(PageImage.isActive == True, PageImage.deletedInd == False)
+        .filter(PageImage.deletedInd == False)
         .order_by(PageImage.pageKey)
         .all()
     )
@@ -99,6 +98,36 @@ def upsert(
         row.modifiedDate = now
         if description and not row.description:
             row.description = description
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def clear_image(db: Session, page_key: str) -> tuple[Optional[PageImage], str]:
+    """
+    Clear the imageUrl for page_key (keeps the row, empties the URL).
+    Returns (updated_row, old_url) so the caller can delete the Azure blob.
+    """
+    now = datetime.now(timezone.utc)
+    row = get_by_key(db, page_key)
+    if row is None:
+        return None, ""
+    old_url = row.imageUrl or ""
+    row.imageUrl = ""
+    row.modifiedDate = now
+    db.commit()
+    db.refresh(row)
+    return row, old_url
+
+
+def set_visibility(db: Session, page_key: str, is_active: bool) -> Optional[PageImage]:
+    """Set isActive for page_key (show / hide the section on the home page)."""
+    now = datetime.now(timezone.utc)
+    row = get_by_key(db, page_key)
+    if row is None:
+        return None
+    row.isActive = is_active
+    row.modifiedDate = now
     db.commit()
     db.refresh(row)
     return row

@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -138,7 +137,9 @@ def upload_variant_images(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    product_folder = sanitize_folder_name(product.productCode)
+    # Use product name as the subfolder so each product's images are grouped together
+    raw_folder_name = product.name or product.productCode or str(product.productId)
+    product_folder = sanitize_folder_name(raw_folder_name)
 
     saved_images = []
 
@@ -153,7 +154,8 @@ def upload_variant_images(
         f.file.seek(0)
 
         # upload_image handles container auto-creation + local fallback
-        file_url = upload_image(f, container_key="products", folder=f"image/{product_folder}")
+        # Each product gets its own named subfolder: product-images/<ProductName>/
+        file_url = upload_image(f, container_key="products", folder=product_folder)
 
         img = ProductImage(
             productId        = variant.productId,
@@ -205,4 +207,3 @@ def delete_variant_image(
     db.commit()
 
     return {"deleted": image_id}
-

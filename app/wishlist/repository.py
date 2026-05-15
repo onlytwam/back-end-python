@@ -17,7 +17,9 @@ def _enrich(db: Session, w: Wishlist) -> dict:
     try:
         row = db.execute(text("""
             SELECT p."Name", pv."VariantName", pvd."FinalPrice", pvd."MRPPrice", s."SizeLabel",
-                   (SELECT CONCAT(:base, pi2."FilePath") FROM twam."ProductImage" pi2
+                   (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                           ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
+                    FROM twam."ProductImage" pi2
                     WHERE pi2."ProductVariantId" = :vid AND pi2."DeletedInd"=false
                     AND pi2."FilePath" IS NOT NULL LIMIT 1)
             FROM twam."Products" p

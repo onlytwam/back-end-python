@@ -150,7 +150,8 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
 
             pvd."ProductCode" AS sku,
                 (
-                    SELECT CONCAT('{BASE_URL}', '/', pi2."FilePath")
+                    SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                      ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
                     FROM twam."ProductImage" pi2
                     WHERE (
                         (
@@ -318,7 +319,8 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
             pvd."FinalPrice",
             pvd."TaxAmount",
             (
-                SELECT CONCAT('{BASE_URL}', pi2."FilePath")
+                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = c."ProductVariantId"
                   AND pi2."DeletedInd" = false
@@ -379,7 +381,8 @@ def _get_buynow_checkout_items(db: Session, order_items: list) -> List[dict]:
             pvd."FinalPrice",
             pvd."TaxAmount",
             (
-                SELECT CONCAT('{BASE_URL}', pi2."FilePath")
+                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = pvd."ProductVariantId"
                   AND pi2."DeletedInd" = false
@@ -1303,7 +1306,8 @@ def get_return_order_items(db: Session, order_id: int, filters, order_ascending,
         SELECT
             oi."OrderItemId", oi."Quantity", oi."Price",
             p."Name", s."SizeLabel", pv."Color", pv."IsReturnAvailable",
-            (SELECT CONCAT('{BASE_URL}', pi2."FilePath")
+            (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = oi."ProductVariantId" AND pi2."DeletedInd" = false
              LIMIT 1) AS product_image

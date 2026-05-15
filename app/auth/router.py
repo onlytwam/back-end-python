@@ -499,28 +499,29 @@ async def token(
 
     result = authenticate_user(db, username, password)
     if not result.success:
-        error_map = {
-            "not_allowed":         "User not found.",
-            "locked_out":          "Account is locked. Please reset your password.",
-            "invalid_credentials": "Invalid username or password.",
-        }
-        raise HTTPException(
-            status_code=400,
-            detail=error_map.get(result.error, "Authentication failed.")
-        )
+        if result.error == "locked_out" and result.lockout_remaining_minutes:
+            detail = f"Account is temporarily locked. Try again in {result.lockout_remaining_minutes} minute(s)."
+        else:
+            error_map = {
+                "not_allowed":         "User not found.",
+                "locked_out":          "Account is locked. Please reset your password.",
+                "invalid_credentials": "Invalid username or password.",
+            }
+            detail = error_map.get(result.error, "Authentication failed.")
+        raise HTTPException(status_code=400, detail=detail)
 
-    # ✅ Get the user object from the result
-    people = result.user  
-
+    # Build claims first — they already contain storeId, warehouseId, warehouseName
+    # resolved from the People table. Use them directly instead of re-reading the
+    # IdentityUser relationship (which had the warehouseId attribute-name bug).
     claims       = build_token_claims(db, result.user)
     access_token = create_access_token(claims)
 
     return TokenResponse(
         access_token  = access_token,
         expires_in    = EXPIRES_MINUTES * 60,
-        storeId       = people.StoreId if people else None,
-        warehouseId   = people.WarehouseId if people else None,
-        warehouseName = people.warehouse.WarehouseName if (people and people.warehouse) else "",
+        storeId       = claims.get("storeId"),
+        warehouseId   = claims.get("warehouseId"),
+        warehouseName = claims.get("warehouseName", ""),
     )
 
 
