@@ -19,7 +19,13 @@ def get_all_categories(
     only_child: bool = False,
     with_products_only: bool = False,
 ) -> dict:
-    query = db.query(Category).filter(Category.deletedInd == False, Category.isActive == True)
+    # Admin grid: show ALL non-deleted categories including inactive ones.
+    # Public/user-facing callers pass with_products_only=True which adds its
+    # own isActive filter via the expanded-product-count logic below.
+    query = db.query(Category).filter(Category.deletedInd == False)
+    if with_products_only:
+        # Public endpoints only show active categories
+        query = query.filter(Category.isActive == True)
 
     if only_child:
         query = query.filter(Category.groupCategoryId != True)
