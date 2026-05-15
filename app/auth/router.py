@@ -46,6 +46,7 @@ from .repository import (
     parse_profile_update_payload,
     update_identity_user_profile,
     reset_password_with_token,
+    _MAX_FAILED_ATTEMPTS,
 )
 from .security import create_access_token, decode_reset_token, EXPIRES_MINUTES
 from .dependencies import get_current_user, require_roles, Roles, CurrentUser
@@ -500,15 +501,33 @@ async def token(
     result = authenticate_user(db, username, password)
     if not result.success:
         if result.error == "locked_out" and result.lockout_remaining_minutes:
-            detail = f"Account is temporarily locked. Try again in {result.lockout_remaining_minutes} minute(s)."
+            raise HTTPException(status_code=400, detail={
+                "error":              "locked_out",
+                "message":            f"Account is temporarily locked. Try again in {result.lockout_remaining_minutes} minute(s).",
+                "failed_count":       _MAX_FAILED_ATTEMPTS,
+                "max_attempts":       _MAX_FAILED_ATTEMPTS,
+            })
+        elif result.error == "locked_out":
+            raise HTTPException(status_code=400, detail={
+                "error":              "locked_out",
+                "message":            "Account is locked. Please reset your password.",
+                "failed_count":       _MAX_FAILED_ATTEMPTS,
+                "max_attempts":       _MAX_FAILED_ATTEMPTS,
+            })
+        elif result.error == "invalid_credentials":
+            raise HTTPException(status_code=400, detail={
+                "error":              "invalid_credentials",
+                "message":            "Invalid username or password.",
+                "failed_count":       result.failed_count or 1,
+                "max_attempts":       _MAX_FAILED_ATTEMPTS,
+            })
         else:
-            error_map = {
-                "not_allowed":         "User not found.",
-                "locked_out":          "Account is locked. Please reset your password.",
-                "invalid_credentials": "Invalid username or password.",
-            }
-            detail = error_map.get(result.error, "Authentication failed.")
-        raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(status_code=400, detail={
+                "error":              result.error,
+                "message":            "Authentication failed.",
+                "failed_count":       0,
+                "max_attempts":       _MAX_FAILED_ATTEMPTS,
+            })
 
     # Build claims first — they already contain storeId, warehouseId, warehouseName
     # resolved from the People table. Use them directly instead of re-reading the

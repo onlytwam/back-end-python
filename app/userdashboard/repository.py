@@ -68,7 +68,11 @@ def get_dashboard(db: Session, user_profile_id: str) -> dict:
             'SELECT pv."ProductVariantId", pv."ProductId", p."Name", pv."VariantDescription" '
             'FROM twam."ProductVariants" pv '
             'LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId" '
+            'LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId" '
+            'LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId" '
             'WHERE pv."DeletedInd"=false AND pv."IsBestSeller"=true '
+            'AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true)) '
+            'AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true)) '
             'ORDER BY pv."CreatedDate" DESC LIMIT 12'
         )).fetchall()
         for r in rows:
@@ -91,7 +95,11 @@ def get_dashboard(db: Session, user_profile_id: str) -> dict:
             'SELECT pv."ProductVariantId", pv."ProductId", p."Name", pv."VariantDescription" '
             'FROM twam."ProductVariants" pv '
             'LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId" '
+            'LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId" '
+            'LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId" '
             'WHERE pv."DeletedInd"=false '
+            'AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true)) '
+            'AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true)) '
             'ORDER BY pv."CreatedDate" DESC LIMIT 12'
         )).fetchall()
         for r in rows:

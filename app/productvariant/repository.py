@@ -321,7 +321,12 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         FROM twam."ProductVariants" pv
         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
         LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
-        WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL) AND {where}
+        LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
+        LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
+        WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
+          AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true))
+          AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true))
+          AND {where}
         LIMIT 1
     """
     row = db.execute(text(sql), params).fetchone()
@@ -510,7 +515,7 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
     except (ValueError, TypeError):
         return []
     rows = db.execute(
-        text('SELECT "CategoryId", "ParentCategoryId" FROM twam."Category" WHERE "DeletedInd"=false OR "DeletedInd" IS NULL')
+        text('SELECT "CategoryId", "ParentCategoryId" FROM twam."Category" WHERE ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "IsActive"=true')
     ).fetchall()
     children_map: dict = {}
     for cat_id, parent_id in rows:
@@ -540,6 +545,12 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
     conds = [
         "(pv.\"DeletedInd\" = false OR pv.\"DeletedInd\" IS NULL)",
         "(p.\"DeletedInd\"  = false OR p.\"DeletedInd\"  IS NULL)",
+        # Hide products whose parent category has been deleted or made inactive.
+        # pc is LEFT JOINed so if CategoryId is NULL we allow it through.
+        "(p.\"CategoryId\" IS NULL OR (pc.\"DeletedInd\" = false AND pc.\"IsActive\" = true))",
+        # Hide products whose child category has been deleted or made inactive.
+        # cc is LEFT JOINed so if ChildCategoryId is NULL we allow it through.
+        "(p.\"ChildCategoryId\" IS NULL OR (cc.\"DeletedInd\" = false AND cc.\"IsActive\" = true))",
     ]
     params: dict = {"base": BASE}
 
@@ -932,6 +943,8 @@ def get_new_arrivals(
         (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
         AND (p."DeletedInd"  = false OR p."DeletedInd"  IS NULL)
         AND pv."CreatedDate" >= NOW() - INTERVAL '6 months'
+        AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true))
+        AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true))
     """
 
     count_sql = f"""
@@ -942,6 +955,8 @@ def get_new_arrivals(
           ON pvd."ProductVariantId" = pv."ProductVariantId"
          AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
         LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
+        LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
+        LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE {where}
     """
 
@@ -1016,6 +1031,8 @@ def get_new_arrivals(
             LEFT JOIN mdm."Size" s     ON s."SizeId"     = pvd."Size"
             LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
             LEFT JOIN mdm."Brand" b     ON b."brandId"    = p."BrandId"
+            LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
+            LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
             ORDER BY pv."ProductVariantId", pvd."ProductVariantDetailId" ASC NULLS LAST
         ) deduped
