@@ -63,7 +63,9 @@ async def upload(
         const url = res.data.url;
     """
     # Upload to Azure / local — raises 400/500 on errors
-    file_url = upload_file(file, container_key="uploads")
+    # Stored in the dedicated user_queries container so contact-us attachments
+    # are kept separate from all other media.
+    file_url = upload_file(file, container_key="user_queries")
 
     # Persist a record so admins can audit what was uploaded
     record_id = repository.create_from_upload(

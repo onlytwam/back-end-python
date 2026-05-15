@@ -126,11 +126,13 @@ def update_category(category_id: int, command: schemas.CategoryUpdate, db: Sessi
     return {"categoryId": result}
 
 
-@router.delete("/{category_id}", status_code=204,
+@router.delete("/{category_id}",
                dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def delete_category(category_id: int, db: Session = Depends(get_db)):
-    if not repository.delete_category(db, category_id):
+    result = repository.delete_category(db, category_id)
+    if not result:
         raise HTTPException(404, "Category not found.")
+    return result
 @router.get("/GetCategory/{category_id}", response_model=schemas.CategoryResponse)
 def get_category_public(category_id: int, db: Session = Depends(get_db)):
     """Public endpoint — fetch a single category by ID (no auth required)."""
@@ -176,9 +178,52 @@ def upload_category_image(
     return {"success": True, "categoryId": category_id, "imageUrl": new_url}
 
 
+
+
+@router.patch(
+    "/{category_id}/visibility",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def toggle_category_visibility(
+    category_id: int,
+    unhide_children: bool = Query(False, alias="unhideChildren"),
+    db: Session = Depends(get_db),
+):
+    """Toggle isActive (hide / unhide) for a category.
+    Hiding a parent cascades to all its child categories.
+    When un-hiding, pass ?unhideChildren=true to also restore child categories.
+    """
+    result = repository.toggle_category_visibility(db, category_id, unhide_children)
+    if not result:
+        raise HTTPException(404, "Category not found.")
+    return result
+
+
+@router.delete(
+    "/{category_id}/image",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def delete_category_image(category_id: int, db: Session = Depends(get_db)):
+    """Remove the hero/banner image for a category."""
+    old_url = repository.delete_category_image(db, category_id)
+    if old_url is None and not repository.get_category_by_id(db, category_id):
+        raise HTTPException(404, "Category not found.")
+    if old_url:
+        delete_image(old_url)
+    return {"success": True, "categoryId": category_id}
+
 @router.get("/{category_id}", response_model=schemas.CategoryResponse,
             dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def get_category(category_id: int, db: Session = Depends(get_db)):
     result = repository.get_category_by_id(db, category_id)
     if not result: raise HTTPException(404, "Category not found.")
     return result
+
+@router.get(
+    "/{category_id}/children",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def get_category_children(category_id: int, db: Session = Depends(get_db)):
+    """Return direct child categories for a given parent category ID."""
+    children = repository.get_children(db, category_id)
+    return [{"categoryId": c.categoryId, "name": c.name, "isActive": c.isActive} for c in children]

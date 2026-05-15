@@ -27,7 +27,7 @@ def _upsert_product_color(db, color_name: str):
     except Exception:
         pass  # Table may not exist yet — ignore
     
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/") + "/"
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 
 
@@ -99,7 +99,7 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "taxHSNCodeId":       variant.taxHSNCodeId,
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
-        "images":             _get_images(db, variant.productVariantId),
+        "images":             _get_images(db, variant.productVariantId, variant.productId),
     }
 
 
@@ -156,7 +156,8 @@ def get_variant_by_id(db: Session, variant_id: int) -> Optional[dict]:
     result = _to_response(db, variant)
     for img in result["images"]:
         if img.get("filePath"):
-            img["fileData"] = f"{BASE_URL}{img['filePath']}"
+            fp = img.get("filePath") or ""
+            img["fileData"] = fp if fp.startswith("http") else f"{BASE_URL}/{fp.lstrip('/')}"
     return result
 
 
@@ -335,10 +336,21 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     # isCupSize on the variant is kept for reference; display is driven by PVD cup data below.
     is_cup_size = bool(row[7])
 
+    # Step 1: try variant-level images
     img_rows = db.execute(text(
-        'SELECT CONCAT(:base, "FilePath") FROM twam."ProductImage" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
-    ), {"pvid": pv_id, "base": BASE_URL}).fetchall()
-    images = [r[0] for r in img_rows if r[0]]
+        'SELECT "FilePath" FROM twam."ProductImage" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
+    ), {"pvid": pv_id}).fetchall()
+
+    # Step 2: fall back to product-level images (Bug 3 fix)
+    if not img_rows:
+        img_rows = db.execute(text(
+            'SELECT "FilePath" FROM twam."ProductImage" WHERE "ProductId"=:pid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
+        ), {"pid": prod_id}).fetchall()
+
+    images = [
+        r[0] if (r[0] or "").startswith("http") else f"{BASE_URL}/{r[0].lstrip('/')}"
+        for r in img_rows if r[0]
+    ]
 
     pvd_row = db.execute(text(
         'SELECT "FinalPrice","MRPPrice","AvailableQuantity","DiscountPercent","Size" FROM twam."ProductVariantDetail" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) LIMIT 1'
@@ -433,7 +445,8 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
 
     color_rows = db.execute(text("""
         SELECT pv2."ProductVariantId", pv2."Color",
-            (SELECT CONCAT(:base, pi2."FilePath")
+            (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = pv2."ProductVariantId"
                AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
@@ -516,7 +529,7 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
 
 
 def _fallback_product_list(db, filters, page_index, page_size, order_property, order_ascending):
-    BASE = os.getenv("BASE_URL", "").rstrip("/") + "/"
+    BASE = os.getenv("BASE_URL", "").rstrip("/")
 
     def _fv(prop, default=""):
         for f in (filters or []):
@@ -779,13 +792,17 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 0                                                       AS reserved_col,
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS price,
                 pvd."MRPPrice"                                          AS old_price,
-                (SELECT CONCAT(:base, pi2."FilePath")
+                (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
                  FROM twam."ProductImage" pi2
                  WHERE pi2."ProductVariantId" = pv."ProductVariantId"
                    AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
                    AND pi2."FilePath" IS NOT NULL
                  ORDER BY pi2."ProductImageId" LIMIT 1)                 AS image,
-                (SELECT ARRAY_AGG(CONCAT(:base, pi3."FilePath") ORDER BY pi3."ProductImageId")
+                (SELECT ARRAY_AGG(
+                       CASE WHEN pi3."FilePath" LIKE 'http%' THEN pi3."FilePath"
+                            ELSE CONCAT(:base, '/', LTRIM(pi3."FilePath", '/')) END
+                       ORDER BY pi3."ProductImageId")
                  FROM twam."ProductImage" pi3
                  WHERE pi3."ProductVariantId" = pv."ProductVariantId"
                    AND (pi3."DeletedInd" = false OR pi3."DeletedInd" IS NULL)
@@ -903,8 +920,7 @@ def get_new_arrivals(
     last 6 months, ordered newest-first.  Only active/non-deleted variants with
     at least one non-deleted ProductVariantDetail are returned.
     """
-    # BASE = os.getenv("BASE_URL", "")
-    BASE = os.getenv("BASE_URL", "").rstrip("/") + "/"
+    BASE = os.getenv("BASE_URL", "").rstrip("/")
 
     p_index = max(1, page_index)
     p_size  = max(1, page_size)
@@ -957,13 +973,17 @@ def get_new_arrivals(
                 0                                                       AS reserved_col,
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS price,
                 pvd."MRPPrice"                                          AS old_price,
-                (SELECT CONCAT(:base, pi2."FilePath")
+                (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
                  FROM twam."ProductImage" pi2
                  WHERE pi2."ProductVariantId" = pv."ProductVariantId"
                    AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
                    AND pi2."FilePath" IS NOT NULL
                  ORDER BY pi2."ProductImageId" LIMIT 1)                 AS image,
-                (SELECT ARRAY_AGG(CONCAT(:base, pi3."FilePath") ORDER BY pi3."ProductImageId")
+                (SELECT ARRAY_AGG(
+                       CASE WHEN pi3."FilePath" LIKE 'http%' THEN pi3."FilePath"
+                            ELSE CONCAT(:base, '/', LTRIM(pi3."FilePath", '/')) END
+                       ORDER BY pi3."ProductImageId")
                  FROM twam."ProductImage" pi3
                  WHERE pi3."ProductVariantId" = pv."ProductVariantId"
                    AND (pi3."DeletedInd" = false OR pi3."DeletedInd" IS NULL)

@@ -44,7 +44,8 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             c."CreatedDate",
             c."ModifiedDate",
             (
-                SELECT CONCAT('{BASE_URL}', pi2."FilePath")
+                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
+                      ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = c."ProductVariantId"
                   AND pi2."DeletedInd" = false

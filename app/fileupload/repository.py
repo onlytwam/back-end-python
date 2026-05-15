@@ -75,7 +75,7 @@ def create(db: Session, data) -> int:
                 file_bytes=file_bytes,
                 filename=data.fileName,
                 content_type=content_type,
-                container_key="uploads",
+                container_key="user_queries",
             )
         except Exception as exc:
             print(f"[FileUpload] Upload failed: {exc}")
