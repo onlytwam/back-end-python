@@ -77,7 +77,18 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
                AND pi3."FilePath" IS NOT NULL
              ORDER BY pi3."CreatedDate"
              OFFSET 1
-             LIMIT 1) AS hoverImage
+             LIMIT 1) AS hoverImage,
+
+            -- Category active status: inactive category = product unavailable
+            COALESCE(
+                (SELECT cc2."IsActive" FROM twam."Category" cc2
+                 WHERE cc2."CategoryId" = p."ChildCategoryId" AND cc2."DeletedInd" = false
+                 LIMIT 1),
+                (SELECT pc2."IsActive" FROM twam."Category" pc2
+                 WHERE pc2."CategoryId" = p."CategoryId" AND pc2."DeletedInd" = false
+                 LIMIT 1),
+                true
+            ) AS categoryIsActive
 
         FROM twam."Wishlist" w
         LEFT JOIN twam."ProductVariants" pv
@@ -157,6 +168,7 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
             'reviewCount':            int(g('reviewCount')) if g('reviewCount') is not None else 0,
             'sizeLabel':              g('sizeLabel'),
             'createdDate':            g('createdDate'),
+            'categoryIsActive':       bool(g('categoryIsActive')) if g('categoryIsActive') is not None else True,
         })
     
     print(f"✅ Wishlist: Retrieved {len(results)} items for filters {params}")
@@ -388,7 +400,17 @@ def get_user_wishlist(db: Session, user_id: str):
                 ORDER BY pi."ProductImageId"
                 OFFSET 1
                 LIMIT 1
-            ) AS hoverImage
+            ) AS hoverImage,
+
+            COALESCE(
+                (SELECT cc2."IsActive" FROM twam."Category" cc2
+                 WHERE cc2."CategoryId" = p."ChildCategoryId" AND cc2."DeletedInd" = false
+                 LIMIT 1),
+                (SELECT pc2."IsActive" FROM twam."Category" pc2
+                 WHERE pc2."CategoryId" = p."CategoryId" AND pc2."DeletedInd" = false
+                 LIMIT 1),
+                true
+            ) AS categoryIsActive
 
         FROM twam."Wishlist" w
         LEFT JOIN twam."Products" p 

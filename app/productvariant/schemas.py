@@ -127,3 +127,6 @@ class UserProductVariantResponse(BaseModel):
     sizes:              Optional[List[SizeDetail]] = []
     cupSizes:           Optional[List[CupSizeDetail]] = []
     colors:             Optional[List[ColorDetail]] = []
+    # categoryIsActive must be in the schema so FastAPI doesn't strip it.
+    # False means the product's category has been hidden by an admin.
+    categoryIsActive:   Optional[bool] = True

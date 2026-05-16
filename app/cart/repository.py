@@ -52,7 +52,17 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
                   AND pi2."FilePath" IS NOT NULL
                   AND pi2."FilePath" != ''
                 LIMIT 1
-            ) AS image
+            ) AS image,
+            -- Category active status for inactive-category detection
+            COALESCE(
+                (SELECT cc2."IsActive" FROM twam."Category" cc2
+                 WHERE cc2."CategoryId" = p."ChildCategoryId" AND cc2."DeletedInd" = false
+                 LIMIT 1),
+                (SELECT pc2."IsActive" FROM twam."Category" pc2
+                 WHERE pc2."CategoryId" = p."CategoryId" AND pc2."DeletedInd" = false
+                 LIMIT 1),
+                true
+            ) AS categoryIsActive
         FROM twam."Cart" c
         LEFT JOIN twam."Products"             p   ON p."ProductId"               = c."ProductId"
         LEFT JOIN mdm."Brand"                 b   ON b."brandId"                 = p."BrandId"
@@ -136,6 +146,7 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             "size":                  r[12],
             "cupSize":               r[13],
             "color":                 r[14],
+            "colorName":             r[14],  # alias so frontend colorName check works
             "stockQuantity":         r[15],
             "processedQuantity":     r[16],
             "returnedQuantity":      r[17],
@@ -149,6 +160,7 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             "createdDate":           r[25],
             "modifiedDate":          r[26],
             "image":                 r[27] or "",
+            "categoryIsActive":      bool(r[28]) if r[28] is not None else True,
             "quantity":              r[16],  # processedQuantity = cart quantity
         })
 

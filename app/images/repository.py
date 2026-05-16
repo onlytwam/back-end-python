@@ -51,6 +51,10 @@ PAGE_IMAGE_DEFAULTS: dict[str, tuple[str, str]] = {
         "",
         "Shop by Category — 'All Products' banner image",
     ),
+    "home_shop_by_category": (
+        "",
+        "Shop by Category section — visibility toggle (isActive only, no image needed)",
+    ),
 }
 
 
