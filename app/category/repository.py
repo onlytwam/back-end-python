@@ -333,7 +333,7 @@ def get_category_product_counts(db: Session) -> List[dict]:
         JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
         WHERE pvd."DeletedInd" = false
           AND p."DeletedInd"   = false
-          AND pvd."State"      = 'Approved'
+          AND (pvd."State" = 'Approved' OR pvd."State" IS NULL)
           AND p."ChildCategoryId" IS NOT NULL
           AND cc."DeletedInd"  = false
           AND cc."IsActive"    = true
@@ -346,7 +346,7 @@ def get_category_product_counts(db: Session) -> List[dict]:
         JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
         WHERE pvd."DeletedInd" = false
           AND p."DeletedInd"   = false
-          AND pvd."State"      = 'Approved'
+          AND (pvd."State" = 'Approved' OR pvd."State" IS NULL)
           AND p."CategoryId"   IS NOT NULL
           AND pc."DeletedInd"  = false
           AND pc."IsActive"    = true

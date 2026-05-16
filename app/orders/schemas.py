@@ -239,6 +239,8 @@ class GetOrderListItem(BaseModel):
     isShipped: Optional[bool] = None
     reason: Optional[str] = None
     deliveredDate: Optional[datetime] = None
+    trackingId: Optional[str] = None
+    trackingUrl: Optional[str] = None
     address: Optional[AddressResponse] = None
     deliveryInfo: Optional[DeliveryInfoResponse] = None
     orderItems: Optional[List[OrderItemModel]] = None
@@ -327,6 +329,14 @@ class GetOrderDetailsResponse(BaseModel):
     subTotal: Optional[float] = None
     taxAmount: Optional[float] = None
     deliveryCharge: Optional[float] = None
+    couponAmount: Optional[float] = None
+    # ── Tracking / shipping ───────────────────────────────────────────────────
+    trackingId: Optional[str] = None
+    trackingUrl: Optional[str] = None
+    isShipped: Optional[bool] = None
+    deliveryAgent: Optional[str] = None
+    deliveredDate: Optional[datetime] = None
+    # ── Relations ─────────────────────────────────────────────────────────────
     shippingAddress: Optional[AddressResponse] = None
     billingAddress: Optional[AddressResponse] = None
     deliveryInfo: Optional[DeliveryInfoResponse] = None
@@ -378,5 +388,3 @@ class ReturnOrderItemsResponse(BaseModel):
     count: Optional[int] = None
     list: Optional[List[ReturnOrderDetails]] = None
     parameters: Optional[Any] = None
-
-

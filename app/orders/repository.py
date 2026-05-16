@@ -192,6 +192,7 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
 
         WHERE
             oi."DeletedInd" = false
+            AND (oi."IsReturn" IS NULL OR oi."IsReturn" = false)
             AND oi."OrderId" IN ({ids_str})
         """
     try:
@@ -1060,6 +1061,8 @@ def get_order_list(db: Session, filters, order_ascending, order_property, page_i
 
     result = []
     for o in orders:
+        tracking_base = get_setting("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track")
+        tracking_url  = f"{tracking_base}/{o.trackingId}" if o.trackingId else None
         result.append({
             "orderId": o.orderId,
             "totalAmount": float(o.totalAmount) if o.totalAmount else None,
@@ -1077,6 +1080,8 @@ def get_order_list(db: Session, filters, order_ascending, order_property, page_i
             "isShipped": o.isShipped,
             "reason": o.reason,
             "deliveredDate": o.deliveredDate,
+            "trackingId": o.trackingId,
+            "trackingUrl": tracking_url,
             "address": _get_address(db, o.shippingAddressId),
             "deliveryInfo": _get_delivery_info(db, o.shippingTypeId),
             "orderItems": items_map.get(o.orderId, []),
