@@ -422,6 +422,39 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             f"State=Processing | TrackingId={result.awb_number!r}"
         )
 
+        # ── STEP 9b: Deduct stock now that Ekart shipment is confirmed ───────
+        print(f"[Payment→Ekart] STEP 9b — Deducting stock from ProductVariantDetail for order {order_id}...")
+        try:
+            deduct_res = db.execute(text("""
+                UPDATE twam."ProductVariantDetail" pvd
+                SET "AvailableQuantity" = GREATEST(
+                        0,
+                        COALESCE(pvd."AvailableQuantity", 0) - oi.ordered_qty
+                    ),
+                    "ModifiedDate" = :now
+                FROM (
+                    SELECT "ProductVariantDetailId",
+                           SUM("Quantity") AS ordered_qty
+                    FROM   twam."OrderItems"
+                    WHERE  "OrderId"               = :oid
+                      AND  "DeletedInd"             = false
+                      AND  "ProductVariantDetailId" IS NOT NULL
+                    GROUP BY "ProductVariantDetailId"
+                ) oi
+                WHERE pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+            db.commit()
+            print(
+                f"[Payment→Ekart] STEP 9b ✅ Stock deducted for order {order_id} — "
+                f"{deduct_res.rowcount} variant(s) updated"
+            )
+        except Exception as _se:
+            db.rollback()
+            print(
+                f"[Payment→Ekart] STEP 9b ⚠️  Stock deduction FAILED (non-fatal) "
+                f"for order {order_id}: {_se}"
+            )
+
         # ── STEP 10: Notification ────────────────────────────────────────────
         print(f"[Payment→Ekart] STEP 10 — Sending shipped notification...")
         try:
@@ -602,7 +635,7 @@ async def payment_callback(
         db.rollback()
         print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
 
-    # ── STEP 7: On success — queue Ekart + mark cart ordered ──────────────
+    # ── STEP 7: On success — remove cart items + queue Ekart shipment ────────
     if success:
         print(
             f"[Payment:Callback] STEP 7 — Payment SUCCESS ✅ | "
@@ -611,11 +644,14 @@ async def payment_callback(
         background_tasks.add_task(_auto_create_ekart_shipment, order_id)
         print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
 
-        print(f"[Payment:Callback] STEP 7 — Marking cart items as ordered for order {order_id}...")
+        # Remove all ordered cart items completely so the cart is clean for the user
+        print(f"[Payment:Callback] STEP 7 — Removing ordered cart items for order {order_id}...")
         try:
-            db.execute(text("""
+            result = db.execute(text("""
                 UPDATE twam."Cart" c
-                SET "IsOrdered" = true
+                SET "DeletedInd"    = true,
+                    "IsOrdered"     = true,
+                    "ModifiedDate"  = :now
                 FROM twam."OrderItems" oi
                 WHERE oi."OrderId" = :oid
                   AND oi."DeletedInd" = false
@@ -625,13 +661,15 @@ async def payment_callback(
                       WHERE "OrderId" = :oid AND "DeletedInd" = false
                   )
                   AND c."DeletedInd" = false
-                  AND (c."IsOrdered" IS NULL OR c."IsOrdered" = false)
-            """), {"oid": order_id})
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
             db.commit()
-            print(f"[Payment:Callback] STEP 7 ✅ Cart items marked IsOrdered=true for order {order_id}")
+            print(
+                f"[Payment:Callback] STEP 7 ✅ Cart cleared — "
+                f"{result.rowcount} item(s) removed for order {order_id}"
+            )
         except Exception as exc:
             db.rollback()
-            print(f"[Payment:Callback] STEP 7 ⚠️  Cart update FAILED (non-fatal) for order {order_id}: {exc}")
+            print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
     else:
         print(
             f"[Payment:Callback] STEP 7 — Payment NOT successful (code={response_code}) | "
