@@ -195,7 +195,9 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             "total_amount":       float(row[2]) if row[2] else 0,
             "state":              row[3],
             "tracking_id":        row[4],
-            "payment_mode":       "Prepaid",
+            # FIX 1: Read PaymentMethod from DB (row[5]) instead of hardcoding "Prepaid".
+            # COD orders were incorrectly registered as Prepaid in Ekart.
+            "payment_mode":       row[5] if row[5] else "Prepaid",
             "delivery_charge":    float(row[6]) if row[6] else 0,
             "name":               row[7] or "Customer",
             "phone":              row[8] or "",
@@ -286,17 +288,43 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         )
 
         client = get_ekart_client_for_db(db)
+        # FIX 2: mock mode means Ekart config is missing/incomplete.
+        # Old code wrote a fake AWB to the DB giving a false "shipped" status.
+        # Now we abort early so the order stays "Confirmed" and can be retried.
         if client.mock_mode:
-            print(f"[Payment→Ekart] ⚠️  MOCK MODE — shipment NOT real (config incomplete?)")
+            print(
+                f"[Payment→Ekart] ❌ MOCK MODE — Ekart config missing or incomplete.\n"
+                f"   → Order {order_id} stays in \'Confirmed\'. Retry via POST /api/Ekart/CreateShipment\n"
+                f"   → Fix: ensure shipment.ShipmentConfigurations has clientId, userName, password,\n"
+                f"     accessTokenURL, createShipmentURL, and stateId = \'Active\'."
+            )
+            return
 
         print(f"[Payment→Ekart] Calling Ekart API...")
         result = await client.create_shipment(request)
 
         if not result.success:
+            # FIX 4: Log the full error and annotate the order with the reason
+            # so admins can see it needs a manual retry.
             print(
                 f"[Payment→Ekart] ❌ FAILED: {result.error_message}\n"
+                f"   → Order {order_id} stays in \'Confirmed\' (no tracking ID written).\n"
                 f"   → Admin retry: POST /api/Ekart/CreateShipment"
             )
+            try:
+                db.execute(text("""
+                    UPDATE twam."Orders"
+                    SET "Notes" = CONCAT(COALESCE("Notes", ''), :note),
+                        "ModifiedDate" = :now
+                    WHERE "OrderId" = :oid
+                """), {
+                    "note": f"[Ekart auto-shipment failed: {(result.error_message or '')[:200]}] ",
+                    "oid": order_id,
+                    "now": datetime.now(timezone.utc),
+                })
+                db.commit()
+            except Exception:
+                db.rollback()
             return
 
         print(f"[Payment→Ekart] ✅ AWB={result.awb_number} courier={result.courier_name}")

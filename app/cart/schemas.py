@@ -68,6 +68,11 @@ class CartListItem(BaseModel):
     quantity: Optional[int] = None
     createdDate: Optional[datetime] = None
     modifiedDate: Optional[datetime] = None
+    # categoryIsActive must be declared here so FastAPI/Pydantic doesn't strip it
+    # from the response. Without this field the repository value is silently
+    # dropped, which is why the unavailable-category UI never triggered.
+    categoryIsActive: Optional[bool] = True
+    colorName: Optional[str] = None
 
     class Config:
         from_attributes = True

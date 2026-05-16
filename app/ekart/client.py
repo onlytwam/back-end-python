@@ -202,8 +202,17 @@ class EkartClient:
                 resp.raise_for_status()
                 data = resp.json()
 
-            success = data.get("status") is True
-            awb = data.get("tracking_id") or data.get("awb_number") or data.get("awb")
+            # FIX 3: Ekart may return {"status": true} (bool) OR {"status": "true"} (string).
+            # Using "is True" would evaluate "true" == False and wrongly report failure.
+            raw_status = data.get("status")
+            success = raw_status is True or str(raw_status).lower() == "true"
+            awb = (
+                data.get("tracking_id")
+                or data.get("awb_number")
+                or data.get("awb")
+                or data.get("waybillNumber")
+                or data.get("wbn")
+            )
 
             return EkartShipmentResponse(
                 success=success,

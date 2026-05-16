@@ -317,15 +317,14 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             p."Name", p."Description", p."ProductCode", p."Tag", p."CategoryId",
             pv."IsCupSize", pv."IsReturnAvailable",
             b."brandName",
-            p."ChildCategoryId"
+            p."ChildCategoryId",
+            COALESCE(cc."IsActive", pc."IsActive", true) AS categoryIsActive
         FROM twam."ProductVariants" pv
         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
         LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
         LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
         LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
-          AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true))
-          AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true))
           AND {where}
         LIMIT 1
     """
@@ -471,6 +470,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         "isCupSize":          is_cup_size,
         "hasCupSize":         has_cup_size,         # True when product has cup-size PVD rows
         "isReturnAvailable":  row[8],
+        "categoryIsActive":   bool(row[11]) if row[11] is not None else True,
         "brandName":          row[9],
         "price":              float(pvd_row[0]) if pvd_row and pvd_row[0] is not None else None,
         "originalPrice":      float(pvd_row[1]) if pvd_row and pvd_row[1] is not None else None,
