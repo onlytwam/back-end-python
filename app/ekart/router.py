@@ -157,28 +157,34 @@ class ShipmentResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_order_with_address(db: Session, order_id: int) -> Optional[dict]:
-    row = db.execute(text("""
-        SELECT
-            o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
-            o."TrackingId", o."PaymentMethod", o."DeliveryCharge",
-            a."Name", a."Phone", a."AddressLine", a."City",
-            a."PinCode", s."StateName", c."CountryName",
-            p."Email",
-            o."ShippingTypeId", st."ShippingTypeName"
-        FROM twam."Orders" o
-        LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
-        LEFT JOIN mdm."State" s ON s."StateId" = a."StateId"
-        LEFT JOIN mdm."Country" c ON c."CountryId" = a."CountryId"
-        LEFT JOIN twam."People" p ON p."UserProfileId" = o."UserProfileId"
-        LEFT JOIN mdm."ShippingType" st ON st."ShippingTypeId" = o."ShippingTypeId"
-            AND st."DeletedInd" = false
-        WHERE o."OrderId" = :order_id AND o."DeletedInd" = false
-    """), {"order_id": order_id}).fetchone()
+    print(f"[Ekart:_get_order_with_address] 🔍 Fetching order {order_id} from DB...")
+    try:
+        row = db.execute(text("""
+            SELECT
+                o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
+                o."TrackingId", o."PaymentMethod", o."DeliveryCharge",
+                a."Name", a."Phone", a."AddressLine", a."City",
+                a."PinCode", s."StateName", c."CountryName",
+                p."EmailId",
+                o."ShippingTypeId", st."ShippingTypeName"
+            FROM twam."Orders" o
+            LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
+            LEFT JOIN mdm."State" s ON s."StateId" = a."StateId"
+            LEFT JOIN mdm."Country" c ON c."CountryId" = a."CountryId"
+            LEFT JOIN twam."People" p ON p."UserProfileId" = o."UserProfileId"
+            LEFT JOIN mdm."ShippingType" st ON st."ShippingTypeId" = o."ShippingTypeId"
+                AND st."DeletedInd" = false
+            WHERE o."OrderId" = :order_id AND o."DeletedInd" = false
+        """), {"order_id": order_id}).fetchone()
+    except Exception as db_exc:
+        print(f"[Ekart:_get_order_with_address] ❌ DB query FAILED for order {order_id}: {db_exc}")
+        raise
 
     if not row:
+        print(f"[Ekart:_get_order_with_address] ❌ Order {order_id} NOT FOUND in DB (deleted or wrong id)")
         return None
 
-    return {
+    result = {
         "order_id":           row[0],
         "order_number":       row[1] or str(row[0]),
         "total_amount":       float(row[2]) if row[2] else 0,
@@ -198,23 +204,55 @@ def _get_order_with_address(db: Session, order_id: int) -> Optional[dict]:
         "shipping_type_name": row[16] or "Normal",
     }
 
+    print(
+        f"[Ekart:_get_order_with_address] ✅ Found order {order_id} | "
+        f"state={result['state']} | tracking={result['tracking_id']!r} | "
+        f"city={result['city']} | pin={result['pincode']} | "
+        f"total=₹{result['total_amount']} | payment_mode={result['payment_mode']} | "
+        f"address_line={result['address_line']!r} | state_name={result['state_name']!r} | "
+        f"name={result['name']!r} | phone={result['phone']!r} | "
+        f"shipping_type={result['shipping_type_name']!r}"
+    )
+
+    # Warn about missing address fields that would cause Ekart API rejection
+    missing = []
+    if not result["name"]:         missing.append("consignee name")
+    if not result["phone"]:        missing.append("phone")
+    if not result["address_line"]: missing.append("address_line")
+    if not result["city"]:         missing.append("city")
+    if not result["pincode"]:      missing.append("pincode")
+    if not result["state_name"]:   missing.append("state_name (StateId may not be set on Address)")
+    if missing:
+        print(f"[Ekart:_get_order_with_address] ⚠️  MISSING FIELDS for order {order_id}: {', '.join(missing)}")
+
+    return result
+
 
 def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
     # TaxHSNCodeId is on twam.Products (product-level GST classification).
     # HSN does not change per colour/size — product level is the correct source.
     # TaxHSNCode lookup table is in mdm schema.
-    rows = db.execute(text("""
-        SELECT
-            p."Name",
-            COALESCE(pv."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
-            oi."Quantity", oi."Price",
-            thc."HSNCode"
-        FROM twam."OrderItems" oi
-        LEFT JOIN twam."Products" p         ON p."ProductId"         = oi."ProductId"
-        LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
-        LEFT JOIN mdm."TaxHSNCode" thc      ON thc."TaxHSNCodeId"    = p."TaxHSNCodeId"
-        WHERE oi."OrderId" = :order_id AND oi."DeletedInd" = false
-    """), {"order_id": order_id}).fetchall()
+    print(f"[Ekart:_get_order_items_for_shipment] 🔍 Fetching items for order {order_id}...")
+    try:
+        rows = db.execute(text("""
+            SELECT
+                p."Name",
+                COALESCE(pv."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
+                oi."Quantity", oi."Price",
+                thc."HSNCode"
+            FROM twam."OrderItems" oi
+            LEFT JOIN twam."Products" p         ON p."ProductId"         = oi."ProductId"
+            LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
+            LEFT JOIN mdm."TaxHSNCode" thc      ON thc."TaxHSNCodeId"    = p."TaxHSNCodeId"
+            WHERE oi."OrderId" = :order_id AND oi."DeletedInd" = false
+        """), {"order_id": order_id}).fetchall()
+    except Exception as db_exc:
+        print(f"[Ekart:_get_order_items_for_shipment] ❌ DB query FAILED for order {order_id}: {db_exc}")
+        raise
+
+    if not rows:
+        print(f"[Ekart:_get_order_items_for_shipment] ⚠️  NO items found for order {order_id} — shipment will be rejected by Ekart!")
+        return []
 
     items = [
         EkartShipmentItem(
@@ -226,7 +264,8 @@ def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
         )
         for r in rows
     ]
-
+    print(f"[Ekart:_get_order_items_for_shipment] ✅ {len(items)} item(s) for order {order_id}: "
+          + ", ".join(f"{i.name}(qty={i.quantity}, ₹{i.price})" for i in items))
     return items
 
 
@@ -272,7 +311,7 @@ def _build_return_address_from_db(db: Session) -> EkartAddress:
 
 
 def _build_shipment_request(order: dict, items: list) -> CreateShipmentRequest:
-    return CreateShipmentRequest(
+    req = CreateShipmentRequest(
         order_id=           order["order_id"],
         order_number=       order["order_number"],
         consignee_name=     order["name"],
@@ -292,6 +331,14 @@ def _build_shipment_request(order: dict, items: list) -> CreateShipmentRequest:
         items=              items,
         shipping_type_name= order.get("shipping_type_name", "Normal"),
     )
+    print(
+        f"[Ekart:_build_shipment_request] 📦 Request built for order {order['order_id']} | "
+        f"payment_mode={req.payment_mode} | total=₹{req.total_amount} | "
+        f"consignee={req.consignee_name!r} | phone={req.consignee_phone!r} | "
+        f"city={req.consignee_address.city!r} | pin={req.consignee_address.pincode!r} | "
+        f"state={req.consignee_address.state!r} | items={len(items)}"
+    )
+    return req
 
 
 # ── Create Single Shipment ────────────────────────────────────────────────────
@@ -303,14 +350,23 @@ async def create_shipment(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_admin_user),
 ):
+    print(f"\n{'='*60}")
+    print(f"[Ekart:CreateShipment] ▶ Manual shipment request for order {inp.order_id}")
+    print(f"[Ekart:CreateShipment]   manual_tracking_id={inp.manual_tracking_id!r}")
+
     order = _get_order_with_address(db, inp.order_id)
     if not order:
+        print(f"[Ekart:CreateShipment] ❌ Order {inp.order_id} not found — aborting")
         raise HTTPException(404, "Order not found")
 
+    print(f"[Ekart:CreateShipment] ✅ Order found: state={order['state']!r} tracking={order['tracking_id']!r}")
+
     if order["state"] in ("Shipped", "Delivered", "Cancelled"):
+        print(f"[Ekart:CreateShipment] ⚠️  State is '{order['state']}' — cannot create shipment")
         raise HTTPException(400, f"Cannot create shipment for order in '{order['state']}' state")
 
     if order["tracking_id"]:
+        print(f"[Ekart:CreateShipment] ℹ️  Already has tracking_id={order['tracking_id']!r} — skipping")
         return ShipmentResponse(
             success=True, order_id=order["order_id"],
             tracking_id=order["tracking_id"],
@@ -320,38 +376,53 @@ async def create_shipment(
     if inp.manual_tracking_id:
         tracking_id  = inp.manual_tracking_id
         tracking_url = None
+        print(f"[Ekart:CreateShipment] ℹ️  Using manual tracking_id={tracking_id!r}")
     else:
         items   = _get_order_items_for_shipment(db, inp.order_id)
+        if not items:
+            print(f"[Ekart:CreateShipment] ❌ No order items found for order {inp.order_id} — aborting")
+            return ShipmentResponse(
+                success=False, order_id=order["order_id"],
+                error="No order items found. Cannot create Ekart shipment.",
+            )
+
         request = _build_shipment_request(order, items)
 
+        print(f"[Ekart:CreateShipment] 🔑 Loading Ekart config from DB...")
         client = get_ekart_client_for_db(db)
+        print(f"[Ekart:CreateShipment] ℹ️  Client mode: {'MOCK ⚠️' if client.mock_mode else 'LIVE ✅'}")
+
+        if client.mock_mode:
+            print(
+                f"[Ekart:CreateShipment] ❌ MOCK MODE — Ekart config is missing or incomplete.\n"
+                f"   Check ShipmentConfigurations: needs clientId, userName, password,\n"
+                f"   accessTokenURL, createShipmentURL, stateId=NULL or 'Active'.\n"
+                f"   Run GET /api/Ekart/Readiness to see exactly what is missing."
+            )
+            return ShipmentResponse(
+                success=False, order_id=order["order_id"],
+                error="Ekart is in MOCK mode — config missing. Check /api/Ekart/Readiness.",
+            )
+
+        print(f"[Ekart:CreateShipment] 📡 Calling Ekart API (create_shipment)...")
         result = await client.create_shipment(request)
 
         if not result.success:
+            print(
+                f"[Ekart:CreateShipment] ❌ Ekart API FAILED for order {inp.order_id}: "
+                f"{result.error_message}"
+            )
             return ShipmentResponse(
                 success=False, order_id=order["order_id"],
                 error=result.error_message or "Failed to create shipment",
             )
 
+        print(f"[Ekart:CreateShipment] ✅ Ekart API success: AWB={result.awb_number!r}")
         tracking_id  = result.awb_number
         tracking_url = result.tracking_url
 
-    # db.execute(text("""
-    #     UPDATE twam."Orders"
-    #     SET "TrackingId" = :tid, "State" = 'Processing', "IsShipped" = true,
-    #         "DeliveryAgent" = 'EKart', "ModifiedDate" = :now
-    #     WHERE "OrderId" = :order_id
-    # """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
-
-    # db.add(OrderTrackingStatus(
-    #     orderId=inp.order_id,
-    #     status="Processing",
-    #     createdDate=datetime.now(timezone.utc),
-    # ))
-    # db.commit()
-
-    # background_tasks.add_task(send_order_shipped_notification, db, inp.order_id)
-
+    # ── Write tracking ID + state to DB ──────────────────────────────────────
+    print(f"[Ekart:CreateShipment] 💾 Writing tracking_id={tracking_id!r} to DB for order {inp.order_id}...")
     try:
         db.execute(text("""
             UPDATE twam."Orders"
@@ -366,10 +437,11 @@ async def create_shipment(
             createdDate=datetime.now(timezone.utc),
         ))
         db.commit()
+        print(f"[Ekart:CreateShipment] ✅ DB updated — order {inp.order_id} → Processing, TrackingId={tracking_id!r}")
 
     except Exception as e:
         db.rollback()
-        print(f"[Ekart]  DB commit failed for order {inp.order_id}: {e}")
+        print(f"[Ekart:CreateShipment] ❌ DB commit FAILED for order {inp.order_id}: {e} — retrying once...")
         try:
             db.execute(text("""
                 UPDATE twam."Orders"
@@ -379,14 +451,16 @@ async def create_shipment(
                 WHERE "OrderId" = :order_id AND "DeletedInd" = false
             """), {"tid": tracking_id, "order_id": inp.order_id, "now": datetime.now(timezone.utc)})
             db.commit()
-            print(f"[Ekart]  Fallback commit succeeded for order {inp.order_id}")
+            print(f"[Ekart:CreateShipment] ✅ Retry commit succeeded for order {inp.order_id}")
         except Exception as e2:
             db.rollback()
-            print(f"[Ekart]  Fallback also failed: {e2}")
+            print(f"[Ekart:CreateShipment] ❌ Retry also FAILED: {e2}")
             raise HTTPException(500, f"Shipment created on Ekart (AWB: {tracking_id}) but DB update failed: {e2}")
 
+    print(f"[Ekart:CreateShipment] 📣 Queuing shipped notification for order {inp.order_id}")
     background_tasks.add_task(send_order_shipped_notification, db, inp.order_id)
 
+    print(f"[Ekart:CreateShipment] ✅ DONE — order {inp.order_id} shipment created successfully\n{'='*60}\n")
     return ShipmentResponse(
         success=True, order_id=order["order_id"],
         tracking_id=tracking_id, tracking_url=tracking_url,

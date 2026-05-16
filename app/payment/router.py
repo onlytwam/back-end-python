@@ -143,26 +143,47 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
     """
     Runs as a FastAPI background task after successful payment.
     Creates its OWN DB session — the request session is already closed.
+    Every step is logged so you can pinpoint exactly where it fails.
     """
     from database import SessionLocal
     db = SessionLocal()
+    SEP = "─" * 60
     try:
+        print(f"\n{SEP}")
+        print(f"[Payment→Ekart] ▶▶▶ START auto-shipment for order={order_id}")
+        print(f"[SEP]")
+
+        # ── STEP 1: Load Ekart config ────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 1 — Loading Ekart config from ShipmentConfigurations table...")
         from app.ekart.client import get_ekart_client_for_db, load_ekart_config_from_db
         from app.ekart.schemas import CreateShipmentRequest, EkartAddress, EkartShipmentItem
         from app.ekart.notifications import send_order_shipped_notification
 
-        print(f"\n[Payment→Ekart] ▶▶▶ START order={order_id}")
-
         cfg = load_ekart_config_from_db(db)
         if cfg is None:
-            print(f"[Payment→Ekart] ❌ No EKart config in DB — check ShipmentConfigurations table")
+            print(
+                f"[Payment→Ekart] STEP 1 ❌ FAILED — No EKart config found in DB.\n"
+                f"   → FIX: Insert a row in shipment.ShipmentConfigurations with\n"
+                f"     deliveryAgent ILIKE 'EKart%', deletedInd=false,\n"
+                f"     stateId=NULL or 'Active' (case-insensitive).\n"
+                f"   → Run GET /api/Ekart/Readiness to see full config status."
+            )
             return
 
         print(
-            f"[Payment→Ekart] Config: client_id={cfg.client_id} | "
-            f"alias={cfg.pickup_alias!r} | complete={cfg.is_complete}"
+            f"[Payment→Ekart] STEP 1 ✅ Config loaded | "
+            f"client_id={cfg.client_id!r} | alias={cfg.pickup_alias!r} | "
+            f"complete={cfg.is_complete} | auth_url={cfg.access_token_url!r}"
         )
+        if not cfg.is_complete:
+            print(
+                f"[Payment→Ekart] STEP 1 ⚠️  Config is INCOMPLETE — missing one of:\n"
+                f"   accessTokenURL, createShipmentURL, userName, or password.\n"
+                f"   Client will run in MOCK mode — no real AWB will be generated."
+            )
 
+        # ── STEP 2: Fetch order from DB ──────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 2 — Fetching order {order_id} from DB...")
         row = db.execute(text("""
             SELECT
                 o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
@@ -183,9 +204,11 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
 
         if not row:
             print(
-                f"[Payment→Ekart] ❌ Order {order_id} NOT IN DB!\n"
-                f"   → Frontend is calling a LOCAL backend, not this Azure instance.\n"
-                f"   → Fix: add frontend/.env.local with VITE_API_BASE_URL pointing to Azure."
+                f"[Payment→Ekart] STEP 2 ❌ FAILED — Order {order_id} NOT IN DB!\n"
+                f"   → This usually means the frontend called a LOCAL backend (localhost:8000)\n"
+                f"     to place the order, but PayG is calling back to Azure.\n"
+                f"   → FIX: ensure VITE_API_BASE_URL in frontend points to this Azure URL.\n"
+                f"   → Also add http://localhost:5173 to Azure CORS_ORIGINS env var."
             )
             return
 
@@ -195,8 +218,6 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             "total_amount":       float(row[2]) if row[2] else 0,
             "state":              row[3],
             "tracking_id":        row[4],
-            # FIX 1: Read PaymentMethod from DB (row[5]) instead of hardcoding "Prepaid".
-            # COD orders were incorrectly registered as Prepaid in Ekart.
             "payment_mode":       row[5] if row[5] else "Prepaid",
             "delivery_charge":    float(row[6]) if row[6] else 0,
             "name":               row[7] or "Customer",
@@ -211,18 +232,39 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         }
 
         print(
-            f"[Payment→Ekart] Order: state={order['state']} tracking={order['tracking_id']!r} "
-            f"city={order['city']} pin={order['pincode']} total=₹{order['total_amount']}"
+            f"[Payment→Ekart] STEP 2 ✅ Order found | "
+            f"state={order['state']!r} | tracking={order['tracking_id']!r} | "
+            f"total=₹{order['total_amount']} | payment_mode={order['payment_mode']!r} | "
+            f"name={order['name']!r} | phone={order['phone']!r} | "
+            f"city={order['city']!r} | pin={order['pincode']!r} | "
+            f"state_name={order['state_name']!r} | address={order['address_line']!r}"
         )
 
+        # Warn on missing address fields — Ekart will reject if these are blank
+        missing_addr = []
+        if not order["name"]:         missing_addr.append("consignee name")
+        if not order["phone"]:        missing_addr.append("phone")
+        if not order["address_line"]: missing_addr.append("address_line (ShippingAddressId may be NULL)")
+        if not order["city"]:         missing_addr.append("city")
+        if not order["pincode"]:      missing_addr.append("pincode")
+        if not order["state_name"]:   missing_addr.append("state_name (StateId not set on Address, or State not in mdm.State)")
+        if missing_addr:
+            print(f"[Payment→Ekart] STEP 2 ⚠️  MISSING address fields: {', '.join(missing_addr)}")
+
+        # ── STEP 3: Guard checks ─────────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 3 — Guard checks...")
         if order["tracking_id"]:
-            print(f"[Payment→Ekart] ⚠️  Already has tracking_id — skip")
+            print(f"[Payment→Ekart] STEP 3 ⚠️  Already has tracking_id={order['tracking_id']!r} — skipping (duplicate callback?)")
             return
 
         if order["state"] in ("Shipped", "Delivered", "Cancelled"):
-            print(f"[Payment→Ekart] ⚠️  State='{order['state']}' — skip")
+            print(f"[Payment→Ekart] STEP 3 ⚠️  Order state is '{order['state']}' — skipping shipment creation")
             return
 
+        print(f"[Payment→Ekart] STEP 3 ✅ Guards passed — proceeding to create shipment")
+
+        # ── STEP 4: Fetch order items ────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 4 — Fetching order items...")
         item_rows = db.execute(text("""
             SELECT
                 p."Name",
@@ -236,6 +278,14 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             WHERE oi."OrderId" = :oid AND oi."DeletedInd" = false
         """), {"oid": order_id}).fetchall()
 
+        if not item_rows:
+            print(
+                f"[Payment→Ekart] STEP 4 ❌ FAILED — No OrderItems found for order {order_id}!\n"
+                f"   → OrderItems may not have been committed before this background task ran.\n"
+                f"   → Check twam.OrderItems for OrderId={order_id} and DeletedInd=false."
+            )
+            return
+
         items = [
             EkartShipmentItem(
                 name=r[0] or "Product",
@@ -246,9 +296,13 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             )
             for r in item_rows
         ]
-        print(f"[Payment→Ekart] {len(items)} item(s) fetched")
+        print(
+            f"[Payment→Ekart] STEP 4 ✅ {len(items)} item(s): "
+            + ", ".join(f"{i.name}(qty={i.quantity}, ₹{i.price}, sku={i.sku})" for i in items)
+        )
 
-        # ── Surprise gift: if physical_gift type, add to shipment at ₹0 ─────
+        # ── STEP 5: Surprise gift ────────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 5 — Checking for surprise gift...")
         try:
             from app.surprisegift.repository import get_order_gift_snapshot
             gift_snap = get_order_gift_snapshot(db, order_id)
@@ -260,12 +314,16 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                     price=0.0,
                     hsn_code=gift_snap.hsnCode,
                 ))
-                print(f"[Payment→Ekart] 🎁 Added physical gift '{gift_snap.giftName}' (sku={gift_snap.sku}) to shipment")
-            elif gift_snap and gift_snap.giftType == "physical_coupon":
-                print(f"[Payment→Ekart] 🎁 Physical coupon gift — no ekart item needed (packed by inventory)")
+                print(f"[Payment→Ekart] STEP 5 ✅ Physical gift added: '{gift_snap.giftName}' sku={gift_snap.sku!r}")
+            elif gift_snap:
+                print(f"[Payment→Ekart] STEP 5 ℹ️  Gift type={gift_snap.giftType!r} — no extra Ekart item needed")
+            else:
+                print(f"[Payment→Ekart] STEP 5 ℹ️  No surprise gift for this order")
         except Exception as _gexc:
-            print(f"[Payment→Ekart] ⚠️  Could not fetch surprise gift for order {order_id}: {_gexc}")
+            print(f"[Payment→Ekart] STEP 5 ⚠️  Could not fetch surprise gift (non-fatal): {_gexc}")
 
+        # ── STEP 6: Build Ekart request ──────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 6 — Building Ekart shipment request...")
         request = CreateShipmentRequest(
             order_id=            order["order_id"],
             order_number=        order["order_number"],
@@ -286,31 +344,41 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             items=               items,
             shipping_type_name=  order.get("shipping_type_name", "Normal"),
         )
+        print(
+            f"[Payment→Ekart] STEP 6 ✅ Request built | "
+            f"payment_mode={request.payment_mode} | total=₹{request.total_amount} | "
+            f"items={len(items)} | shipping_type={request.shipping_type_name!r}"
+        )
 
+        # ── STEP 7: Check mock mode ──────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 7 — Initialising Ekart client...")
         client = get_ekart_client_for_db(db)
-        # FIX 2: mock mode means Ekart config is missing/incomplete.
-        # Old code wrote a fake AWB to the DB giving a false "shipped" status.
-        # Now we abort early so the order stays "Confirmed" and can be retried.
+        print(f"[Payment→Ekart] STEP 7 — Client mode: {'MOCK ⚠️' if client.mock_mode else 'LIVE ✅'}")
+
         if client.mock_mode:
             print(
-                f"[Payment→Ekart] ❌ MOCK MODE — Ekart config missing or incomplete.\n"
-                f"   → Order {order_id} stays in \'Confirmed\'. Retry via POST /api/Ekart/CreateShipment\n"
-                f"   → Fix: ensure shipment.ShipmentConfigurations has clientId, userName, password,\n"
-                f"     accessTokenURL, createShipmentURL, and stateId = \'Active\'."
+                f"[Payment→Ekart] STEP 7 ❌ MOCK MODE — config missing/incomplete.\n"
+                f"   → Order {order_id} stays in 'Confirmed' state. No AWB written.\n"
+                f"   → FIX: ensure ShipmentConfigurations has clientId, userName, password,\n"
+                f"     accessTokenURL, createShipmentURL, stateId=NULL or 'Active'.\n"
+                f"   → Retry manually: POST /api/Ekart/CreateShipment {{\"order_id\": {order_id}}}"
             )
             return
 
-        print(f"[Payment→Ekart] Calling Ekart API...")
+        # ── STEP 8: Call Ekart API ───────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 8 — Calling Ekart API (PUT /api/v1/package/create)...")
         result = await client.create_shipment(request)
 
         if not result.success:
-            # FIX 4: Log the full error and annotate the order with the reason
-            # so admins can see it needs a manual retry.
             print(
-                f"[Payment→Ekart] ❌ FAILED: {result.error_message}\n"
-                f"   → Order {order_id} stays in \'Confirmed\' (no tracking ID written).\n"
-                f"   → Admin retry: POST /api/Ekart/CreateShipment"
+                f"[Payment→Ekart] STEP 8 ❌ FAILED — Ekart API rejected the request.\n"
+                f"   Error: {result.error_message}\n"
+                f"   → Order {order_id} stays in 'Confirmed' — no TrackingId written.\n"
+                f"   → Common causes: SWIFT_RESOURCE_NOT_FOUND (pickup alias not registered),\n"
+                f"     invalid pincode, phone must be 10 digits, token expired.\n"
+                f"   → Retry manually: POST /api/Ekart/CreateShipment {{\"order_id\": {order_id}}}"
             )
+            # Annotate order notes so admin can see the failure reason in the DB
             try:
                 db.execute(text("""
                     UPDATE twam."Orders"
@@ -318,17 +386,21 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                         "ModifiedDate" = :now
                     WHERE "OrderId" = :oid
                 """), {
-                    "note": f"[Ekart auto-shipment failed: {(result.error_message or '')[:200]}] ",
+                    "note": f"[Ekart auto-shipment FAILED: {(result.error_message or '')[:200]}] ",
                     "oid": order_id,
                     "now": datetime.now(timezone.utc),
                 })
                 db.commit()
-            except Exception:
+                print(f"[Payment→Ekart] STEP 8 ℹ️  Failure reason written to Orders.Notes for order {order_id}")
+            except Exception as _ne:
                 db.rollback()
+                print(f"[Payment→Ekart] STEP 8 ⚠️  Could not write Notes: {_ne}")
             return
 
-        print(f"[Payment→Ekart] ✅ AWB={result.awb_number} courier={result.courier_name}")
+        print(f"[Payment→Ekart] STEP 8 ✅ Ekart API SUCCESS | AWB={result.awb_number!r} | courier={result.courier_name!r}")
 
+        # ── STEP 9: Update DB ────────────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 9 — Writing AWB={result.awb_number!r} to DB for order {order_id}...")
         db.execute(text("""
             UPDATE twam."Orders"
             SET "TrackingId"    = :tid,
@@ -345,13 +417,25 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             createdDate=datetime.now(timezone.utc),
         ))
         db.commit()
-        print(f"[Payment→Ekart] ✅ Order updated → Processing, TrackingId={result.awb_number}\n")
+        print(
+            f"[Payment→Ekart] STEP 9 ✅ DB updated — order {order_id} → "
+            f"State=Processing | TrackingId={result.awb_number!r}"
+        )
 
-        send_order_shipped_notification(db, order_id)
+        # ── STEP 10: Notification ────────────────────────────────────────────
+        print(f"[Payment→Ekart] STEP 10 — Sending shipped notification...")
+        try:
+            send_order_shipped_notification(db, order_id)
+            print(f"[Payment→Ekart] STEP 10 ✅ Shipped notification sent for order {order_id}")
+        except Exception as _nex:
+            print(f"[Payment→Ekart] STEP 10 ⚠️  Notification failed (non-fatal): {_nex}")
+
+        print(f"[Payment→Ekart] ✅✅✅ COMPLETE — order {order_id} shipment created. AWB={result.awb_number!r}")
+        print(f"{SEP}\n")
 
     except Exception as exc:
         import traceback
-        print(f"[Payment→Ekart] ❌ UNEXPECTED ERROR order={order_id}: {exc}")
+        print(f"[Payment→Ekart] ❌ UNEXPECTED ERROR for order {order_id}: {exc}")
         traceback.print_exc()
     finally:
         db.close()
@@ -366,7 +450,8 @@ async def payment_callback(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # ── 1. Parse params ───────────────────────────────────────────────────
+    SEP = "=" * 60
+    # ── STEP 1: Parse incoming params from PayG ───────────────────────────
     params: dict = {}
     if request.method == "GET":
         params = dict(request.query_params)
@@ -384,9 +469,10 @@ async def payment_callback(
             except Exception:
                 params = {}
 
-    print(f"\n{'='*60}")
-    print(f"[Payment] ▶ Callback {request.method} | URL={request.url}")
-    print(f"[Payment]   params={json.dumps(params, default=str)}")
+    print(f"\n{SEP}")
+    print(f"[Payment:Callback] ▶ STEP 1 — Received {request.method} callback from PayG")
+    print(f"[Payment:Callback]   URL={request.url}")
+    print(f"[Payment:Callback]   Raw params={json.dumps(params, default=str)}")
 
     oid = params.get("oid", "")
     rid = params.get("rid", "")
@@ -397,21 +483,37 @@ async def payment_callback(
         or params.get("UserDefined1")
     )
 
-    print(f"[Payment] oid={oid!r} rid={rid!r} payg_gave_us_params={payg_gave_us_params}")
+    print(
+        f"[Payment:Callback] STEP 1 ✅ Parsed | oid={oid!r} | rid={rid!r} | "
+        f"payg_gave_us_params={payg_gave_us_params} | "
+        f"PaymentResponseCode={params.get('PaymentResponseCode')!r} | "
+        f"OrderKeyId={params.get('OrderKeyId')!r}"
+    )
 
-    # ── 2. Enrich from Detail API if PayG gave nothing ────────────────────
+    # ── STEP 2: Enrich from Detail API if PayG gave nothing ───────────────
     if not payg_gave_us_params and (oid or rid):
-        print(f"[Payment] Calling PayG Detail API...")
+        print(f"[Payment:Callback] STEP 2 — PayG gave empty params, calling PayG Detail API (oid={oid!r} rid={rid!r})...")
         enriched = _enrich_params_via_detail_api(oid, rid)
         if enriched:
             params = enriched
+            print(
+                f"[Payment:Callback] STEP 2 ✅ Detail API enriched params | "
+                f"code={params.get('PaymentResponseCode')!r} | status={params.get('OrderStatus')!r}"
+            )
         else:
-            print(f"[Payment] ⚠️  Detail API empty — using oid={oid!r}, code defaults to -1")
+            print(f"[Payment:Callback] STEP 2 ⚠️  Detail API returned nothing — payment code defaults to -1 (FAILED)")
+    else:
+        print(f"[Payment:Callback] STEP 2 — Skipped Detail API (PayG already gave us params or no oid/rid)")
 
-    # ── 3. Find order ─────────────────────────────────────────────────────
+    # ── STEP 3: Find order in DB ──────────────────────────────────────────
     order_id_str  = params.get("UserDefined1") or oid or ""
     order_key_id  = params.get("OrderKeyId", "")
     unique_req_id = params.get("UniqueRequestId", "") or rid
+
+    print(
+        f"[Payment:Callback] STEP 3 — Looking up order | "
+        f"order_id_str={order_id_str!r} | order_key_id={order_key_id!r} | unique_req_id={unique_req_id!r}"
+    )
 
     order: Optional[Orders] = None
     if order_id_str:
@@ -420,28 +522,32 @@ async def payment_callback(
                 Orders.orderId    == int(order_id_str),
                 Orders.deletedInd == False,
             ).first()
+            print(f"[Payment:Callback] STEP 3 — Lookup by orderId={order_id_str!r}: {'FOUND' if order else 'NOT FOUND'}")
         except Exception as e:
-            print(f"[Payment] id lookup error: {e}")
+            print(f"[Payment:Callback] STEP 3 ⚠️  orderId lookup error: {e}")
 
     if order is None and order_key_id:
         order = db.query(Orders).filter(
             Orders.orderKeyId  == order_key_id,
             Orders.deletedInd  == False,
         ).first()
+        print(f"[Payment:Callback] STEP 3 — Lookup by orderKeyId={order_key_id!r}: {'FOUND' if order else 'NOT FOUND'}")
 
     if order is None and unique_req_id:
         order = db.query(Orders).filter(
             Orders.paymentTransactionRefNo == unique_req_id,
             Orders.deletedInd              == False,
         ).first()
+        print(f"[Payment:Callback] STEP 3 — Lookup by uniqueRequestId={unique_req_id!r}: {'FOUND' if order else 'NOT FOUND'}")
 
     if order is None:
         print(
-            f"[Payment] ❌ ORDER NOT FOUND in Azure DB!\n"
-            f"   order_id_str={order_id_str!r}\n"
-            f"   ROOT CAUSE: frontend called local backend (localhost:8000), not Azure.\n"
-            f"   FIX: create frontend/.env.local → VITE_API_BASE_URL=<azure_url>\n"
-            f"        and add http://localhost:5173 to Azure CORS_ORIGINS env var."
+            f"[Payment:Callback] STEP 3 ❌ ORDER NOT FOUND in this Azure DB!\n"
+            f"   Tried: orderId={order_id_str!r} | orderKeyId={order_key_id!r} | uniqueReqId={unique_req_id!r}\n"
+            f"   ROOT CAUSE: Frontend called a LOCAL backend (localhost:8000) to place the order,\n"
+            f"               but PayG is calling back to this Azure instance — the order is NOT here.\n"
+            f"   FIX 1: Set VITE_API_BASE_URL in frontend/.env.local → this Azure URL.\n"
+            f"   FIX 2: Add http://localhost:5173 to CORS_ORIGINS env var in Azure."
         )
         return RedirectResponse(
             url=f"{_frontend_url()}/user-products/payment-callback?status=error&message=Order+not+found",
@@ -449,47 +555,63 @@ async def payment_callback(
         )
 
     order_id = order.orderId
-    print(f"[Payment] ✅ Order found: id={order_id} number={order.orderNumber} state={order.state}")
+    print(
+        f"[Payment:Callback] STEP 3 ✅ Order found | "
+        f"id={order_id} | number={order.orderNumber!r} | state={order.state!r} | "
+        f"orderKeyId={order.orderKeyId!r} | paymentRef={order.paymentTransactionRefNo!r}"
+    )
 
-    # ── 4. Hash (skipped in UAT) ──────────────────────────────────────────
+    # ── STEP 4: Hash verification ─────────────────────────────────────────
     is_uat  = get_setting("payg_mode", "uat").lower() == "uat"
     hash_ok = payg_client.verify_callback_hash(params)
+    print(
+        f"[Payment:Callback] STEP 4 — Hash check | is_uat={is_uat} | hash_ok={hash_ok}"
+    )
     if not is_uat and not hash_ok:
-        print(f"[Payment] ❌ Hash mismatch for order {order_id}")
+        print(f"[Payment:Callback] STEP 4 ❌ Hash MISMATCH for order {order_id} — rejecting (LIVE mode)")
         return RedirectResponse(
             url=f"{_frontend_url()}/user-products/payment-callback?status=error&orderId={order_id}&message=Invalid+signature",
             status_code=302,
         )
+    if is_uat:
+        print(f"[Payment:Callback] STEP 4 ℹ️  UAT mode — hash check SKIPPED")
 
-    # ── 5. Outcome ────────────────────────────────────────────────────────
+    # ── STEP 5: Determine payment outcome ─────────────────────────────────
     try:
         response_code = int(params.get("PaymentResponseCode", -1))
     except (ValueError, TypeError):
         response_code = -1
 
     success = (response_code == 1)
-    print(f"[Payment] code={response_code} success={success} uat={is_uat}")
+    new_state = payg_client.payment_code_to_order_state(response_code)
+    print(
+        f"[Payment:Callback] STEP 5 — Payment outcome | "
+        f"response_code={response_code} | success={success} | new_state={new_state!r} | "
+        f"PaymentMethod={params.get('PaymentMethod')!r} | "
+        f"PaymentTransactionId={params.get('PaymentTransactionId')!r}"
+    )
 
+    # ── STEP 6: Update order state in DB ──────────────────────────────────
+    print(f"[Payment:Callback] STEP 6 — Updating order {order_id} state → {new_state!r} in DB...")
     try:
         _update_order_after_payment(db, order, response_code, params)
         _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
         db.commit()
-        print(f"[Payment] ✅ DB updated → {payg_client.payment_code_to_order_state(response_code)}")
+        print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
     except Exception as exc:
         db.rollback()
-        print(f"[Payment] ❌ DB update failed: {exc}")
+        print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
 
-    # ── 6. On success: queue Ekart shipment + mark cart items ordered ─────
-    # Cart items are marked IsOrdered=true HERE (not at order-creation time).
-    # This means if payment fails the items remain visible in the cart so
-    # the user can review their order and retry without losing anything.
+    # ── STEP 7: On success — queue Ekart + mark cart ordered ──────────────
     if success:
-        print(f"[Payment] ✅ SUCCESS — queueing Ekart task for order {order_id}")
+        print(
+            f"[Payment:Callback] STEP 7 — Payment SUCCESS ✅ | "
+            f"Queueing _auto_create_ekart_shipment background task for order {order_id}..."
+        )
         background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+        print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
 
-        # Mark the cart rows that match this order's items as ordered.
-        # Uses a JOIN on ProductVariantDetailId + UserProfileId so we only
-        # touch the exact items that were just paid for, not other cart rows.
+        print(f"[Payment:Callback] STEP 7 — Marking cart items as ordered for order {order_id}...")
         try:
             db.execute(text("""
                 UPDATE twam."Cart" c
@@ -506,17 +628,22 @@ async def payment_callback(
                   AND (c."IsOrdered" IS NULL OR c."IsOrdered" = false)
             """), {"oid": order_id})
             db.commit()
-            print(f"[Payment] ✅ Cart items marked as ordered for order {order_id}")
+            print(f"[Payment:Callback] STEP 7 ✅ Cart items marked IsOrdered=true for order {order_id}")
         except Exception as exc:
             db.rollback()
-            print(f"[Payment] ⚠️  Failed to mark cart items ordered for order {order_id}: {exc}")
+            print(f"[Payment:Callback] STEP 7 ⚠️  Cart update FAILED (non-fatal) for order {order_id}: {exc}")
     else:
-        print(f"[Payment] ⚠️  code={response_code} — Ekart NOT queued, cart preserved")
+        print(
+            f"[Payment:Callback] STEP 7 — Payment NOT successful (code={response_code}) | "
+            f"Ekart task NOT queued | Cart preserved for retry"
+        )
 
-    # ── 7. Notify ─────────────────────────────────────────────────────────
+    # ── STEP 8: Send notification ─────────────────────────────────────────
+    print(f"[Payment:Callback] STEP 8 — Sending payment notification (success={success})...")
     _send_payment_notification(db, order_id, success)
+    print(f"[Payment:Callback] STEP 8 ✅ Notification sent")
 
-    # ── 8. Redirect ───────────────────────────────────────────────────────
+    # ── STEP 9: Redirect user ─────────────────────────────────────────────
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
     else:
@@ -526,7 +653,8 @@ async def payment_callback(
             f"?status=failed&orderId={order_id}&code={response_code}&reason={reason}"
         )
 
-    print(f"[Payment] Redirecting → {redirect_url}\n{'='*60}\n")
+    print(f"[Payment:Callback] STEP 9 — Redirecting → {redirect_url}")
+    print(f"{SEP}\n")
     return RedirectResponse(url=redirect_url, status_code=302)
 
 
