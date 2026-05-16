@@ -460,6 +460,36 @@ async def create_shipment(
     print(f"[Ekart:CreateShipment] 📣 Queuing shipped notification for order {inp.order_id}")
     background_tasks.add_task(send_order_shipped_notification, db, inp.order_id)
 
+    # ── Deduct stock now that Ekart shipment is confirmed ─────────────────────
+    print(f"[Ekart:CreateShipment] 📦 Deducting stock for order {inp.order_id}...")
+    try:
+        deduct_res = db.execute(text("""
+            UPDATE twam."ProductVariantDetail" pvd
+            SET "AvailableQuantity" = GREATEST(
+                    0,
+                    COALESCE(pvd."AvailableQuantity", 0) - oi.ordered_qty
+                ),
+                "ModifiedDate" = :now
+            FROM (
+                SELECT "ProductVariantDetailId",
+                       SUM("Quantity") AS ordered_qty
+                FROM   twam."OrderItems"
+                WHERE  "OrderId"               = :oid
+                  AND  "DeletedInd"             = false
+                  AND  "ProductVariantDetailId" IS NOT NULL
+                GROUP BY "ProductVariantDetailId"
+            ) oi
+            WHERE pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
+        """), {"oid": inp.order_id, "now": datetime.now(timezone.utc)})
+        db.commit()
+        print(
+            f"[Ekart:CreateShipment] ✅ Stock deducted for order {inp.order_id} — "
+            f"{deduct_res.rowcount} variant(s) updated"
+        )
+    except Exception as _se:
+        db.rollback()
+        print(f"[Ekart:CreateShipment] ⚠️  Stock deduction FAILED (non-fatal) for order {inp.order_id}: {_se}")
+
     print(f"[Ekart:CreateShipment] ✅ DONE — order {inp.order_id} shipment created successfully\n{'='*60}\n")
     return ShipmentResponse(
         success=True, order_id=order["order_id"],

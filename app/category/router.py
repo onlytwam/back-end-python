@@ -1,5 +1,6 @@
 import re
 import json
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy.orm import Session
@@ -43,7 +44,7 @@ def parse_angular_filters(request: Request) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC endpoints — MUST be before /{category_id} catch-all
+# PUBLIC endpoints — no auth required
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/GetCategory", response_model=schemas.CategoryMenuResponse)
@@ -76,15 +77,29 @@ def get_product_detail_categories(
     o_asc   = order_ascending if order_ascending is not None else Order_Ascending
 
     filters = parse_angular_filters(request) or parse_filters(Filters) or []
-    # Public endpoint: never show categories that have no approved products
     return repository.get_all_categories(
         db, filters, o_asc, o_prop, p_index, p_size,
         with_products_only=True,
     )
 
 
+# FIX: /GetCategory/{category_id} MUST be registered before /{category_id}
+# otherwise FastAPI's wildcard /{category_id} catches it first and the
+# require_roles auth guard rejects the request with 403.
+@router.get("/GetCategory/{category_id}", response_model=schemas.CategoryResponse)
+def get_category_public(category_id: int, db: Session = Depends(get_db)):
+    """Public endpoint — fetch a single category by ID (no auth required)."""
+    result = repository.get_category_by_id(db, category_id)
+    if not result:
+        raise HTTPException(404, "Category not found.")
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN endpoints — role required
+# All specific sub-paths (check-delete, children, image, visibility) MUST be
+# declared before the plain /{category_id} wildcard route so FastAPI matches
+# them correctly instead of hitting the wildcard first.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=schemas.CategoryListResponse,
@@ -122,14 +137,7 @@ def create_category(command: schemas.CategoryCreate, db: Session = Depends(get_d
     return {"categoryId": repository.create_category(db, command)}
 
 
-@router.put("/{category_id}",
-            dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
-def update_category(category_id: int, command: schemas.CategoryUpdate, db: Session = Depends(get_db)):
-    result = repository.update_category(db, category_id, command)
-    if not result: raise HTTPException(404, "Category not found.")
-    return {"categoryId": result}
-
-
+# FIX: /{category_id}/check-delete declared before /{category_id} wildcard GET
 @router.get(
     "/{category_id}/check-delete",
     dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
@@ -152,7 +160,6 @@ def check_category_delete(category_id: int, db: Session = Depends(get_db)):
     child_ids = [c.categoryId for c in children]
     all_ids   = [category_id] + child_ids
 
-    # Count products linked to this category or any of its children
     from sqlalchemy import text
     product_count_row = db.execute(text("""
         SELECT COUNT(DISTINCT p."ProductId")
@@ -164,29 +171,24 @@ def check_category_delete(category_id: int, db: Session = Depends(get_db)):
     """), {"ids": all_ids}).fetchone()
 
     return {
-        "categoryId":    category_id,
-        "name":          cat.name,
-        "isParent":      len(child_ids) > 0,
-        "childCount":    len(child_ids),
-        "productCount":  int(product_count_row[0]) if product_count_row else 0,
-        "children":      [{"categoryId": c.categoryId, "name": c.name} for c in children],
+        "categoryId":   category_id,
+        "name":         cat.name,
+        "isParent":     len(child_ids) > 0,
+        "childCount":   len(child_ids),
+        "productCount": int(product_count_row[0]) if product_count_row else 0,
+        "children":     [{"categoryId": c.categoryId, "name": c.name} for c in children],
     }
 
 
-@router.delete("/{category_id}",
-               dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
-def delete_category(category_id: int, db: Session = Depends(get_db)):
-    result = repository.delete_category(db, category_id)
-    if not result:
-        raise HTTPException(404, "Category not found.")
-    return result
-@router.get("/GetCategory/{category_id}", response_model=schemas.CategoryResponse)
-def get_category_public(category_id: int, db: Session = Depends(get_db)):
-    """Public endpoint — fetch a single category by ID (no auth required)."""
-    result = repository.get_category_by_id(db, category_id)
-    if not result:
-        raise HTTPException(404, "Category not found.")
-    return result
+# FIX: /{category_id}/children declared before /{category_id} wildcard GET
+@router.get(
+    "/{category_id}/children",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def get_category_children(category_id: int, db: Session = Depends(get_db)):
+    """Return direct child categories for a given parent category ID."""
+    children = repository.get_children(db, category_id)
+    return [{"categoryId": c.categoryId, "name": c.name, "isActive": c.isActive} for c in children]
 
 
 @router.put(
@@ -210,21 +212,17 @@ def upload_category_image(
     old_url = cat.categoryImage or ""
     new_url = upload_image(file, container_key="category", folder=f"category_{category_id}")
 
-    # Resolve to absolute URL for local /uploads/ paths
     if new_url and new_url.startswith("/uploads/"):
         new_url = str(request.base_url).rstrip("/") + new_url
 
     cat.categoryImage = new_url
-    from datetime import datetime, timezone
-    cat.modifiedDate = datetime.now(timezone.utc)
+    cat.modifiedDate  = datetime.now(timezone.utc)
     db.commit()
 
     if old_url and old_url != new_url:
         delete_image(old_url)
 
     return {"success": True, "categoryId": category_id, "imageUrl": new_url}
-
-
 
 
 @router.patch(
@@ -259,18 +257,37 @@ def delete_category_image(category_id: int, db: Session = Depends(get_db)):
         delete_image(old_url)
     return {"success": True, "categoryId": category_id}
 
-@router.get("/{category_id}", response_model=schemas.CategoryResponse,
-            dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
+
+@router.delete(
+    "/{category_id}",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def delete_category(category_id: int, db: Session = Depends(get_db)):
+    result = repository.delete_category(db, category_id)
+    if not result:
+        raise HTTPException(404, "Category not found.")
+    return result
+
+
+@router.put(
+    "/{category_id}",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def update_category(category_id: int, command: schemas.CategoryUpdate, db: Session = Depends(get_db)):
+    result = repository.update_category(db, category_id, command)
+    if not result: raise HTTPException(404, "Category not found.")
+    return {"categoryId": result}
+
+
+# FIX: /{category_id} wildcard GET is now LAST — all specific sub-paths above
+# take priority. Previously /GetCategory/{id} and /{id}/children were below
+# this and got intercepted by the auth guard here, returning 403.
+@router.get(
+    "/{category_id}",
+    response_model=schemas.CategoryResponse,
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
 def get_category(category_id: int, db: Session = Depends(get_db)):
     result = repository.get_category_by_id(db, category_id)
     if not result: raise HTTPException(404, "Category not found.")
     return result
-
-@router.get(
-    "/{category_id}/children",
-    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
-)
-def get_category_children(category_id: int, db: Session = Depends(get_db)):
-    """Return direct child categories for a given parent category ID."""
-    children = repository.get_children(db, category_id)
-    return [{"categoryId": c.categoryId, "name": c.name, "isActive": c.isActive} for c in children]

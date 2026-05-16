@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy.orm import Session
-from sqlalchemy import asc, desc, text
+from sqlalchemy import asc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import Category
@@ -19,23 +19,17 @@ def get_all_categories(
     only_child: bool = False,
     with_products_only: bool = False,
 ) -> dict:
-    # Admin grid: show ALL non-deleted categories including inactive ones.
-    # Public/user-facing callers pass with_products_only=True which adds its
-    # own isActive filter via the expanded-product-count logic below.
     query = db.query(Category).filter(Category.deletedInd == False)
     if with_products_only:
-        # Public endpoints only show active categories
         query = query.filter(Category.isActive == True)
 
     if only_child:
         query = query.filter(Category.groupCategoryId != True)
 
-    # ── Filter to only categories (and their parents) that have products ──────
     if with_products_only:
         counts_raw = get_category_product_counts(db)
         cats_with_products: set = {row["categoryId"] for row in counts_raw if row["count"] > 0}
 
-        # Expand upward: mark every ancestor of a populated child as included
         all_cats = db.query(Category).filter(Category.deletedInd == False).all()
         cat_map  = {c.categoryId: c for c in all_cats}
         expanded: set = set(cats_with_products)
@@ -50,7 +44,6 @@ def get_all_categories(
         if expanded:
             query = query.filter(Category.categoryId.in_(expanded))
         else:
-            # No products at all — return empty result set
             return build_paged_response(0, [])
 
     query = apply_filters(query, Category, filters)
@@ -151,8 +144,6 @@ def update_category(db: Session, category_id: int, data) -> Optional[int]:
     cat.displayOrder     = data.displayOrder
     cat.parentCategoryId = data.parentCategoryId
     cat.isActive         = data.isActive if data.isActive is not None else True
-    # Only overwrite the stored image URL when the caller sends an explicit
-    # non-None value.  None means "field was not supplied" — leave DB intact.
     if data.categoryImage is not None:
         cat.categoryImage = data.categoryImage
     cat.modifiedDate     = datetime.now(timezone.utc)
@@ -235,12 +226,10 @@ def toggle_category_visibility(
 
     child_count = len(children)
 
-    # If hiding → always cascade hide to all children
     if not new_state:
         for child in children:
             child.isActive     = False
             child.modifiedDate = datetime.now(timezone.utc)
-    # If un-hiding and caller opted in → restore children too
     elif unhide_children:
         for child in children:
             child.isActive     = True
@@ -248,10 +237,10 @@ def toggle_category_visibility(
 
     db.commit()
     return {
-        "categoryId":  category_id,
-        "isActive":    new_state,
-        "childCount":  child_count,
-        "isParent":    child_count > 0,
+        "categoryId": category_id,
+        "isActive":   new_state,
+        "childCount": child_count,
+        "isParent":   child_count > 0,
     }
 
 
@@ -269,6 +258,7 @@ def delete_category_image(db: Session, category_id: int) -> Optional[str]:
     db.commit()
     return old_url
 
+
 # ── User-facing: nested category menu tree ────────────────────────────────────
 
 def get_category_menu(db: Session) -> dict:
@@ -280,12 +270,9 @@ def get_category_menu(db: Session) -> dict:
         asc(Category.displayOrder)
     ).all()
 
-    # Build the set of category IDs that have at least one approved product.
-    # A parent category must have products in itself OR in any descendant to be shown.
     counts_raw = get_category_product_counts(db)
     categories_with_products: set = {row["categoryId"] for row in counts_raw if row["count"] > 0}
 
-    # Expand upward: if a child has products, mark every ancestor as having products too.
     cat_map = {c.categoryId: c for c in categories}
     expanded: set = set(categories_with_products)
     for cat_id in list(categories_with_products):
@@ -300,7 +287,6 @@ def get_category_menu(db: Session) -> dict:
         result = []
         children = [c for c in categories if c.parentCategoryId == parent_id]
         for child in children:
-            # Skip this entire branch if it has no products
             if child.categoryId not in expanded:
                 continue
             node = {
@@ -322,36 +308,44 @@ def get_category_menu(db: Session) -> dict:
 # ── Category product counts ───────────────────────────────────────────────────
 
 def get_category_product_counts(db: Session) -> List[dict]:
-    # Join the Category table so we only count products whose category is
-    # still alive (DeletedInd=false) AND visible (IsActive=true).
-    # Without this join, deleting or hiding a category would still make its
-    # product counts appear in the menu/storefront.
-    child_sql = text("""
-        SELECT p."ChildCategoryId" AS category_id, COUNT(*) AS cnt
-        FROM twam."ProductVariantDetail" pvd
-        JOIN twam."Products"  p  ON p."ProductId"   = pvd."ProductId"
-        JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
-        WHERE pvd."DeletedInd" = false
-          AND p."DeletedInd"   = false
-          AND (pvd."State" = 'Approved' OR pvd."State" IS NULL)
-          AND p."ChildCategoryId" IS NOT NULL
-          AND cc."DeletedInd"  = false
-          AND cc."IsActive"    = true
-        GROUP BY p."ChildCategoryId"
+    # FIX: Use LOWER() for case-insensitive State comparison so that
+    # 'approved', 'Approved', 'APPROVED' all match correctly.
+    # Previously, Azure DB rows with lowercase 'approved' were excluded,
+    # making all product counts = 0 and the navbar return empty categories.
+    #
+    # FIX: Merge both queries into a single UNION ALL and aggregate with
+    # SUM to avoid duplicate counts when a category appears in both
+    # ChildCategoryId and CategoryId result sets.
+    sql = text("""
+        SELECT category_id, SUM(cnt) AS total
+        FROM (
+            SELECT p."ChildCategoryId" AS category_id, COUNT(*) AS cnt
+            FROM twam."ProductVariantDetail" pvd
+            JOIN twam."Products"  p  ON p."ProductId"   = pvd."ProductId"
+            JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
+            WHERE pvd."DeletedInd" = false
+              AND p."DeletedInd"   = false
+              AND (LOWER(pvd."State") = 'approved' OR pvd."State" IS NULL)
+              AND p."ChildCategoryId" IS NOT NULL
+              AND cc."DeletedInd"  = false
+              AND cc."IsActive"    = true
+            GROUP BY p."ChildCategoryId"
+
+            UNION ALL
+
+            SELECT p."CategoryId" AS category_id, COUNT(*) AS cnt
+            FROM twam."ProductVariantDetail" pvd
+            JOIN twam."Products"  p  ON p."ProductId"  = pvd."ProductId"
+            JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
+            WHERE pvd."DeletedInd" = false
+              AND p."DeletedInd"   = false
+              AND (LOWER(pvd."State") = 'approved' OR pvd."State" IS NULL)
+              AND p."CategoryId"   IS NOT NULL
+              AND pc."DeletedInd"  = false
+              AND pc."IsActive"    = true
+            GROUP BY p."CategoryId"
+        ) combined
+        GROUP BY category_id
     """)
-    parent_sql = text("""
-        SELECT p."CategoryId" AS category_id, COUNT(*) AS cnt
-        FROM twam."ProductVariantDetail" pvd
-        JOIN twam."Products"  p  ON p."ProductId"  = pvd."ProductId"
-        JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
-        WHERE pvd."DeletedInd" = false
-          AND p."DeletedInd"   = false
-          AND (pvd."State" = 'Approved' OR pvd."State" IS NULL)
-          AND p."CategoryId"   IS NOT NULL
-          AND pc."DeletedInd"  = false
-          AND pc."IsActive"    = true
-        GROUP BY p."CategoryId"
-    """)
-    rows  = db.execute(child_sql).fetchall()
-    rows += db.execute(parent_sql).fetchall()
-    return [{"categoryId": r[0], "count": r[1]} for r in rows if r[0]]
+    rows = db.execute(sql).fetchall()
+    return [{"categoryId": r[0], "count": int(r[1])} for r in rows if r[0]]
