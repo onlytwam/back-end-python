@@ -306,7 +306,9 @@ def _get_order_items(db: Session, order_id: int) -> list:
                ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
         LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
         LEFT JOIN mdm."Size" s ON s."SizeId" = pvd."Size"
-        WHERE oi."OrderId" = :order_id AND oi."DeletedInd" = false
+        WHERE oi."OrderId" = :order_id
+          AND oi."DeletedInd" = false
+          AND (oi."IsReturn" IS NULL OR oi."IsReturn" = false)
     """), {"order_id": order_id}).fetchall()
     return [
         {"name": r[0] or "Product", "quantity": r[1] or 1,
@@ -326,24 +328,29 @@ def _fmt_items_sms(items: list) -> str:
 # ── Email HTML helpers ────────────────────────────────────────────────────────
 
 def _header(company_name: str) -> str:
+    """Legacy helper kept for other notification types."""
     return f"""
-    <div style="background:#f8f5f0;padding:20px;text-align:center;
-                border-bottom:3px solid #8b7355;">
-      <h1 style="margin:0;color:#8b7355;font-family:Georgia,serif;">{company_name}</h1>
+    <div style="background:#6A012A;padding:10px 24px;display:flex;align-items:center;
+                justify-content:space-between;">
+      <img src="https://onlytwam.com/assets/Twam-Logo_White.png" height="32" alt="{company_name}"
+           style="display:block;" />
     </div>"""
 
 
 def _footer(company_name: str, support_email: str) -> str:
     return f"""
-    <div style="background:#f8f5f0;padding:20px;text-align:center;
-                margin-top:30px;border-top:1px solid #e5e0d8;">
-      <p style="margin:0 0 10px;color:#666;font-size:14px;">
-        Questions? <a href="mailto:{support_email}"
-                      style="color:#8b7355;">{support_email}</a>
+    <div style="background:#F0E6D0;padding:20px 24px;margin-top:0;
+                border-top:1.5px solid #EDE0CC;display:flex;
+                justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;">
+      <p style="margin:0;color:#9B7080;font-family:Georgia,serif;font-size:11px;
+                letter-spacing:0.08em;max-width:360px;line-height:1.6;">
+        We are Only TWAM, a multibrand platform where women have a wide variety of lingerie
+        brands, that can help them pick their most comfortable fit based on their daily needs.
       </p>
-      <p style="margin:0;color:#999;font-size:12px;">
-        © {datetime.now().year} {company_name}. All rights reserved.
-      </p>
+      <div style="font-size:10px;color:#9B7080;font-family:Georgia,serif;
+                  letter-spacing:0.1em;text-align:right;line-height:1.8;">
+        <div>onlytwam.com/contact-us</div>
+      </div>
     </div>"""
 
 
@@ -353,23 +360,157 @@ def _items_table(items: list) -> str:
         details = []
         if item.get("size"):  details.append(f"Size: {item['size']}")
         if item.get("color"): details.append(f"Color: {item['color']}")
-        det = (f"<br><small style='color:#666'>{' | '.join(details)}</small>"
+        det = (f"<br/><small style='color:#6B5060;font-size:11px'>{' | '.join(details)}</small>"
                if details else "")
+        total = item["price"] * item["quantity"]
         rows_html += f"""
         <tr>
-          <td style="padding:12px;border-bottom:1px solid #eee;">{item['name']}{det}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;text-align:center;">{item['quantity']}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;text-align:right;">{_fmt(item['price'])}</td>
+          <td style="padding:14px 16px;border-bottom:1px solid #F0E6D0;
+                     font-family:Georgia,serif;font-size:13px;color:#2C1018;">
+            {item['name']}{det}
+          </td>
+          <td style="padding:14px 16px;border-bottom:1px solid #F0E6D0;
+                     text-align:center;font-family:Georgia,serif;font-size:13px;color:#6B5060;">
+            {item['quantity']}
+          </td>
+          <td style="padding:14px 16px;border-bottom:1px solid #F0E6D0;
+                     text-align:right;font-family:Georgia,serif;font-size:13px;color:#6B5060;">
+            {_fmt(item['price'])}
+          </td>
+          <td style="padding:14px 16px;border-bottom:1px solid #F0E6D0;
+                     text-align:right;font-family:Georgia,serif;font-size:14px;
+                     font-weight:600;color:#2C1018;">
+            {_fmt(total)}
+          </td>
         </tr>"""
     return f"""
-    <table style="width:100%;border-collapse:collapse;margin:20px 0;">
-      <thead><tr style="background:#f8f5f0;">
-        <th style="padding:12px;text-align:left;border-bottom:2px solid #8b7355;">Item</th>
-        <th style="padding:12px;text-align:center;border-bottom:2px solid #8b7355;">Qty</th>
-        <th style="padding:12px;text-align:right;border-bottom:2px solid #8b7355;">Price</th>
-      </tr></thead>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:0;">
+      <thead>
+        <tr style="background:#6A012A;">
+          <th style="padding:10px 16px;text-align:left;font-family:Georgia,serif;
+                     font-size:9px;letter-spacing:0.24em;text-transform:uppercase;
+                     color:rgba(246,238,225,0.7);font-weight:normal;">Product</th>
+          <th style="padding:10px 16px;text-align:center;font-family:Georgia,serif;
+                     font-size:9px;letter-spacing:0.24em;text-transform:uppercase;
+                     color:rgba(246,238,225,0.7);font-weight:normal;">Qty</th>
+          <th style="padding:10px 16px;text-align:right;font-family:Georgia,serif;
+                     font-size:9px;letter-spacing:0.24em;text-transform:uppercase;
+                     color:rgba(246,238,225,0.7);font-weight:normal;">Price</th>
+          <th style="padding:10px 16px;text-align:right;font-family:Georgia,serif;
+                     font-size:9px;letter-spacing:0.24em;text-transform:uppercase;
+                     color:rgba(246,238,225,0.7);font-weight:normal;">Total</th>
+        </tr>
+      </thead>
       <tbody>{rows_html}</tbody>
     </table>"""
+
+
+def _build_invoice_email(order: dict, items: list, company: str, support: str) -> str:
+    """Generate an invoice-style HTML email that mirrors the Invoice.tsx design."""
+    subtotal    = sum(i["price"] * i["quantity"] for i in items)
+    ship_charge = order.get("delivery_charge") or 0
+    coupon      = order.get("coupon_amount") or 0
+    total       = order.get("total_amount") or 0
+    order_date  = datetime.now().strftime("%d %B %Y")
+    order_no    = order.get("order_number", "")
+
+    # Address block
+    addr_line = ", ".join(filter(None, [
+        order.get("address_line"), order.get("locality"),
+        order.get("city"), order.get("state"), order.get("pincode"),
+    ]))
+    addr_html = f"""
+      <div style="margin-bottom:28px;padding-bottom:24px;border-bottom:1.5px solid #EDE0CC;">
+        <div style="font-family:Georgia,serif;font-size:9px;letter-spacing:0.28em;
+                    text-transform:uppercase;color:#9B7080;margin-bottom:8px;">Bill / Ship To</div>
+        <div style="font-family:Georgia,serif;font-size:16px;font-weight:700;
+                    color:#2C1018;margin-bottom:4px;">{order.get('customer_name','')}</div>
+        <div style="font-family:Georgia,serif;font-size:13px;color:#6B5060;line-height:1.65;">
+          {addr_line}
+        </div>
+        <div style="font-family:Georgia,serif;font-size:13px;color:#9B7080;margin-top:6px;
+                    letter-spacing:0.06em;">{order.get('customer_phone','')}</div>
+      </div>"""
+
+    # Totals
+    totals_rows = f"""
+      <tr>
+        <td style="font-family:Georgia,serif;font-size:12px;color:#9B7080;
+                   letter-spacing:0.10em;text-transform:uppercase;padding:6px 0;">Subtotal</td>
+        <td style="font-family:Georgia,serif;font-size:13px;color:#2C1018;
+                   text-align:right;padding:6px 0;">{_fmt(subtotal)}</td>
+      </tr>
+      <tr>
+        <td style="font-family:Georgia,serif;font-size:12px;color:#9B7080;
+                   letter-spacing:0.10em;text-transform:uppercase;padding:6px 0;">Shipping</td>
+        <td style="font-family:Georgia,serif;font-size:13px;color:#2C1018;
+                   text-align:right;padding:6px 0;">{'FREE' if ship_charge == 0 else _fmt(ship_charge)}</td>
+      </tr>"""
+    if coupon > 0:
+        totals_rows += f"""
+      <tr>
+        <td style="font-family:Georgia,serif;font-size:12px;color:#9B7080;
+                   letter-spacing:0.10em;text-transform:uppercase;padding:6px 0;">Coupon Discount</td>
+        <td style="font-family:Georgia,serif;font-size:13px;color:#2E8B57;font-weight:600;
+                   text-align:right;padding:6px 0;">−{_fmt(coupon)}</td>
+      </tr>"""
+
+    return f"""
+<div style="font-family:Georgia,serif;max-width:700px;margin:0 auto;
+            background:#F6EEE1;">
+  <!-- Accent bar -->
+  <div style="height:5px;background:#6A012A;"></div>
+
+  <!-- Header: slim burgundy bar -->
+  <div style="background:#6A012A;padding:10px 24px;display:flex;align-items:center;
+              justify-content:space-between;">
+    <img src="https://onlytwam.com/assets/Twam-Logo_White.png" height="32" alt="{company}"
+         style="display:block;" />
+    <div style="text-align:right;">
+      <div style="font-family:Georgia,serif;font-size:13px;font-weight:700;
+                  color:#F6EEE1;letter-spacing:0.08em;line-height:1.3;">
+        Order #{order_no}
+      </div>
+      <div style="font-family:Georgia,serif;font-size:11px;
+                  color:rgba(246,238,225,0.70);letter-spacing:0.10em;line-height:1.3;">
+        {order_date}
+      </div>
+    </div>
+  </div>
+
+  <!-- Body -->
+  <div style="background:#fff;padding:32px 36px 0;">
+    {addr_html}
+    {_items_table(items)}
+
+    <!-- Totals -->
+    <div style="display:flex;justify-content:flex-end;padding:20px 0 0;">
+      <table style="min-width:260px;border-collapse:collapse;">
+        {totals_rows}
+        <tr>
+          <td colspan="2" style="padding:4px 0;"></td>
+        </tr>
+        <tr>
+          <td colspan="2" style="padding:0;">
+            <div style="display:flex;justify-content:space-between;align-items:center;
+                        padding:14px 16px;
+                        background:linear-gradient(135deg,#F6EEE1 0%,#fff 100%);
+                        border:1.5px solid #EDE0CC;border-left:5px solid #6A012A;
+                        border-radius:2px;margin-top:8px;">
+              <span style="font-family:Georgia,serif;font-size:11px;letter-spacing:0.26em;
+                           text-transform:uppercase;color:#9B7080;">Total</span>
+              <span style="font-family:Georgia,serif;font-size:22px;font-weight:700;
+                           color:#6A012A;letter-spacing:0.04em;">{_fmt(total)}</span>
+            </div>
+          </td>
+        </tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  {_footer(company, support)}
+</div>"""
 
 
 # ── SmsLog writer ─────────────────────────────────────────────────────────────
@@ -675,36 +816,7 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
     items   = _get_order_items(db, order_id)
 
     if order["customer_email"]:
-        subtotal    = sum(i["price"] * i["quantity"] for i in items)
-        ship_charge = _fmt(order["delivery_charge"]) if order["delivery_charge"] else "FREE"
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#333;margin-bottom:5px;">Thank you for your order!</h2>
-            <p style="color:#666;margin-top:0;">Hi {order['customer_name']}, your order has been confirmed.</p>
-            <div style="background:#f8f5f0;padding:15px;border-radius:8px;margin:20px 0;">
-              <p style="margin:0;"><strong>Order Number:</strong> #{order['order_number']}</p>
-              <p style="margin:5px 0 0;"><strong>Order Date:</strong> {datetime.now().strftime('%d %B %Y')}</p>
-            </div>
-            {_items_table(items)}
-            <div style="text-align:right;padding:15px 0;border-top:2px solid #8b7355;">
-              <p style="margin:5px 0;"><span style="color:#666;">Subtotal:</span> <strong>{_fmt(subtotal)}</strong></p>
-              <p style="margin:5px 0;"><span style="color:#666;">Shipping:</span> <strong>{ship_charge}</strong></p>
-              <p style="margin:10px 0 0;font-size:18px;"><span style="color:#666;">Total:</span>
-                <strong style="color:#8b7355;">{_fmt(order['total_amount'])}</strong></p>
-            </div>
-            <div style="background:#fff8e7;padding:15px;border-radius:8px;border-left:4px solid #f5a623;margin:20px 0;">
-              <p style="margin:0;color:#333;">We'll send tracking details once your order ships!</p>
-            </div>
-            <h3 style="color:#8b7355;">Delivery Address</h3>
-            <p style="color:#666;line-height:1.6;">
-              {order['customer_name']}<br>{order['address_line'] or ''}<br>
-              {order['city'] or ''} - {order['pincode'] or ''}<br>{order['customer_phone'] or ''}
-            </p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        body = _build_invoice_email(order, items, company, support)
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
             subject=f"Order Confirmed! #{order['order_number']} - {company}", message=body,
