@@ -530,37 +530,22 @@ def create_order(db: Session, data) -> dict:
         ]
 
     order_items_input = data.orderItems or []
-    if not order_items_input and getattr(data, "cartId", None):
-        summary = get_checkout_summary(
-            db,
-            getattr(data, "userProfileId", None) or "",
-            type("CheckoutPayload", (), {
-                "cartIds": getattr(data, "cartId", None) or [],
-                "shippingAddressId": getattr(data, "shippingAddressId", None),
-                "billingAddressId": getattr(data, "billingAddressId", None),
-                "shippingTypeId": getattr(data, "shippingTypeId", None),
-                "couponAmount": getattr(data, "couponAmount", None) or 0,
-            })()
+
+    # REMOVED FALLBACK: The old code had a dangerous fallback here that, when
+    # orderItems was empty, fetched ALL unordered cart items for the submitted
+    # cartIds via get_checkout_summary().  This caused phantom products to
+    # appear in the order when the frontend accidentally sent an empty
+    # orderItems list but a full cartId list (e.g. after a session reset).
+    #
+    # The frontend (Payment.tsx) always sends an explicit orderItems list built
+    # from the checkout session, so the fallback is never needed.  Removing it
+    # means an empty orderItems list is now a hard error, which surfaces the
+    # real problem instead of silently shipping the wrong products.
+    if not order_items_input:
+        raise ValueError(
+            "orderItems must not be empty. "
+            "The checkout session may have been lost — please return to cart and try again."
         )
-        if getattr(data, "subTotal", None) is None:
-            data.subTotal = summary["subTotal"]
-        if getattr(data, "taxAmount", None) is None:
-            data.taxAmount = summary["taxAmount"]
-        if getattr(data, "deliveryCharge", None) is None:
-            data.deliveryCharge = summary["deliveryCharge"]
-        if getattr(data, "totalAmount", None) is None:
-            data.totalAmount = summary["totalAmount"]
-        order_items_input = [
-            type("OrderItem", (), {
-                "productVariantDetailId": item["productVariantDetailId"],
-                "productVariantId": item["productVariantId"],
-                "productId": item["productId"],
-                "quantity": item["quantity"],
-                "price": item["unitPrice"],
-            })()
-            for item in summary["cartItems"]
-        ]
-        data.orderItems = order_items_input
     variant_ids = list({i.productVariantDetailId for i in order_items_input if i.productVariantDetailId})
 
     out_of_stock = check_out_of_stock(db, variant_ids)
@@ -569,9 +554,47 @@ def create_order(db: Session, data) -> dict:
 
     shipping_address, billing_address = _normalize_order_addresses_and_delivery(db, data)
 
+    # ── FIX: Fetch live prices from DB BEFORE creating the order so that
+    # subTotal / totalAmount are always authoritative server-side values.
+    # This prevents a mismatch where the client submits wrong amounts (e.g.
+    # sending a lower total while including extra items in the payload).
+    pvd_map = {}
+    if order_items_input:
+        pvd_ids = [i.productVariantDetailId for i in order_items_input if i.productVariantDetailId]
+        if pvd_ids:
+            ids_str = ",".join(str(i) for i in pvd_ids)
+            rows = db.execute(text(
+                f'SELECT "ProductVariantDetailId","CGST","SGST","TaxAmount","FinalPrice" '
+                f'FROM twam."ProductVariantDetail" '
+                f'WHERE "ProductVariantDetailId" IN ({ids_str})'
+            )).fetchall()
+            pvd_map = {r[0]: {"cgst": r[1], "sgst": r[2], "taxAmount": r[3], "finalPrice": r[4]} for r in rows}
+
+    # ── Server-side total recalculation ────────────────────────────────────
+    # Always derive from live DB prices, never from client-submitted values.
+    computed_subtotal = round(sum(
+        float(pvd_map.get(x.productVariantDetailId, {}).get("finalPrice") or 0) * int(x.quantity or 1)
+        for x in order_items_input
+    ), 2)
+    computed_tax = round(sum(
+        float(pvd_map.get(x.productVariantDetailId, {}).get("taxAmount") or 0) * int(x.quantity or 1)
+        for x in order_items_input
+    ), 2)
+    computed_delivery = round(float(getattr(data, "deliveryCharge", 0) or 0), 2)
+    computed_coupon   = round(float(getattr(data, "couponAmount", 0) or 0), 2)
+    computed_total    = round(computed_subtotal + computed_delivery - computed_coupon, 2)
+
+    print(
+        f"[Order] Server-side totals — subtotal=₹{computed_subtotal} "
+        f"tax=₹{computed_tax} delivery=₹{computed_delivery} "
+        f"coupon=₹{computed_coupon} total=₹{computed_total} "
+        f"(client sent subTotal={getattr(data, 'subTotal', '?')} "
+        f"totalAmount={getattr(data, 'totalAmount', '?')})"
+    )
+
     order = Orders(
         orderNumber=generate_order_number(),
-        totalAmount=getattr(data, "totalAmount", None),
+        totalAmount=computed_total,
         orderDate=getattr(data, "orderDate", None) or datetime.now(timezone.utc),
         userProfileId=getattr(data, "userProfileId", None),
         state="AwaitingPayment",
@@ -582,10 +605,10 @@ def create_order(db: Session, data) -> dict:
         personalId=0,
         couponId=getattr(data, "couponId", None),
         shippingTypeId=getattr(data, "shippingTypeId", None),
-        couponAmount=getattr(data, "couponAmount", None),
-        deliveryCharge=getattr(data, "deliveryCharge", None),
-        taxAmount=getattr(data, "taxAmount", None),
-        subTotal=getattr(data, "subTotal", None),
+        couponAmount=computed_coupon,
+        deliveryCharge=computed_delivery,
+        taxAmount=computed_tax,
+        subTotal=computed_subtotal,
         isWhatsappNotification=getattr(data, "isWhatsappNotification", None),
         paymentMethod=getattr(data, "paymentMethod", None),
         paymentAccount=getattr(data, "paymentAccount", None),
@@ -595,39 +618,28 @@ def create_order(db: Session, data) -> dict:
     db.flush()  # get auto-generated orderId
     order_id = order.orderId
 
-    # Fetch variant tax/price info
-    pvd_map = {}
-    if order_items_input:
-        pvd_ids = [i.productVariantDetailId for i in order_items_input if i.productVariantDetailId]
-        if pvd_ids:
-            ids_str = ",".join(str(i) for i in pvd_ids)
-            rows = db.execute(text(
-                f'SELECT "ProductVariantDetailId","CGST","SGST","TaxAmount","FinalPrice" FROM twam."ProductVariantDetail" WHERE "ProductVariantDetailId" IN ({ids_str})'
-            )).fetchall()
-            pvd_map = {r[0]: {"cgst": r[1], "sgst": r[2], "taxAmount": r[3], "finalPrice": r[4]} for r in rows}
+    # Save order items (pvd_map already built above — no second DB round-trip)
+    for x in order_items_input:
+        variant     = pvd_map.get(x.productVariantDetailId, {})
+        tax         = float(variant.get("taxAmount") or 0)
+        final_price = float(variant.get("finalPrice") or 0)
 
-        for x in order_items_input:
-            variant  = pvd_map.get(x.productVariantDetailId, {})
-            tax      = float(variant.get("taxAmount") or 0)
-            final_price = float(variant.get("finalPrice") or 0)
-
-            # ── BUG FIX: OrderItems model uses PascalCase column names ──────
-            item = OrderItems(
-                OrderId                = order_id,
-                OrderItemNumber        = generate_order_item_number(),
-                ProductVariantDetailId = x.productVariantDetailId,
-                ProductVariantId       = x.productVariantId,
-                ProductId              = x.productId,
-                Quantity               = x.quantity,
-                Price                  = x.price,
-                CreatedDate            = datetime.now(timezone.utc),
-                DeletedInd             = False,
-                TaxAmount              = tax,
-                CGST                   = variant.get("cgst"),
-                SGST                   = variant.get("sgst"),
-                UnitPrice              = float(final_price) - float(tax) if final_price else None,
-            )
-            db.add(item)
+        item = OrderItems(
+            OrderId                = order_id,
+            OrderItemNumber        = generate_order_item_number(),
+            ProductVariantDetailId = x.productVariantDetailId,
+            ProductVariantId       = x.productVariantId,
+            ProductId              = x.productId,
+            Quantity               = x.quantity,
+            Price                  = final_price,        # ← use live DB price, not client value
+            CreatedDate            = datetime.now(timezone.utc),
+            DeletedInd             = False,
+            TaxAmount              = tax,
+            CGST                   = variant.get("cgst"),
+            SGST                   = variant.get("sgst"),
+            UnitPrice              = round(final_price - tax, 2) if final_price else None,
+        )
+        db.add(item)
 
     # Add initial tracking status
     db.add(OrderTrackingStatus(

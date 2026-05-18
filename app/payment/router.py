@@ -644,23 +644,40 @@ async def payment_callback(
         background_tasks.add_task(_auto_create_ekart_shipment, order_id)
         print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
 
-        # Remove all ordered cart items completely so the cart is clean for the user
+        # Remove all ordered cart items completely so the cart is clean for the user.
+        # FIX: The old SQL joined Cart to OrderItems on ProductVariantDetailId and
+        # deleted EVERY Cart row with a matching PVDID.  This was dangerous when
+        # duplicate Cart rows existed (due to the IsOrdered NULL bug in cart/repository.py)
+        # because it would also delete Cart rows the user had NOT yet ordered.
+        # The corrected query uses a CTE to collect exactly the CartIds that
+        # were ordered (by matching PVDID through OrderItems), then deletes only
+        # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
+        # row that was most likely in the cart when the order was placed).
         print(f"[Payment:Callback] STEP 7 — Removing ordered cart items for order {order_id}...")
         try:
             result = db.execute(text("""
-                UPDATE twam."Cart" c
-                SET "DeletedInd"    = true,
-                    "IsOrdered"     = true,
-                    "ModifiedDate"  = :now
-                FROM twam."OrderItems" oi
-                WHERE oi."OrderId" = :oid
-                  AND oi."DeletedInd" = false
-                  AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                  AND c."UserProfileId" = (
-                      SELECT "UserProfileId" FROM twam."Orders"
-                      WHERE "OrderId" = :oid AND "DeletedInd" = false
-                  )
-                  AND c."DeletedInd" = false
+                WITH user_id AS (
+                    SELECT "UserProfileId"
+                    FROM twam."Orders"
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false
+                    LIMIT 1
+                ),
+                carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
             """), {"oid": order_id, "now": datetime.now(timezone.utc)})
             db.commit()
             print(
@@ -675,6 +692,25 @@ async def payment_callback(
             f"[Payment:Callback] STEP 7 — Payment NOT successful (code={response_code}) | "
             f"Ekart task NOT queued | Cart preserved for retry"
         )
+        # ── FIX: Soft-delete OrderItems from this failed order so ghost items
+        # never appear on a future invoice or bleed into the next order.
+        # Cart items are preserved so the user can retry from their cart.
+        try:
+            cleanup = db.execute(text("""
+                UPDATE twam."OrderItems"
+                SET    "DeletedInd"   = true,
+                       "ModifiedDate" = :now
+                WHERE  "OrderId"    = :oid
+                  AND  "DeletedInd" = false
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+            db.commit()
+            print(
+                f"[Payment:Callback] STEP 7 ✅ Soft-deleted {cleanup.rowcount} OrderItem(s) "
+                f"for failed order {order_id}"
+            )
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Callback] STEP 7 ⚠️  OrderItems cleanup failed for order {order_id}: {exc}")
 
     # ── STEP 8: Send notification ─────────────────────────────────────────
     print(f"[Payment:Callback] STEP 8 — Sending payment notification (success={success})...")
@@ -876,6 +912,29 @@ def expire_payment(
     ))
     db.commit()
     print(f"[Payment/Expire] Order {order_id} expired → PaymentFailed")
+
+    # ── FIX: Soft-delete OrderItems from this failed order so they can never
+    # bleed into a subsequent order's item list or invoice display.
+    # Cart items are intentionally left intact (IsOrdered=false) so the user
+    # can retry from their cart — they are re-fetched by CartId on the next
+    # checkout, not by scanning all unordered items.
+    try:
+        result = db.execute(text("""
+            UPDATE twam."OrderItems"
+            SET    "DeletedInd"   = true,
+                   "ModifiedDate" = :now
+            WHERE  "OrderId"    = :oid
+              AND  "DeletedInd" = false
+        """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+        db.commit()
+        print(
+            f"[Payment/Expire] Soft-deleted {result.rowcount} OrderItem(s) "
+            f"for failed order {order_id}"
+        )
+    except Exception as exc:
+        db.rollback()
+        print(f"[Payment/Expire] OrderItems cleanup failed for order {order_id}: {exc}")
+
     return {"success": True, "state": "PaymentFailed"}
 
 

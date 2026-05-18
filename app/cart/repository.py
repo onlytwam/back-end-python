@@ -179,11 +179,18 @@ def create_cart(db: Session, data) -> dict:
     
     Returns: {"cartId": int, "status": "created"|"updated", "quantity": int}
     """
+    # FIX: Use isnot(True) instead of != True.
+    # isOrdered is nullable Boolean (NULL by default on new rows).
+    # In SQL, NULL != TRUE evaluates to NULL (unknown), which WHERE treats as
+    # FALSE → existing rows with IsOrdered IS NULL are never found → every
+    # "Add to Cart" creates a brand-new duplicate row instead of incrementing
+    # quantity.  isnot(True) generates "IS NOT TRUE" which correctly matches
+    # both NULL and FALSE.
     existing = db.query(Cart).filter(
         Cart.productVariantDetailId == data.productVariantDetailId,
         Cart.userProfileId == data.userProfileId,
         Cart.deletedInd == False,
-        Cart.isOrdered != True
+        Cart.isOrdered.isnot(True),
     ).first()
 
     if existing:
@@ -249,12 +256,13 @@ def create_bulk_cart(db: Session, items: list, user_profile_id: str) -> Dict:
     print(f"🔄 Cart: Processing bulk sync for user {user_profile_id} - {len(items)} items")
 
     for item in items:
-        # Check if item already exists
+        # Check if item already exists.
+        # FIX: Use isnot(True) — same NULL bug as create_cart above.
         existing = db.query(Cart).filter(
             Cart.productVariantDetailId == item.productVariantDetailId,
             Cart.userProfileId == user_profile_id,
             Cart.deletedInd == False,
-            Cart.isOrdered != True
+            Cart.isOrdered.isnot(True),
         ).first()
 
         if existing:
