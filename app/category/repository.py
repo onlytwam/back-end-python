@@ -308,41 +308,47 @@ def get_category_menu(db: Session) -> dict:
 # ── Category product counts ───────────────────────────────────────────────────
 
 def get_category_product_counts(db: Session) -> List[dict]:
-    # FIX: Use LOWER() for case-insensitive State comparison so that
-    # 'approved', 'Approved', 'APPROVED' all match correctly.
-    # Previously, Azure DB rows with lowercase 'approved' were excluded,
-    # making all product counts = 0 and the navbar return empty categories.
+    # ── FIX: Count products using Products.state, not ProductVariantDetail.state ──
     #
-    # FIX: Merge both queries into a single UNION ALL and aggregate with
-    # SUM to avoid duplicate counts when a category appears in both
-    # ChildCategoryId and CategoryId result sets.
+    # ROOT CAUSE of empty navbar:
+    # ProductVariantDetail rows are always inserted with State = 'Created' by the
+    # bulk-upload pipeline and are NEVER updated. Only the Products table gets its
+    # state promoted to 'Approved' by the admin workflow. Filtering on
+    # pvd."State" = 'approved' therefore always returns 0 rows, the expanded set
+    # stays empty, _build(None) returns [], and the navbar shows no categories.
+    #
+    # FIX: Move the visibility filter to Products.state (which IS updated) and drop
+    # the pvd.State predicate entirely. We still join PVD to exclude products that
+    # have no stock rows at all (DeletedInd guard), but we no longer filter on its
+    # State column.
+    #
+    # We also retain the UNION ALL + SUM pattern to correctly count products that
+    # appear in both ChildCategoryId and CategoryId result sets.
     sql = text("""
         SELECT category_id, SUM(cnt) AS total
         FROM (
-            SELECT p."ChildCategoryId" AS category_id, COUNT(*) AS cnt
-            FROM twam."ProductVariantDetail" pvd
-            JOIN twam."Products"  p  ON p."ProductId"   = pvd."ProductId"
+            -- Products filed under a child category (ChildCategoryId)
+            SELECT p."ChildCategoryId" AS category_id, COUNT(DISTINCT p."ProductId") AS cnt
+            FROM twam."Products"  p
             JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
-            WHERE pvd."DeletedInd" = false
-              AND p."DeletedInd"   = false
-              AND (LOWER(pvd."State") = 'approved' OR pvd."State" IS NULL)
-              AND p."ChildCategoryId" IS NOT NULL
-              AND cc."DeletedInd"  = false
-              AND cc."IsActive"    = true
+            WHERE p."DeletedInd"          = false
+              AND LOWER(p."State")        = 'approved'
+              AND p."ChildCategoryId"     IS NOT NULL
+              AND cc."DeletedInd"         = false
+              AND cc."IsActive"           = true
             GROUP BY p."ChildCategoryId"
 
             UNION ALL
 
-            SELECT p."CategoryId" AS category_id, COUNT(*) AS cnt
-            FROM twam."ProductVariantDetail" pvd
-            JOIN twam."Products"  p  ON p."ProductId"  = pvd."ProductId"
+            -- Products filed directly under a parent category (CategoryId, no child)
+            SELECT p."CategoryId" AS category_id, COUNT(DISTINCT p."ProductId") AS cnt
+            FROM twam."Products"  p
             JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
-            WHERE pvd."DeletedInd" = false
-              AND p."DeletedInd"   = false
-              AND (LOWER(pvd."State") = 'approved' OR pvd."State" IS NULL)
-              AND p."CategoryId"   IS NOT NULL
-              AND pc."DeletedInd"  = false
-              AND pc."IsActive"    = true
+            WHERE p."DeletedInd"      = false
+              AND LOWER(p."State")    = 'approved'
+              AND p."CategoryId"      IS NOT NULL
+              AND pc."DeletedInd"     = false
+              AND pc."IsActive"       = true
             GROUP BY p."CategoryId"
         ) combined
         GROUP BY category_id
