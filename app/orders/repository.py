@@ -546,6 +546,59 @@ def create_order(db: Session, data) -> dict:
             "orderItems must not be empty. "
             "The checkout session may have been lost — please return to cart and try again."
         )
+
+    # ── FIX: Cross-validate orderItems against the submitted cartIds ────────
+    # This is the definitive server-side guard against phantom products.
+    #
+    # The frontend sends BOTH:
+    #   - cartId: list of CartIds the user selected in the cart UI
+    #   - orderItems: list of products (with productVariantDetailId) to order
+    #
+    # Before this fix, create_order trusted orderItems blindly.  If a stale
+    # checkout session or a UI race condition included an unselected product in
+    # orderItems, it would silently appear in the order.
+    #
+    # Now we fetch the ProductVariantDetailIds that are authorised for this
+    # checkout (i.e., belong to the submitted cartIds and belong to this user)
+    # and reject any orderItems entry whose PVDID is not in that authorised set.
+    #
+    # If no cartIds were submitted (Buy Now flow), skip this check — Buy Now
+    # items have no Cart rows.
+    submitted_cart_ids = list({int(c) for c in (getattr(data, "cartId", None) or []) if c})
+    if submitted_cart_ids:
+        user_profile_id_str = getattr(data, "userProfileId", None) or ""
+        ids_str_cids = ",".join(str(c) for c in submitted_cart_ids)
+        authorised_rows = db.execute(text(f"""
+            SELECT "CartId", "ProductVariantDetailId"
+            FROM twam."Cart"
+            WHERE "CartId" IN ({ids_str_cids})
+              AND "UserProfileId" = :uid
+              AND "DeletedInd" = false
+              AND ("IsOrdered" IS NULL OR "IsOrdered" = false)
+        """), {"uid": user_profile_id_str}).fetchall()
+
+        # Map: PVDID → CartId (only authorised PVDIDs)
+        authorised_pvdids = {row[1] for row in authorised_rows if row[1] is not None}
+
+        phantom = [
+            i.productVariantDetailId
+            for i in order_items_input
+            if i.productVariantDetailId is not None
+            and i.productVariantDetailId not in authorised_pvdids
+        ]
+        if phantom:
+            print(
+                f"[Order] ❌ Phantom product guard triggered — "
+                f"orderItems contains PVDIDs not in submitted cartIds: {phantom}. "
+                f"Submitted cartIds={submitted_cart_ids}. "
+                f"Authorised PVDIDs={authorised_pvdids}. "
+                f"Rejecting order to prevent incorrect products being charged."
+            )
+            raise ValueError(
+                "One or more items in your order could not be verified. "
+                "Please return to cart, review your selection, and try again."
+            )
+
     variant_ids = list({i.productVariantDetailId for i in order_items_input if i.productVariantDetailId})
 
     out_of_stock = check_out_of_stock(db, variant_ids)
