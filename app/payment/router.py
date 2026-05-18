@@ -968,6 +968,29 @@ def _mask(v: str) -> str:
     return v[:4] + "****" + v[-4:]
 
 
+@router.get("/OutboundIp")
+def get_outbound_ip():
+    """
+    Returns this server's public outbound IP address.
+    Share this IP with PayG support to get it whitelisted.
+    No auth required — safe to call from browser/Postman.
+    """
+    import httpx as _httpx
+    results = {}
+    for svc, url in [
+        ("amazonaws",  "https://checkip.amazonaws.com"),
+        ("ipify",      "https://api.ipify.org"),
+        ("my-ip.io",   "https://api4.my-ip.io/ip"),
+    ]:
+        try:
+            r = _httpx.get(url, timeout=5)
+            results[svc] = r.text.strip()
+            break
+        except Exception as e:
+            results[svc] = f"failed: {e}"
+    return {"outbound_ip": results}
+
+
 @router.get(
     "/Config",
     response_model = PaygConfigResponse,
