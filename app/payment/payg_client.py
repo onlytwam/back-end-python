@@ -103,17 +103,17 @@ def _sanitize_phone(phone) -> str:
 
 def _build_auth_header() -> str:
     """
-    PayG requires:  Authorization: Basic base64(AuthKey:AuthToken:M:MerchantKeyId)
+    PayG requires:  Authorization: Basic base64(AuthKey:AuthToken)
 
-    BUG FIX: The format is AuthKey:AuthToken:M:MerchantKeyId — NOT just AuthKey:AuthToken.
-    PayG docs confirm: decode their example YjYwYmU... → "b60be...:84628...:M:8792"
-    Omitting ':M:MerchantKeyId' causes PayG to reject ALL requests with an auth error.
+    NOTE: The ':M:MerchantKeyId' suffix is only required for certain PayG
+    enterprise accounts. For standard UAT accounts the correct format is
+    simply AuthKey:AuthToken. Using the longer format causes PayG to return
+    error 0049 ('merchant not authorized') on standard accounts.
     """
-    auth_key        = _cfg("payg_auth_key")
-    auth_token      = _cfg("payg_auth_token")
-    merchant_key_id = _cfg("payg_merchant_key_id", "0")
-    raw             = f"{auth_key}:{auth_token}:M:{merchant_key_id}"
-    encoded         = base64.b64encode(raw.encode()).decode()
+    auth_key   = _cfg("payg_auth_key")
+    auth_token = _cfg("payg_auth_token")
+    raw        = f"{auth_key}:{auth_token}"
+    encoded    = base64.b64encode(raw.encode()).decode()
     return f"Basic {encoded}"
 
 
