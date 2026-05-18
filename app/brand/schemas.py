@@ -5,16 +5,8 @@ from pydantic import BaseModel, Field, field_validator
 
 
 # ─────────────────────────────────────────────
-# Shared
+# Pagination
 # ─────────────────────────────────────────────
-
-class FileUploadModel(BaseModel):
-    fileUploadId: Optional[int]  = None
-    fileName:     Optional[str]  = None
-    filePath:     Optional[str]  = None
-    fileData:     Optional[str]  = None
-    fileType:     Optional[str]  = None
-
 
 class PaginationParams(BaseModel):
     index: int = Field(1,  ge=1)
@@ -26,11 +18,11 @@ class PaginationParams(BaseModel):
 # ─────────────────────────────────────────────
 
 class BrandBase(BaseModel):
-    brandName:        str            = Field(..., min_length=1, max_length=255)
-    brandDescription: Optional[str]  = Field(None, max_length=2000)
-    userProfileId:    Optional[str]  = None
-    state:            Optional[str]  = None
-    isActive:         bool           = True
+    brandName:        str           = Field(..., min_length=1, max_length=255)
+    brandDescription: Optional[str] = Field(None, max_length=2000)
+    userProfileId:    Optional[str] = None
+    state:            Optional[str] = None
+    isActive:         bool          = True
 
     @field_validator("brandName", mode="before")
     @classmethod
@@ -46,8 +38,7 @@ class BrandBase(BaseModel):
 
 
 class BrandCreate(BrandBase):
-    brandLogoFileModel:  Optional[FileUploadModel] = None
-    brandImageFileModel: Optional[FileUploadModel] = None
+    pass
 
 
 class BrandUpdate(BaseModel):
@@ -57,8 +48,6 @@ class BrandUpdate(BaseModel):
     userProfileId:    Optional[str]  = None
     state:            Optional[str]  = None
     isActive:         Optional[bool] = None
-    brandLogoFileModel:  Optional[FileUploadModel] = None
-    brandImageFileModel: Optional[FileUploadModel] = None
 
     @field_validator("brandName", mode="before")
     @classmethod
@@ -78,12 +67,14 @@ class BrandUpdate(BaseModel):
 class BrandResponse(BaseModel):
     brandId:          int
     brandName:        str
-    brandDescription: Optional[str]  = None
-    brandLogo:        Optional[str]  = None
-    brandImage:       Optional[str]  = None
-    userProfileId:    Optional[str]  = None
-    state:            Optional[str]  = None
-    isActive:         bool           = True
+    brandDescription: Optional[str] = None
+    brandImage:       Optional[str] = None
+    userProfileId:    Optional[str] = None
+    state:            Optional[str] = None
+    isActive:         bool          = True
+    # deletedInd is included so the admin UI can display a "DELETED" badge.
+    # Public users never see deleted brands (filtered server-side).
+    deletedInd:       bool          = False
 
     model_config = {"from_attributes": True}
 

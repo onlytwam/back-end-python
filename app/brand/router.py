@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from email.mime import text
 import json
 import logging
-import os
 from typing import Optional
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+
+from fastapi import (
+    APIRouter, Depends, File, Form, HTTPException, Query, Request,
+    UploadFile, status,
+)
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
@@ -27,13 +29,7 @@ router = APIRouter(
 # Helpers
 # ─────────────────────────────────────────────
 
-def _save_upload(file: UploadFile, subfolder: str = "") -> str:
-    """Upload a brand image to Azure Blob (prod) or local disk (dev)."""
-    return upload_image(file, container_key="brands", folder=subfolder)
-
-
 def _to_url(path: Optional[str]) -> Optional[str]:
-    """Convert a stored filesystem path to a URL-safe path."""
     if not path:
         return None
     if path.startswith("/") or path.startswith("http"):
@@ -60,22 +56,43 @@ def _coerce_bool(value: Optional[str], default: bool = True) -> bool:
     return str(value).strip().lower() not in ("false", "0", "no")
 
 
+def _brand_to_response(b) -> schemas.BrandResponse:
+    return schemas.BrandResponse(
+        brandId          = b.brandId,
+        brandName        = b.brandName,
+        brandDescription = b.brandDescription,
+        brandImage       = _to_url(b.brandImage),
+        userProfileId    = b.userProfileId,
+        state            = b.state,
+        isActive         = b.isActive if b.isActive is not None else True,
+        deletedInd       = bool(b.deletedInd) if b.deletedInd is not None else False,
+    )
+
+
 # ─────────────────────────────────────────────
-# PUBLIC — list / detail
+# PUBLIC — list (active + non-deleted only)
 # ─────────────────────────────────────────────
+
 @router.get(
     "/",
     response_model=schemas.BrandListResponse,
-    summary="List brands (paginated)",
+    summary="List brands (paginated). Public: active only. Admin with showAll=true: includes hidden.",
 )
 def list_brands(
-    Filters: Optional[str] = Query(None, alias="Filters"),
-    Order_Property: Optional[str] = Query(None, alias="Order.Property"),
-    Order_Ascending: Optional[bool] = Query(None, alias="Order.Ascending"),
-    Page_Index: Optional[int] = Query(1, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(10, alias="Page.Size", ge=1, le=1000),
+    Filters:           Optional[str]  = Query(None, alias="Filters"),
+    Order_Property:    Optional[str]  = Query(None, alias="Order.Property"),
+    Order_Ascending:   Optional[bool] = Query(None, alias="Order.Ascending"),
+    Page_Index:        Optional[int]  = Query(1,    alias="Page.Index", ge=1),
+    Page_Size:         Optional[int]  = Query(10,   alias="Page.Size",  ge=1, le=1000),
+    # Admin callers pass showAll=true to also see hidden (isActive=false) brands.
+    # Deleted brands (deletedInd=true) are NEVER returned to anyone via this endpoint.
+    showAll:           bool           = Query(False, alias="showAll"),
     db: Session = Depends(get_db),
 ) -> schemas.BrandListResponse:
+
+    # Public view always active_only=True; admin can pass showAll=true
+    active_only = not showAll
+
     result = repository.get_all_brands(
         db              = db,
         filters         = _parse_filters(Filters),
@@ -83,27 +100,15 @@ def list_brands(
         order_ascending = Order_Ascending,
         page_index      = Page_Index,
         page_size       = Page_Size,
+        active_only     = active_only,
     )
-
-    response_list = [
-        schemas.BrandResponse(
-            brandId          = b.brandId,
-            brandName        = b.brandName,
-            brandDescription = b.brandDescription,
-            brandLogo        = _to_url(b.brandLogo),
-            brandImage       = _to_url(b.brandImage),
-            userProfileId    = b.userProfileId,
-            state            = b.state,
-            isActive         = b.isActive if b.isActive is not None else True,
-        )
-        for b in result["list"]
-    ]
 
     return schemas.BrandListResponse(
         count      = result["count"],
-        list       = response_list,
+        list       = [_brand_to_response(b) for b in result["list"]],
         parameters = None,
     )
+
 
 @router.get(
     "/{brand_id}",
@@ -115,13 +120,13 @@ def get_brand(
     db: Session = Depends(get_db),
 ) -> schemas.BrandResponse:
     brand = repository.get_brand_by_id(db, brand_id)
-    if not brand:
+    if not brand or brand.deletedInd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
-    return brand
+    return _brand_to_response(brand)
 
 
 # ─────────────────────────────────────────────
-# PROTECTED — create / update / delete
+# PROTECTED — create / update
 # ─────────────────────────────────────────────
 
 @router.post(
@@ -132,12 +137,11 @@ def get_brand(
     dependencies=[Depends(get_current_user)],
 )
 def create_brand(
-    brandName:        str                  = Form(...),
-    brandDescription: Optional[str]        = Form(None),
-    userProfileId:    Optional[str]        = Form(None),
-    state:            Optional[str]        = Form(None),
-    isActive:         Optional[str]        = Form("true"),
-    brandLogo:        Optional[UploadFile] = File(None),
+    brandName:        str            = Form(...),
+    brandDescription: Optional[str] = Form(None),
+    userProfileId:    Optional[str] = Form(None),
+    state:            Optional[str] = Form(None),
+    isActive:         Optional[str] = Form("true"),
     db: Session = Depends(get_db),
 ) -> schemas.BrandResponse:
     validated = schemas.BrandCreate(
@@ -147,36 +151,28 @@ def create_brand(
         state            = state,
         isActive         = _coerce_bool(isActive),
     )
-
-    data = validated.model_dump(exclude={"brandLogoFileModel", "brandImageFileModel"})
-
-    if brandLogo and brandLogo.filename:
-        data["brandLogo"] = _save_upload(brandLogo)
-        logger.info("Saved brand logo: %s", data["brandLogo"])
-
-    brand = repository.create_brand(db, data)
+    brand = repository.create_brand(db, validated.model_dump())
     logger.info("Created brand id=%s name=%r", brand.brandId, brand.brandName)
-    return brand
+    return _brand_to_response(brand)
 
 
 @router.put(
     "/{brand_id}",
     response_model=schemas.BrandResponse,
-    summary="Update a brand (name / description / logo)",
+    summary="Update a brand (name / description)",
     dependencies=[Depends(get_current_user)],
 )
 def update_brand(
     brand_id:         int,
-    brandName:        Optional[str]        = Form(None),
-    brandDescription: Optional[str]        = Form(None),
-    userProfileId:    Optional[str]        = Form(None),
-    state:            Optional[str]        = Form(None),
-    isActive:         Optional[str]        = Form(None),
-    brandLogo:        Optional[UploadFile] = File(None),
+    brandName:        Optional[str] = Form(None),
+    brandDescription: Optional[str] = Form(None),
+    userProfileId:    Optional[str] = Form(None),
+    state:            Optional[str] = Form(None),
+    isActive:         Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ) -> schemas.BrandResponse:
     existing = repository.get_brand_by_id(db, brand_id)
-    if not existing:
+    if not existing or existing.deletedInd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
     validated = schemas.BrandUpdate(
@@ -187,32 +183,44 @@ def update_brand(
         isActive         = _coerce_bool(isActive) if isActive is not None else None,
     )
 
-    data = {
-        k: v for k, v in validated.model_dump(
-            exclude={"brandLogoFileModel", "brandImageFileModel"}
-        ).items()
-        if v is not None
-    }
-
-    if brandLogo and brandLogo.filename:
-        if existing.brandLogo:
-            delete_image(existing.brandLogo)
-        data["brandLogo"] = _save_upload(brandLogo)
-        logger.info("Updated brand logo: %s", data["brandLogo"])
-
+    data = {k: v for k, v in validated.model_dump().items() if v is not None}
     logger.info("Updating brand id=%s with fields: %s", brand_id, list(data.keys()))
     updated = repository.update_brand(db, brand_id, data)
-    return updated
+    return _brand_to_response(updated)
 
 
 # ─────────────────────────────────────────────
-# IMAGE — dedicated upload / delete endpoints
-# (same pattern as /api/Category/{id}/image)
+# PROTECTED — toggle visibility (hide / show)
+# ─────────────────────────────────────────────
+
+@router.patch(
+    "/{brand_id}/toggle-visibility",
+    response_model=schemas.BrandResponse,
+    summary="Toggle brand visibility (hide / show). Hides all associated products from public.",
+    dependencies=[Depends(get_current_user)],
+)
+def toggle_brand_visibility(
+    brand_id: int,
+    db: Session = Depends(get_db),
+) -> schemas.BrandResponse:
+    brand = repository.toggle_brand_visibility(db, brand_id)
+    if not brand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found or has been deleted",
+        )
+    state = "visible" if brand.isActive else "hidden"
+    logger.info("Brand %s toggled → %s", brand_id, state)
+    return _brand_to_response(brand)
+
+
+# ─────────────────────────────────────────────
+# IMAGE — upload / delete
 # ─────────────────────────────────────────────
 
 @router.put(
     "/{brand_id}/image",
-    summary="Upload / replace the banner image for a brand (admin only)",
+    summary="Upload / replace the image for a brand (admin only)",
     dependencies=[Depends(get_current_user)],
 )
 def upload_brand_image(
@@ -221,18 +229,13 @@ def upload_brand_image(
     file:     UploadFile = File(...),
     db:       Session    = Depends(get_db),
 ):
-    """
-    Accepts a multipart file upload and stores it as the brand's brandImage.
-    Returns { success, brandId, imageUrl } — mirrors /api/Category/{id}/image.
-    """
     brand = repository.get_brand_by_id(db, brand_id)
-    if not brand:
+    if not brand or brand.deletedInd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
     old_url = brand.brandImage or ""
     new_url = upload_image(file, container_key="brands", folder=f"brand_{brand_id}")
 
-    # Resolve relative /uploads/ paths to absolute URL for local dev
     if new_url and new_url.startswith("/uploads/"):
         new_url = str(request.base_url).rstrip("/") + new_url
 
@@ -240,7 +243,6 @@ def upload_brand_image(
     brand.modifiedDate = datetime.now(timezone.utc)
     db.commit()
 
-    # Delete old blob after successful commit so we never lose the image on error
     if old_url and old_url != new_url:
         delete_image(old_url)
 
@@ -250,19 +252,15 @@ def upload_brand_image(
 
 @router.delete(
     "/{brand_id}/image",
-    summary="Remove the banner image for a brand (admin only)",
+    summary="Remove the image for a brand (admin only)",
     dependencies=[Depends(get_current_user)],
 )
 def delete_brand_image(
     brand_id: int,
     db:       Session = Depends(get_db),
 ):
-    """
-    Clears brandImage and deletes the blob from storage.
-    Returns { success, brandId }.
-    """
     brand = repository.get_brand_by_id(db, brand_id)
-    if not brand:
+    if not brand or brand.deletedInd:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
     old_url = brand.brandImage or ""
@@ -278,13 +276,13 @@ def delete_brand_image(
 
 
 # ─────────────────────────────────────────────
-# DELETE brand
+# SOFT-DELETE brand
 # ─────────────────────────────────────────────
 
 @router.delete(
     "/{brand_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a brand",
+    summary="Soft-delete a brand. Products keep their brandId FK but brand becomes invisible.",
     dependencies=[Depends(get_current_user)],
 )
 def delete_brand(
@@ -295,13 +293,9 @@ def delete_brand(
     if not existing:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
-    old_logo  = existing.brandLogo
-    old_image = existing.brandImage
-
     if not repository.delete_brand(db, brand_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
 
-    if old_logo:
-        delete_image(old_logo)
-    if old_image:
-        delete_image(old_image)
+    # NOTE: We intentionally do NOT delete the brand image on soft-delete
+    # so it can be restored later. Image is only purged on hard-delete (future).
+    logger.info("Brand %s soft-deleted", brand_id)

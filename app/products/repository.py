@@ -6,29 +6,48 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 
 from .models import Products
 
+
 def _to_response(db: Session, product: Products) -> dict:
-    """Attach brandName from public.Brand join and categoryName + isActive from Category."""
-    brand_name = None
+    """Attach brandName + brand visibility flags, and categoryName from joins."""
+    brand_name       = None
+    brand_is_active  = None
+    brand_deleted    = None
+
     if product.brandId:
         row = db.execute(
-            text('SELECT "brandName" FROM mdm."Brand" WHERE "brandId" = :id LIMIT 1'),
-            {"id": product.brandId}
+            text(
+                'SELECT "brandName", "isActive", "deletedInd" '
+                'FROM mdm."Brand" WHERE "brandId" = :id LIMIT 1'
+            ),
+            {"id": product.brandId},
         ).fetchone()
         if row:
-            brand_name = row[0]
+            brand_name      = row[0]
+            brand_is_active = bool(row[1]) if row[1] is not None else True
+            brand_deleted   = bool(row[2]) if row[2] is not None else False
 
-    # Resolve category name and active status (child category takes priority for name)
-    category_name = None
-    category_is_active = None
+    # Resolve category name, active status, and deleted status.
+    # NOTE: Do NOT filter by DeletedInd here — we need to detect deleted
+    # categories so the admin UI can show "Inactive – Category deleted".
+    category_name       = None
+    category_is_active  = None
+    category_deleted    = None
     cat_id = product.childCategoryId or product.categoryId
     if cat_id:
         row = db.execute(
-            text('SELECT "Name", "IsActive" FROM twam."Category" WHERE "CategoryId" = :id AND "DeletedInd" = false LIMIT 1'),
-            {"id": cat_id}
+            text(
+                'SELECT "Name", "IsActive", "DeletedInd" FROM twam."Category" '
+                'WHERE "CategoryId" = :id LIMIT 1'
+            ),
+            {"id": cat_id},
         ).fetchone()
         if row:
-            category_name = row[0]
-            category_is_active = bool(row[1])
+            category_name      = row[0]
+            category_is_active = bool(row[1]) if row[1] is not None else True
+            category_deleted   = bool(row[2]) if row[2] is not None else False
+            # A deleted category always counts as inactive for product status
+            if category_deleted:
+                category_is_active = False
 
     return {
         "productId":        product.productId,
@@ -37,10 +56,14 @@ def _to_response(db: Session, product: Products) -> dict:
         "description":      product.description,
         "categoryId":       product.categoryId,
         "childCategoryId":  product.childCategoryId,
-        "categoryName":     category_name,
-        "categoryIsActive": category_is_active,
+        "categoryName":        category_name,
+        "categoryIsActive":    category_is_active,
+        "categoryDeletedInd":  category_deleted,
         "brandId":          product.brandId,
         "brandName":        brand_name,
+        # These two fields let the admin UI show warning badges
+        "brandIsActive":    brand_is_active,
+        "brandDeletedInd":  brand_deleted,
         "personalId":       product.personalId,
         "userProfileId":    product.userProfileId,
         "tag":              product.tag,
@@ -52,6 +75,28 @@ def _to_response(db: Session, product: Products) -> dict:
     }
 
 
+def _active_brand_ids(db: Session) -> list[int]:
+    """Return brandIds that are active AND not deleted — used for public filtering."""
+    rows = db.execute(
+        text(
+            'SELECT "brandId" FROM mdm."Brand" '
+            'WHERE "deletedInd" = false AND "isActive" = true'
+        )
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _active_category_ids(db: Session) -> list[int]:
+    """Return categoryIds that are active AND not deleted — used for public filtering."""
+    rows = db.execute(
+        text(
+            'SELECT "CategoryId" FROM twam."Category" '
+            'WHERE "DeletedInd" = false AND "IsActive" = true'
+        )
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def get_all_products(
     db: Session,
     filters: Optional[List[dict]] = None,
@@ -59,11 +104,40 @@ def get_all_products(
     order_property: Optional[str] = None,
     page_index: Optional[int] = None,
     page_size: Optional[int] = None,
+    public_only: bool = True,   # False = admin view (shows all products regardless of brand/category status)
 ) -> dict:
     query = db.query(Products).filter(Products.deletedInd == False)
 
-    query = apply_filters(query, Products, filters)
+    # ── Visibility gates (public storefront only) ──────────────────────────────
+    # Hide products whose brand OR category has been deactivated / deleted.
+    # Null brand / null category are always shown (no gate to block them).
+    if public_only:
+        from sqlalchemy import or_
 
+        # Brand gate: exclude products whose brand is hidden or deleted
+        active_brand_ids = _active_brand_ids(db)
+        query = query.filter(
+            or_(
+                Products.brandId == None,                    # no brand → always show
+                Products.brandId.in_(active_brand_ids),      # brand is active & not deleted
+            )
+        )
+
+        # Category gate: exclude products whose category is inactive or deleted
+        active_cat_ids = _active_category_ids(db)
+        query = query.filter(
+            or_(
+                Products.childCategoryId == None,            # prefer child category …
+                Products.childCategoryId.in_(active_cat_ids),
+            )
+        ).filter(
+            or_(
+                Products.categoryId == None,
+                Products.categoryId.in_(active_cat_ids),     # … fallback to parent category
+            )
+        )
+
+    query = apply_filters(query, Products, filters)
     query = apply_ordering(query, Products, order_property, order_ascending)
 
     total = query.count()
@@ -82,7 +156,7 @@ def get_all_products(
 def get_product_by_id(db: Session, product_id: int) -> Optional[dict]:
     product = db.query(Products).filter(
         Products.productId == product_id,
-        Products.deletedInd == False
+        Products.deletedInd == False,
     ).first()
     if not product:
         return None
@@ -109,7 +183,6 @@ def create_product(db: Session, data) -> int:
     db.commit()
     db.refresh(product)
 
-    # Call audit function (PostgreSQL equivalent of EXEC twam.AutoCreateProductAudit)
     try:
         db.execute(
             text("SELECT twam.\"AutoCreateProductAudit\"(:ref_id, :profile)"),
@@ -117,7 +190,7 @@ def create_product(db: Session, data) -> int:
         )
         db.commit()
     except Exception:
-        pass  # Audit is non-critical
+        pass
 
     return product.productId
 
@@ -125,7 +198,7 @@ def create_product(db: Session, data) -> int:
 def update_product(db: Session, product_id: int, data) -> Optional[int]:
     product = db.query(Products).filter(
         Products.productId == product_id,
-        Products.deletedInd == False
+        Products.deletedInd == False,
     ).first()
     if not product:
         return None
@@ -155,7 +228,7 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
 def delete_product(db: Session, product_id: int) -> bool:
     product = db.query(Products).filter(
         Products.productId == product_id,
-        Products.deletedInd == False
+        Products.deletedInd == False,
     ).first()
     if not product:
         return False
@@ -164,7 +237,6 @@ def delete_product(db: Session, product_id: int) -> bool:
     product.modifiedDate = datetime.now(timezone.utc)
     db.commit()
 
-    # Cascade soft-delete variants, variant details, images
     try:
         db.execute(text(
             'UPDATE twam."ProductVariants" SET "DeletedInd" = true WHERE "ProductId" = :pid'
@@ -183,11 +255,6 @@ def delete_product(db: Session, product_id: int) -> bool:
 
 
 def check_product_validations(db: Session, product_id: int, state: Optional[str] = None) -> bool:
-    """
-    Mirrors GetProductValidationsListQueryHandler:
-    - If state == 'Returned For Correction': check if any VariantDetail has ProcessedQuantity > 0
-    - Otherwise: check if product has at least 1 variant AND 1 variant detail
-    """
     if state == "Returned For Correction":
         count = db.execute(
             text("""
@@ -196,16 +263,16 @@ def check_product_validations(db: Session, product_id: int, state: Optional[str]
                   AND "ProductId" = :pid
                   AND "ProcessedQuantity" > 0
             """),
-            {"pid": product_id}
+            {"pid": product_id},
         ).scalar()
         return (count or 0) > 0
 
     variant_count = db.execute(
         text('SELECT COUNT(*) FROM twam."ProductVariants" WHERE "DeletedInd" = false AND "ProductId" = :pid'),
-        {"pid": product_id}
+        {"pid": product_id},
     ).scalar()
     detail_count = db.execute(
         text('SELECT COUNT(*) FROM twam."ProductVariantDetail" WHERE "DeletedInd" = false AND "ProductId" = :pid'),
-        {"pid": product_id}
+        {"pid": product_id},
     ).scalar()
     return (variant_count or 0) > 0 and (detail_count or 0) > 0
