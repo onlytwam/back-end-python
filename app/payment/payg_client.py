@@ -101,17 +101,25 @@ def _sanitize_phone(phone) -> str:
     return "7036534449"   # absolute last resort — the merchant support number
 
 
+def _strip_0x(value: str) -> str:
+    """
+    PayG portal displays hex keys with a '0x' prefix (e.g. '0xcf7407...').
+    The actual key value is the raw hex WITHOUT the prefix.
+    Strip it defensively so pasting directly from the portal never breaks auth.
+    """
+    return value[2:] if value.startswith("0x") or value.startswith("0X") else value
+
+
 def _build_auth_header() -> str:
     """
     PayG requires:  Authorization: Basic base64(MerchantKeyId:AuthKey:AuthToken)
 
-    Error 0004 'Authorization Parameter Length' is returned when MerchantKeyId
-    is missing from the header — PayG decodes the base64, splits on ':', and
-    validates each segment's length independently.
+    Keys are stored with or without 0x prefix depending on how they were entered.
+    Always strip 0x before encoding — PayG validates the raw hex values.
     """
     merchant_key_id = _cfg("payg_merchant_key_id")
-    auth_key        = _cfg("payg_auth_key")
-    auth_token      = _cfg("payg_auth_token")
+    auth_key        = _strip_0x(_cfg("payg_auth_key"))
+    auth_token      = _strip_0x(_cfg("payg_auth_token"))
     raw             = f"{merchant_key_id}:{auth_key}:{auth_token}"
     encoded         = base64.b64encode(raw.encode()).decode()
     return f"Basic {encoded}"
@@ -126,8 +134,11 @@ def compute_hash(mid: str, unique_request_id: str, order_amount: str) -> str:
 
     BUG FIX: order_amount must always have exactly 2 decimal places ("100.50"
     not "100.5"). Use f"{float(amount):.2f}" when calling this function.
+
+    BUG FIX: Strip 0x portal-display prefix from SecureHashKey before use.
+    PayG computes the HMAC with the raw hex key — including 0x causes mismatch.
     """
-    secret  = _cfg("payg_secure_hash", "")
+    secret  = _strip_0x(_cfg("payg_secure_hash", ""))
     message = f"{mid}|{unique_request_id}|{order_amount}"
     sig = hmac.new(
         secret.encode("utf-8"),
