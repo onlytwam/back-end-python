@@ -32,6 +32,8 @@ def get_products(
     Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
     Page_Index:      Optional[int]  = Query(None, alias="Page.Index", ge=1),
     Page_Size:       Optional[int]  = Query(None, alias="Page.Size",  ge=1),
+    # Admin product manager passes adminView=true to see products of hidden/deleted brands
+    adminView:       bool           = Query(False, alias="adminView"),
     db: Session = Depends(get_db),
 ):
     return repository.get_all_products(
@@ -41,6 +43,7 @@ def get_products(
         order_property=Order_Property,
         page_index=Page_Index,
         page_size=Page_Size,
+        public_only=not adminView,   # public_only=True hides products of hidden/deleted brands
     )
 
 

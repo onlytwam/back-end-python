@@ -225,6 +225,48 @@ def upload_category_image(
     return {"success": True, "categoryId": category_id, "imageUrl": new_url}
 
 
+
+
+@router.patch(
+    "/reorder",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def reorder_categories(
+    body: List[Dict],
+    db: Session = Depends(get_db),
+):
+    """Bulk-update displayOrder for a list of categories.
+
+    Expects a JSON array of objects with 'categoryId' and 'displayOrder':
+        [{"categoryId": 1, "displayOrder": 1}, {"categoryId": 2, "displayOrder": 2}, ...]
+    """
+    if not body:
+        raise HTTPException(400, "No items provided.")
+
+    ids = [item.get("categoryId") for item in body if item.get("categoryId")]
+    cats = db.query(repository.Category).filter(
+        repository.Category.categoryId.in_(ids),
+        repository.Category.deletedInd == False,
+    ).all()
+
+    cat_map = {c.categoryId: c for c in cats}
+    now = datetime.now(timezone.utc)
+    updated = 0
+    for item in body:
+        cid   = item.get("categoryId")
+        order = item.get("displayOrder")
+        if cid is None or order is None:
+            continue
+        cat = cat_map.get(cid)
+        if cat:
+            cat.displayOrder = int(order)
+            cat.modifiedDate = now
+            updated += 1
+
+    db.commit()
+    return {"updated": updated}
+
+
 @router.patch(
     "/{category_id}/visibility",
     dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],

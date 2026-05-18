@@ -18,8 +18,12 @@ def get_all_categories(
     page_size: Optional[int] = None,
     only_child: bool = False,
     with_products_only: bool = False,
+    include_deleted: bool = False,
 ) -> dict:
-    query = db.query(Category).filter(Category.deletedInd == False)
+    if include_deleted:
+        query = db.query(Category)
+    else:
+        query = db.query(Category).filter(Category.deletedInd == False)
     if with_products_only:
         query = query.filter(Category.isActive == True)
 
@@ -80,6 +84,7 @@ def get_all_categories(
             "categoryImage":      r.categoryImage,
             "createdDate":        r.createdDate,
             "modifiedDate":       r.modifiedDate,
+            "deletedInd":         bool(r.deletedInd) if r.deletedInd is not None else False,
         })
     return build_paged_response(total, result)
 
@@ -308,22 +313,24 @@ def get_category_menu(db: Session) -> dict:
 # ── Category product counts ───────────────────────────────────────────────────
 
 def get_category_product_counts(db: Session) -> List[dict]:
-    # ── FIX: Count products using Products.state, not ProductVariantDetail.state ──
+    # ── Count only products that are truly visible to storefront users ────────
     #
-    # ROOT CAUSE of empty navbar:
-    # ProductVariantDetail rows are always inserted with State = 'Created' by the
-    # bulk-upload pipeline and are NEVER updated. Only the Products table gets its
-    # state promoted to 'Approved' by the admin workflow. Filtering on
-    # pvd."State" = 'approved' therefore always returns 0 rows, the expanded set
-    # stays empty, _build(None) returns [], and the navbar shows no categories.
+    # A product is invisible when ANY of these hold:
+    #   • its brand  is hidden  (mdm.Brand.isActive  = false OR deletedInd = true)
+    #   • its category is hidden (twam.Category.IsActive = false OR DeletedInd = true)
+    #   • the product itself is deleted / not approved
     #
-    # FIX: Move the visibility filter to Products.state (which IS updated) and drop
-    # the pvd.State predicate entirely. We still join PVD to exclude products that
-    # have no stock rows at all (DeletedInd guard), but we no longer filter on its
-    # State column.
+    # Brand gate (added here):
+    #   LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
+    #   AND (p."BrandId" IS NULL OR (b."isActive" = true AND b."deletedInd" = false))
     #
-    # We also retain the UNION ALL + SUM pattern to correctly count products that
-    # appear in both ChildCategoryId and CategoryId result sets.
+    # Products with no brand (BrandId IS NULL) are always counted — the gate
+    # only blocks products whose brand record exists but is inactive/deleted.
+    #
+    # This ensures that hiding a brand causes its products to be excluded from
+    # the category counts, which in turn causes the now-empty categories to
+    # disappear from the navbar and "Shop by Category" page — matching the
+    # same visibility logic applied in products/repository.py get_all_products().
     sql = text("""
         SELECT category_id, SUM(cnt) AS total
         FROM (
@@ -331,11 +338,18 @@ def get_category_product_counts(db: Session) -> List[dict]:
             SELECT p."ChildCategoryId" AS category_id, COUNT(DISTINCT p."ProductId") AS cnt
             FROM twam."Products"  p
             JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
+            LEFT JOIN mdm."Brand" b  ON b."brandId"     = p."BrandId"
             WHERE p."DeletedInd"          = false
               AND LOWER(p."State")        = 'approved'
               AND p."ChildCategoryId"     IS NOT NULL
               AND cc."DeletedInd"         = false
               AND cc."IsActive"           = true
+              -- Brand gate: products with no brand are always visible;
+              -- products whose brand is hidden/deleted are excluded.
+              AND (
+                    p."BrandId" IS NULL
+                    OR (b."isActive" = true AND b."deletedInd" = false)
+              )
             GROUP BY p."ChildCategoryId"
 
             UNION ALL
@@ -344,11 +358,17 @@ def get_category_product_counts(db: Session) -> List[dict]:
             SELECT p."CategoryId" AS category_id, COUNT(DISTINCT p."ProductId") AS cnt
             FROM twam."Products"  p
             JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
+            LEFT JOIN mdm."Brand" b  ON b."brandId"     = p."BrandId"
             WHERE p."DeletedInd"      = false
               AND LOWER(p."State")    = 'approved'
               AND p."CategoryId"      IS NOT NULL
               AND pc."DeletedInd"     = false
               AND pc."IsActive"       = true
+              -- Brand gate: same as above
+              AND (
+                    p."BrandId" IS NULL
+                    OR (b."isActive" = true AND b."deletedInd" = false)
+              )
             GROUP BY p."CategoryId"
         ) combined
         GROUP BY category_id

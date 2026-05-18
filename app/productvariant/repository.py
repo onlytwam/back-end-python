@@ -551,6 +551,9 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         # Hide products whose child category has been deleted or made inactive.
         # cc is LEFT JOINed so if ChildCategoryId is NULL we allow it through.
         "(p.\"ChildCategoryId\" IS NULL OR (cc.\"DeletedInd\" = false AND cc.\"IsActive\" = true))",
+        # Hide products whose brand has been deactivated (hidden) or soft-deleted.
+        # b is LEFT JOINed so products with no brand (BrandId IS NULL) are always shown.
+        "(p.\"BrandId\" IS NULL OR (b.\"isActive\" = true AND b.\"deletedInd\" = false))",
     ]
     params: dict = {"base": BASE}
 
@@ -945,6 +948,7 @@ def get_new_arrivals(
         AND pv."CreatedDate" >= NOW() - INTERVAL '6 months'
         AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true))
         AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true))
+        AND (p."BrandId" IS NULL OR (b."isActive" = true AND b."deletedInd" = false))
     """
 
     count_sql = f"""

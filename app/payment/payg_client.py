@@ -103,17 +103,17 @@ def _sanitize_phone(phone) -> str:
 
 def _build_auth_header() -> str:
     """
-    PayG requires:  Authorization: Basic base64(AuthKey:AuthToken)
+    PayG requires:  Authorization: Basic base64(MerchantKeyId:AuthKey:AuthToken)
 
-    NOTE: The ':M:MerchantKeyId' suffix is only required for certain PayG
-    enterprise accounts. For standard UAT accounts the correct format is
-    simply AuthKey:AuthToken. Using the longer format causes PayG to return
-    error 0049 ('merchant not authorized') on standard accounts.
+    Error 0004 'Authorization Parameter Length' is returned when MerchantKeyId
+    is missing from the header — PayG decodes the base64, splits on ':', and
+    validates each segment's length independently.
     """
-    auth_key   = _cfg("payg_auth_key")
-    auth_token = _cfg("payg_auth_token")
-    raw        = f"{auth_key}:{auth_token}"
-    encoded    = base64.b64encode(raw.encode()).decode()
+    merchant_key_id = _cfg("payg_merchant_key_id")
+    auth_key        = _cfg("payg_auth_key")
+    auth_token      = _cfg("payg_auth_token")
+    raw             = f"{merchant_key_id}:{auth_key}:{auth_token}"
+    encoded         = base64.b64encode(raw.encode()).decode()
     return f"Basic {encoded}"
 
 
