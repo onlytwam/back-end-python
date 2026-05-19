@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import exists
 
 from app.shared.filters import apply_filters, apply_ordering
 from .models import Brand
+from app.products.models import Products
 
 
 # ─────────────────────────────────────────────
@@ -13,19 +15,30 @@ from .models import Brand
 # ─────────────────────────────────────────────
 
 def get_all_brands(
-    db:              Session,
-    filters:         Optional[list[dict]] = None,
-    order_property:  Optional[str]        = None,
-    order_ascending: Optional[bool]       = None,
-    page_index:      Optional[int]        = None,
-    page_size:       Optional[int]        = None,
-    active_only:     bool                 = False,   # True → public (hide inactive/deleted)
+    db:                Session,
+    filters:           Optional[list[dict]] = None,
+    order_property:    Optional[str]        = None,
+    order_ascending:   Optional[bool]       = None,
+    page_index:        Optional[int]        = None,
+    page_size:         Optional[int]        = None,
+    active_only:       bool                 = False,   # True → public (hide inactive/deleted)
+    with_products_only: bool                = False,   # True → exclude brands with 0 live products
 ) -> dict[str, Any]:
     query = db.query(Brand).filter(Brand.deletedInd == False)
 
     # Public view: only active brands
     if active_only:
         query = query.filter(Brand.isActive == True)
+
+    # Exclude brands that have no active + approved + non-deleted products
+    if with_products_only:
+        has_live_product = exists().where(
+            Products.brandId   == Brand.brandId,
+            Products.deletedInd == False,
+            Products.isActive   == True,
+            Products.state.ilike("approved"),
+        )
+        query = query.filter(has_live_product)
 
     query = apply_filters(query, Brand, filters)
     query = apply_ordering(query, Brand, order_property, order_ascending)

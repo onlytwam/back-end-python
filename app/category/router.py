@@ -274,15 +274,27 @@ def reorder_categories(
 def toggle_category_visibility(
     category_id: int,
     unhide_children: bool = Query(False, alias="unhideChildren"),
+    cascade_products: bool = Query(False, alias="cascadeProducts"),
     db: Session = Depends(get_db),
 ):
     """Toggle isActive (hide / unhide) for a category.
     Hiding a parent cascades to all its child categories.
     When un-hiding, pass ?unhideChildren=true to also restore child categories.
+    Pass ?cascadeProducts=true to also hide/show all products in this category.
     """
     result = repository.toggle_category_visibility(db, category_id, unhide_children)
     if not result:
         raise HTTPException(404, "Category not found.")
+    if cascade_products:
+        try:
+            if result.get("isActive") is False:
+                from app.products.repository import deactivate_products_by_category
+                deactivate_products_by_category(db, category_id)
+            else:
+                from app.products.repository import reactivate_products_by_category
+                reactivate_products_by_category(db, category_id)
+        except Exception:
+            pass
     return result
 
 
@@ -308,6 +320,12 @@ def delete_category(category_id: int, db: Session = Depends(get_db)):
     result = repository.delete_category(db, category_id)
     if not result:
         raise HTTPException(404, "Category not found.")
+    # Cascade: set all products of this category to isActive=False
+    try:
+        from app.products.repository import deactivate_products_by_category
+        deactivate_products_by_category(db, category_id)
+    except Exception:
+        pass
     return result
 
 

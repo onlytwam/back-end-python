@@ -54,6 +54,9 @@ class ProductResponse(BaseModel):
     modifiedBy:       Optional[str]  = None
     createdDate:      Optional[datetime] = None
     modifiedDate:     Optional[datetime] = None
+    # Own active/deleted status
+    isActive:         Optional[bool] = True
+    deletedInd:       Optional[bool] = False
     # Joined fields from Brand — required by admin UI to show Active/Inactive status
     brandName:        Optional[str]  = None
     brandIsActive:    Optional[bool] = None   # False = brand is hidden from public

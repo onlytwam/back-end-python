@@ -340,6 +340,7 @@ def get_category_product_counts(db: Session) -> List[dict]:
             JOIN twam."Category"  cc ON cc."CategoryId" = p."ChildCategoryId"
             LEFT JOIN mdm."Brand" b  ON b."brandId"     = p."BrandId"
             WHERE p."DeletedInd"          = false
+              AND p."IsActive"            = true
               AND LOWER(p."State")        = 'approved'
               AND p."ChildCategoryId"     IS NOT NULL
               AND cc."DeletedInd"         = false
@@ -354,16 +355,21 @@ def get_category_product_counts(db: Session) -> List[dict]:
 
             UNION ALL
 
-            -- Products filed directly under a parent category (CategoryId, no child)
+            -- Products filed directly under a parent category only (no child category assigned).
+            -- The ChildCategoryId IS NULL guard is critical: without it, products that have
+            -- both a CategoryId AND a ChildCategoryId would be counted here AND in the
+            -- ChildCategoryId branch above, causing double-counting on the parent.
             SELECT p."CategoryId" AS category_id, COUNT(DISTINCT p."ProductId") AS cnt
             FROM twam."Products"  p
             JOIN twam."Category"  pc ON pc."CategoryId" = p."CategoryId"
             LEFT JOIN mdm."Brand" b  ON b."brandId"     = p."BrandId"
-            WHERE p."DeletedInd"      = false
-              AND LOWER(p."State")    = 'approved'
-              AND p."CategoryId"      IS NOT NULL
-              AND pc."DeletedInd"     = false
-              AND pc."IsActive"       = true
+            WHERE p."DeletedInd"          = false
+              AND p."IsActive"            = true
+              AND LOWER(p."State")        = 'approved'
+              AND p."CategoryId"          IS NOT NULL
+              AND p."ChildCategoryId"     IS NULL
+              AND pc."DeletedInd"         = false
+              AND pc."IsActive"           = true
               -- Brand gate: same as above
               AND (
                     p."BrandId" IS NULL

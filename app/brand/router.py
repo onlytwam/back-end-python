@@ -87,6 +87,9 @@ def list_brands(
     # Admin callers pass showAll=true to also see hidden (isActive=false) brands.
     # Deleted brands (deletedInd=true) are NEVER returned to anyone via this endpoint.
     showAll:           bool           = Query(False, alias="showAll"),
+    # Public callers pass withProducts=true to exclude brands that have zero
+    # active+approved products (e.g. TwamBrands page).
+    withProducts:      bool           = Query(False, alias="withProducts"),
     db: Session = Depends(get_db),
 ) -> schemas.BrandListResponse:
 
@@ -94,13 +97,14 @@ def list_brands(
     active_only = not showAll
 
     result = repository.get_all_brands(
-        db              = db,
-        filters         = _parse_filters(Filters),
-        order_property  = Order_Property,
-        order_ascending = Order_Ascending,
-        page_index      = Page_Index,
-        page_size       = Page_Size,
-        active_only     = active_only,
+        db                 = db,
+        filters            = _parse_filters(Filters),
+        order_property     = Order_Property,
+        order_ascending    = Order_Ascending,
+        page_index         = Page_Index,
+        page_size          = Page_Size,
+        active_only        = active_only,
+        with_products_only = withProducts,
     )
 
     return schemas.BrandListResponse(
@@ -196,11 +200,12 @@ def update_brand(
 @router.patch(
     "/{brand_id}/toggle-visibility",
     response_model=schemas.BrandResponse,
-    summary="Toggle brand visibility (hide / show). Hides all associated products from public.",
+    summary="Toggle brand visibility (hide / show). Pass ?cascadeProducts=true to also hide/show all brand products.",
     dependencies=[Depends(get_current_user)],
 )
 def toggle_brand_visibility(
     brand_id: int,
+    cascade_products: bool = Query(False, alias="cascadeProducts"),
     db: Session = Depends(get_db),
 ) -> schemas.BrandResponse:
     brand = repository.toggle_brand_visibility(db, brand_id)
@@ -210,7 +215,17 @@ def toggle_brand_visibility(
             detail="Brand not found or has been deleted",
         )
     state = "visible" if brand.isActive else "hidden"
-    logger.info("Brand %s toggled → %s", brand_id, state)
+    logger.info("Brand %s toggled → %s (cascadeProducts=%s)", brand_id, state, cascade_products)
+    if cascade_products:
+        try:
+            if not brand.isActive:
+                from app.products.repository import deactivate_products_by_brand
+                deactivate_products_by_brand(db, brand_id)
+            else:
+                from app.products.repository import reactivate_products_by_brand
+                reactivate_products_by_brand(db, brand_id)
+        except Exception:
+            pass
     return _brand_to_response(brand)
 
 
@@ -299,3 +314,9 @@ def delete_brand(
     # NOTE: We intentionally do NOT delete the brand image on soft-delete
     # so it can be restored later. Image is only purged on hard-delete (future).
     logger.info("Brand %s soft-deleted", brand_id)
+    # Cascade: set all products of this brand to isActive=False
+    try:
+        from app.products.repository import deactivate_products_by_brand
+        deactivate_products_by_brand(db, brand_id)
+    except Exception:
+        pass

@@ -100,6 +100,8 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
         "images":             _get_images(db, variant.productVariantId, variant.productId),
+        "deletedInd":         variant.deletedInd,
+        "isActive":           variant.isActive if variant.isActive is not None else True,
     }
 
 

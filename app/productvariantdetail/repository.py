@@ -55,6 +55,8 @@ def _enrich(db: Session, pvd: ProductVariantDetail) -> dict:
         "isAlphabetSize":         pvd.isAlphabetSize,
         "createdDate":            pvd.createdDate,
         "modifiedDate":           pvd.modifiedDate,
+        "deletedInd":             pvd.deletedInd,
+        "isActive":               pvd.isActive if pvd.isActive is not None else True,
     }
 
 

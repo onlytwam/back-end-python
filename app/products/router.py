@@ -43,7 +43,7 @@ def get_products(
         order_property=Order_Property,
         page_index=Page_Index,
         page_size=Page_Size,
-        public_only=not adminView,   # public_only=True hides products of hidden/deleted brands
+        public_only=not adminView,   # public_only=True hides inactive/hidden-brand/deleted-brand products
     )
 
 
@@ -75,7 +75,17 @@ def update_product(product_id: int, command: schemas.ProductUpdate, db: Session 
     return {"productId": result}
 
 
-# ── PROTECTED: delete product ─────────────────────────────────────────────────
+# ── PROTECTED: toggle product active/inactive (isActive only — NOT deletedInd) ──
+@router.patch("/{product_id}/toggle-active",
+              dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
+def toggle_product_active(product_id: int, db: Session = Depends(get_db)):
+    result = repository.toggle_product_active(db, product_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Product not found.")
+    return result
+
+
+# ── PROTECTED: delete product (hard soft-delete — separate from isActive) ─────
 @router.delete("/{product_id}", status_code=204,
                dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def delete_product(product_id: int, db: Session = Depends(get_db)):
