@@ -16,7 +16,6 @@ def get_brand_product_count(db: Session, filters, order_ascending, order_propert
                 Brand.brandId.label("brandId"),
                 Brand.brandName.label("brandName"),
                 Brand.brandImage.label("brandImage"),
-                Brand.brandLogo.label("brandLogo"),
                 func.count(Products.productId).label("productCount"),
             )
             .outerjoin(
@@ -24,7 +23,7 @@ def get_brand_product_count(db: Session, filters, order_ascending, order_propert
                 (Products.brandId == Brand.brandId) & (Products.deletedInd == False),
             )
             .filter(Brand.deletedInd == False)
-            .group_by(Brand.brandId, Brand.brandName, Brand.brandImage, Brand.brandLogo)
+            .group_by(Brand.brandId, Brand.brandName, Brand.brandImage)
             .order_by(func.count(Products.productId).desc())
         )
 
@@ -38,7 +37,6 @@ def get_brand_product_count(db: Session, filters, order_ascending, order_propert
                 "brandId": row.brandId,
                 "brandName": row.brandName,
                 "brandImage": row.brandImage,
-                "brandLogo": row.brandLogo,
                 "productCount": row.productCount,
             }
             for row in rows

@@ -68,6 +68,8 @@ def _to_response(db: Session, product: Products) -> dict:
         "userProfileId":    product.userProfileId,
         "tag":              product.tag,
         "state":            product.state,
+        "isActive":         product.isActive if product.isActive is not None else True,
+        "deletedInd":       product.deletedInd if product.deletedInd is not None else False,
         "createdBy":        product.createdBy,
         "modifiedBy":       product.modifiedBy,
         "createdDate":      product.createdDate,
@@ -109,10 +111,14 @@ def get_all_products(
     query = db.query(Products).filter(Products.deletedInd == False)
 
     # ── Visibility gates (public storefront only) ──────────────────────────────
-    # Hide products whose brand OR category has been deactivated / deleted.
+    # Hide products that are inactive (isActive=False) or whose brand/category
+    # has been deactivated / deleted.
     # Null brand / null category are always shown (no gate to block them).
     if public_only:
         from sqlalchemy import or_
+
+        # Own product visibility gate
+        query = query.filter(Products.isActive == True)
 
         # Brand gate: exclude products whose brand is hidden or deleted
         active_brand_ids = _active_brand_ids(db)
@@ -177,6 +183,7 @@ def create_product(db: Session, data) -> int:
         tag             = data.tag,
         createdBy       = data.createdBy,
         createdDate     = datetime.now(timezone.utc),
+        isActive        = True,
         deletedInd      = False,
     )
     db.add(product)
@@ -225,6 +232,103 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
     return product_id
 
 
+def toggle_product_active(db: Session, product_id: int) -> Optional[dict]:
+    """Toggle isActive (hide/show) for a product. This is separate from delete."""
+    product = db.query(Products).filter(
+        Products.productId == product_id,
+        Products.deletedInd == False,
+    ).first()
+    if not product:
+        return None
+
+    new_state = not bool(product.isActive)
+    product.isActive     = new_state
+    product.modifiedDate = datetime.now(timezone.utc)
+    db.commit()
+
+    # Cascade to variants and variant details
+    try:
+        db.execute(
+            text('UPDATE twam."ProductVariants" SET "IsActive" = :active WHERE "ProductId" = :pid AND "DeletedInd" = false'),
+            {"active": new_state, "pid": product_id}
+        )
+        db.execute(
+            text('UPDATE twam."ProductVariantDetail" SET "IsActive" = :active WHERE "ProductId" = :pid AND "DeletedInd" = false'),
+            {"active": new_state, "pid": product_id}
+        )
+        db.commit()
+    except Exception:
+        pass
+
+    return {"productId": product_id, "isActive": new_state}
+
+
+def deactivate_products_by_brand(db: Session, brand_id: int) -> int:
+    """Set isActive=False on all non-deleted products of a brand (used when brand is hidden/deleted)."""
+    try:
+        result = db.execute(
+            text(
+                'UPDATE twam."Products" SET "IsActive" = false '
+                'WHERE "BrandId" = :bid AND "DeletedInd" = false AND "IsActive" = true'
+            ),
+            {"bid": brand_id},
+        )
+        db.commit()
+        return result.rowcount or 0
+    except Exception:
+        return 0
+
+
+def reactivate_products_by_brand(db: Session, brand_id: int) -> int:
+    """Set isActive=True on all non-deleted products of a brand (used when brand is re-shown)."""
+    try:
+        result = db.execute(
+            text(
+                'UPDATE twam."Products" SET "IsActive" = true '
+                'WHERE "BrandId" = :bid AND "DeletedInd" = false AND "IsActive" = false'
+            ),
+            {"bid": brand_id},
+        )
+        db.commit()
+        return result.rowcount or 0
+    except Exception:
+        return 0
+
+
+def deactivate_products_by_category(db: Session, category_id: int) -> int:
+    """Set isActive=False on all non-deleted products of a category (used when category is hidden/deleted)."""
+    try:
+        result = db.execute(
+            text(
+                'UPDATE twam."Products" SET "IsActive" = false '
+                'WHERE ("CategoryId" = :cid OR "ChildCategoryId" = :cid) '
+                'AND "DeletedInd" = false AND "IsActive" = true'
+            ),
+            {"cid": category_id},
+        )
+        db.commit()
+        return result.rowcount or 0
+    except Exception:
+        return 0
+
+
+def reactivate_products_by_category(db: Session, category_id: int) -> int:
+    """Set isActive=True on all non-deleted products of a category (used when category is re-shown)."""
+    try:
+        result = db.execute(
+            text(
+                'UPDATE twam."Products" SET "IsActive" = true '
+                'WHERE ("CategoryId" = :cid OR "ChildCategoryId" = :cid) '
+                'AND "DeletedInd" = false AND "IsActive" = false'
+            ),
+            {"cid": category_id},
+        )
+        db.commit()
+        return result.rowcount or 0
+    except Exception:
+        return 0
+
+
 def delete_product(db: Session, product_id: int) -> bool:
     product = db.query(Products).filter(
         Products.productId == product_id,
@@ -234,15 +338,16 @@ def delete_product(db: Session, product_id: int) -> bool:
         return False
 
     product.deletedInd   = True
+    product.isActive     = False
     product.modifiedDate = datetime.now(timezone.utc)
     db.commit()
 
     try:
         db.execute(text(
-            'UPDATE twam."ProductVariants" SET "DeletedInd" = true WHERE "ProductId" = :pid'
+            'UPDATE twam."ProductVariants" SET "DeletedInd" = true, "IsActive" = false WHERE "ProductId" = :pid'
         ), {"pid": product_id})
         db.execute(text(
-            'UPDATE twam."ProductVariantDetail" SET "DeletedInd" = true WHERE "ProductId" = :pid'
+            'UPDATE twam."ProductVariantDetail" SET "DeletedInd" = true, "IsActive" = false WHERE "ProductId" = :pid'
         ), {"pid": product_id})
         db.execute(text(
             'UPDATE twam."ProductImage" SET "DeletedInd" = true WHERE "ProductId" = :pid'

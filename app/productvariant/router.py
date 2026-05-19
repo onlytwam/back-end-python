@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
 from sqlalchemy.orm import Session
 
 from database import get_db
+from app.auth.dependencies import get_current_user, Roles
 from . import schemas, repository
 from .models import ProductImage, ProductVariant
 from app.products.models import Products
@@ -94,6 +95,23 @@ def delete_variant(variant_id: int, db: Session = Depends(get_db)):
 # ─────────────────────────────────────────────────────────────
 # GET IMAGES
 # ─────────────────────────────────────────────────────────────
+
+
+# ── toggle variant active/inactive (isActive only — NOT deletedInd) ──────────
+@router.patch("/{variant_id}/toggle-active", dependencies=[Depends(get_current_user)])
+def toggle_variant_active(variant_id: int, db: Session = Depends(get_db)):
+    from datetime import datetime, timezone
+    v = db.query(ProductVariant).filter(
+        ProductVariant.productVariantId == variant_id,
+        ProductVariant.deletedInd == False,
+    ).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Variant not found.")
+    new_state      = not bool(v.isActive)
+    v.isActive     = new_state
+    v.modifiedDate = datetime.now(timezone.utc)
+    db.commit()
+    return {"variantId": variant_id, "isActive": new_state}
 
 @router.get("/{variant_id}/images")
 def get_variant_images(variant_id: int, db: Session = Depends(get_db)):

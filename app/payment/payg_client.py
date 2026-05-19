@@ -42,8 +42,8 @@ except ImportError:
 
 _UAT_CREATE_URL  = "https://uatapiv2.payg.in/payment/api/order/create"
 _LIVE_CREATE_URL = "https://apiv2.payg.in/payment/api/order/create"
-_UAT_DETAIL_URL  = "https://uatapiv2.payg.in/payment/api/order/Detail"
-_LIVE_DETAIL_URL = "https://apiv2.payg.in/payment/api/order/Detail"
+_UAT_DETAIL_URL  = "https://uatapiv2.payg.in/payment/api/order/detail"
+_LIVE_DETAIL_URL = "https://apiv2.payg.in/payment/api/order/detail"
 
 
 # ── Credential helpers ─────────────────────────────────────────────────────
@@ -112,7 +112,12 @@ def _strip_0x(value: str) -> str:
 
 def _build_auth_header() -> str:
     """
-    PayG requires:  Authorization: Basic base64(MerchantKeyId:AuthKey:AuthToken)
+    PayG requires:
+      Authorization: Basic base64(AuthKey:AuthToken:MerchantKeyId:MID)
+
+    Format confirmed from PayG documentation (base64encode.org screenshot):
+      MerchantAuthenticationKey:MerchantAuthenticationToken:M:MID
+      i.e. AuthKey:AuthToken:MerchantKeyId:MID
 
     Keys are stored with or without 0x prefix depending on how they were entered.
     Always strip 0x before encoding — PayG validates the raw hex values.
@@ -120,7 +125,8 @@ def _build_auth_header() -> str:
     merchant_key_id = _cfg("payg_merchant_key_id")
     auth_key        = _strip_0x(_cfg("payg_auth_key"))
     auth_token      = _strip_0x(_cfg("payg_auth_token"))
-    raw             = f"{merchant_key_id}:{auth_key}:{auth_token}"
+    mid             = _cfg("payg_mid")
+    raw             = f"{auth_key}:{auth_token}:{merchant_key_id}:{mid}"
     encoded         = base64.b64encode(raw.encode()).decode()
     return f"Basic {encoded}"
 
@@ -259,7 +265,7 @@ def create_payg_order(
         },
         "IntegrationData": {
             "UserName": first,
-            "Source": "WebPortal",
+            "Source": "3213",
             "IntegrationType": "",
             "HashData": hash_data,
             "PlatformId": "1",
@@ -333,7 +339,7 @@ def get_payg_order_detail(
     mid: Optional[str] = None,
 ) -> dict:
     """
-    Fetch PayG /payment/api/order/Detail to get live payment status.
+    Fetch PayG /payment/api/order/detail to get live payment status.
     Pass either order_key_id OR unique_request_id.
 
     PaymentResponseCode meanings:
@@ -343,11 +349,9 @@ def get_payg_order_detail(
       4 – Pending
     """
     _mid = mid or _cfg("payg_mid")
-    merchant_key_id = _cfg("payg_merchant_key_id", "0")
 
     body: dict = {
         "MID": _mid,
-        "MerchantKeyId": int(merchant_key_id) if merchant_key_id.isdigit() else 0,
     }
     if order_key_id:
         body["OrderKeyId"] = order_key_id

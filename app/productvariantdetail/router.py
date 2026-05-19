@@ -155,6 +155,24 @@ def update_variant_detail(pvd_id: int, command: schemas.ProductVariantDetailUpda
     return {"productVariantDetailId": result}
 
 
+
+# ── toggle variant detail active/inactive (isActive only — NOT deletedInd) ───
+@router.patch("/{pvd_id}/toggle-active", dependencies=[Depends(get_current_user)])
+def toggle_variant_detail_active(pvd_id: int, db: Session = Depends(get_db)):
+    from app.productvariantdetail.models import ProductVariantDetail
+    from datetime import datetime, timezone
+    pvd = db.query(ProductVariantDetail).filter(
+        ProductVariantDetail.productVariantDetailId == pvd_id,
+        ProductVariantDetail.deletedInd == False,
+    ).first()
+    if not pvd:
+        raise HTTPException(status_code=404, detail="Variant detail not found.")
+    new_state        = not bool(pvd.isActive)
+    pvd.isActive     = new_state
+    pvd.modifiedDate = datetime.now(timezone.utc)
+    db.commit()
+    return {"pvdId": pvd_id, "isActive": new_state}
+
 @router.delete("/{pvd_id}", status_code=204, dependencies=[Depends(get_current_user)])
 def delete_variant_detail(pvd_id: int, db: Session = Depends(get_db)):
     if not repository.delete_variant_detail(db, pvd_id):
