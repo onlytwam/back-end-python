@@ -661,6 +661,28 @@ async def payment_callback(
         print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
 
     # ── STEP 7: On success — remove cart items + queue Ekart shipment ────────
+    #
+    # PayG PaymentResponseCode meanings:
+    #   1  → Approved (definitive success)
+    #   2  → Declined (definitive failure — bank rejected)
+    #   0  → Initiated / Pending (payment not settled yet — DO NOT destroy order)
+    #   4  → Payment Pending    (payment not settled yet — DO NOT destroy order)
+    #  -1  → Unknown (Detail API failed or timed out   — DO NOT destroy order)
+    #
+    # ── BUG FIX: Previously the `else` branch ran for ALL non-success codes
+    # (0, 4, -1, 2) and soft-deleted OrderItems.  This destroyed the order
+    # when PayG returned code=0/4 (payment still in-flight) or when the
+    # Detail API itself failed (code=-1, e.g. network timeout, wrong
+    # credentials).  The user then saw "Payment Not Completed / declined by
+    # the bank" even though their money had already left their account.
+    #
+    # The fix: only soft-delete OrderItems when response_code==2, which is
+    # the ONLY code that means the bank definitively rejected the transaction.
+    # For codes 0, 4 (pending) and -1 (unknown), leave the order and its
+    # items intact — the /Payment/Status poll or the Expire endpoint will
+    # clean up if the payment truly never settles.
+    DEFINITIVE_FAILURE = (response_code == 2)  # 2 = bank declined
+
     if success:
         print(
             f"[Payment:Callback] STEP 7 — Payment SUCCESS ✅ | "
@@ -670,10 +692,6 @@ async def payment_callback(
         print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
 
         # Remove all ordered cart items completely so the cart is clean for the user.
-        # FIX: The old SQL joined Cart to OrderItems on ProductVariantDetailId and
-        # deleted EVERY Cart row with a matching PVDID.  This was dangerous when
-        # duplicate Cart rows existed (due to the IsOrdered NULL bug in cart/repository.py)
-        # because it would also delete Cart rows the user had NOT yet ordered.
         # The corrected query uses a CTE to collect exactly the CartIds that
         # were ordered (by matching PVDID through OrderItems), then deletes only
         # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
@@ -712,14 +730,14 @@ async def payment_callback(
         except Exception as exc:
             db.rollback()
             print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
-    else:
+    elif DEFINITIVE_FAILURE:
+        # code=2: bank definitively declined — safe to clean up OrderItems
+        # so they never bleed into a future invoice.  Cart items are kept so
+        # the user can retry with the same products.
         print(
-            f"[Payment:Callback] STEP 7 — Payment NOT successful (code={response_code}) | "
-            f"Ekart task NOT queued | Cart preserved for retry"
+            f"[Payment:Callback] STEP 7 — Payment DECLINED by bank (code=2) | "
+            f"Soft-deleting OrderItems for order {order_id}..."
         )
-        # ── FIX: Soft-delete OrderItems from this failed order so ghost items
-        # never appear on a future invoice or bleed into the next order.
-        # Cart items are preserved so the user can retry from their cart.
         try:
             cleanup = db.execute(text("""
                 UPDATE twam."OrderItems"
@@ -731,11 +749,21 @@ async def payment_callback(
             db.commit()
             print(
                 f"[Payment:Callback] STEP 7 ✅ Soft-deleted {cleanup.rowcount} OrderItem(s) "
-                f"for failed order {order_id}"
+                f"for declined order {order_id}"
             )
         except Exception as exc:
             db.rollback()
             print(f"[Payment:Callback] STEP 7 ⚠️  OrderItems cleanup failed for order {order_id}: {exc}")
+    else:
+        # code=0 (Initiated), code=4 (Pending), code=-1 (Detail API failed/unknown)
+        # Payment outcome is NOT yet known — preserve order and items intact.
+        # The frontend /Payment/Status poll or the 10-min Expire endpoint will
+        # resolve the order once PayG settles the transaction.
+        print(
+            f"[Payment:Callback] STEP 7 — Payment outcome AMBIGUOUS (code={response_code}) | "
+            f"Preserving order {order_id} and its OrderItems intact — NOT deleting. "
+            f"Frontend status-poll or Expire endpoint will resolve."
+        )
 
     # ── STEP 8: Send notification ─────────────────────────────────────────
     print(f"[Payment:Callback] STEP 8 — Sending payment notification (success={success})...")
@@ -743,10 +771,26 @@ async def payment_callback(
     print(f"[Payment:Callback] STEP 8 ✅ Notification sent")
 
     # ── STEP 9: Redirect user ─────────────────────────────────────────────
+    #
+    # BUG FIX: Previously response_code=-1 (Detail API failure) and
+    # response_code=0/4 (payment still pending) were all redirected with
+    # reason="declined" (the default), making it look like the bank rejected
+    # the transaction.  Now we use appropriate reason strings per code:
+    #   code=2  → "declined"  (bank actually said no)
+    #   code=0  → "pending"   (payment initiated but not settled)
+    #   code=4  → "pending"   (payment explicitly in pending state)
+    #   code=-1 → "error"     (could not determine outcome — Detail API down)
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
     else:
-        reason = params.get("PaymentReasonCode", "declined")
+        if response_code == 2:
+            reason = params.get("PaymentReasonCode") or "declined"
+        elif response_code in (0, 4):
+            reason = "pending"
+        else:
+            # code=-1: Detail API failed or PayG returned an unrecognised code.
+            # Do NOT say "declined" — we genuinely don't know the outcome.
+            reason = params.get("PaymentReasonCode") or "error"
         redirect_url = (
             f"{_frontend_url()}/user-products/payment-callback"
             f"?status=failed&orderId={order_id}&code={response_code}&reason={reason}"
