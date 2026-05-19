@@ -105,16 +105,24 @@ def _send_payment_notification(db: Session, order_id: int, success: bool) -> Non
         print(f"[Payment] Notification error for order {order_id}: {exc}")
 
 
-def _enrich_params_via_detail_api(oid: str, rid: str) -> dict:
+def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") -> dict:
     detail: dict = {}
     try:
-        detail = payg_client.get_payg_order_detail(unique_request_id=rid)
+        # Prefer UniqueRequestId (rid); fall back to OrderKeyId when rid is absent.
+        if rid:
+            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
+        elif order_key_id:
+            detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+        else:
+            print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
+            return {}
         print(
             f"[Payment] Detail API → code={detail.get('PaymentResponseCode')} "
             f"status={detail.get('OrderStatus')} keyId={detail.get('OrderKeyId')}"
         )
     except Exception as exc:
-        print(f"[Payment] ❌ Detail API FAILED for rid={rid}: {exc}")
+        lookup_ref = rid or order_key_id
+        print(f"[Payment] ❌ Detail API FAILED for ref={lookup_ref}: {exc}")
         return {}
 
     txn_list = detail.get("OrderPaymentTransactionDetail") or []
@@ -510,10 +518,17 @@ async def payment_callback(
     oid = params.get("oid", "")
     rid = params.get("rid", "")
 
+    # ── BUG FIX: Only treat params as "complete" when PaymentResponseCode is a
+    # real resolved value (0, 1, 2, 4, …).  PayG sometimes redirects with
+    # OrderKeyId / UserDefined1 present but PaymentResponseCode absent or "-1"
+    # (meaning it hasn't settled yet).  The old code treated any OrderKeyId or
+    # UserDefined1 as sufficient, which caused STEP 2 (Detail API) to be
+    # skipped — the backend then defaulted to code=-1, marked the order as
+    # PaymentFailed, and redirected to the failure page even on a successful
+    # payment.  Now we ALWAYS call the Detail API unless PaymentResponseCode is
+    # already a valid resolved value.
     payg_gave_us_params = bool(
         params.get("PaymentResponseCode") not in (None, "", "-1", -1)
-        or params.get("OrderKeyId")
-        or params.get("UserDefined1")
     )
 
     print(
@@ -523,10 +538,17 @@ async def payment_callback(
         f"OrderKeyId={params.get('OrderKeyId')!r}"
     )
 
-    # ── STEP 2: Enrich from Detail API if PayG gave nothing ───────────────
-    if not payg_gave_us_params and (oid or rid):
-        print(f"[Payment:Callback] STEP 2 — PayG gave empty params, calling PayG Detail API (oid={oid!r} rid={rid!r})...")
-        enriched = _enrich_params_via_detail_api(oid, rid)
+    # ── STEP 2: Enrich from Detail API if PayG gave no resolved code ──────
+    # Trigger when: no valid PaymentResponseCode AND we have any identifier
+    # (oid from URL, rid from URL, or OrderKeyId that PayG appended to the
+    # redirect URL — all are usable to query PayG's Detail API).
+    order_key_id_from_cb = params.get("OrderKeyId", "")
+    if not payg_gave_us_params and (oid or rid or order_key_id_from_cb):
+        print(
+            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved; "
+            f"calling PayG Detail API (oid={oid!r} rid={rid!r} key={order_key_id_from_cb!r})..."
+        )
+        enriched = _enrich_params_via_detail_api(oid, rid, order_key_id=order_key_id_from_cb)
         if enriched:
             params = enriched
             print(
@@ -536,7 +558,10 @@ async def payment_callback(
         else:
             print(f"[Payment:Callback] STEP 2 ⚠️  Detail API returned nothing — payment code defaults to -1 (FAILED)")
     else:
-        print(f"[Payment:Callback] STEP 2 — Skipped Detail API (PayG already gave us params or no oid/rid)")
+        print(
+            f"[Payment:Callback] STEP 2 — Skipped Detail API "
+            f"(PaymentResponseCode={params.get('PaymentResponseCode')!r} already resolved)"
+        )
 
     # ── STEP 3: Find order in DB ──────────────────────────────────────────
     order_id_str  = params.get("UserDefined1") or oid or ""
