@@ -7,6 +7,96 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import Products
 
 
+def _image_path_to_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    if path.startswith("http") or path.startswith("/"):
+        return path
+    return "http://127.0.0.1:8000/" + path.lstrip("/")
+
+
+def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT "ProductImageId", "FileName", "FilePath", "FileType"
+            FROM twam."ProductImage"
+            WHERE "ProductVariantId" = :pvid
+              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+              AND "FilePath" IS NOT NULL
+            ORDER BY "ProductImageId" ASC
+            """
+        ),
+        {"pvid": product_variant_id},
+    ).fetchall()
+
+    if not rows:
+        rows = db.execute(
+            text(
+                """
+                SELECT "ProductImageId", "FileName", "FilePath", "FileType"
+                FROM twam."ProductImage"
+                WHERE "ProductId" = :pid
+                  AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+                  AND "FilePath" IS NOT NULL
+                ORDER BY "ProductImageId" ASC
+                """
+            ),
+            {"pid": product_id},
+        ).fetchall()
+
+    return [
+        {
+            "productImageId": r[0],
+            "fileName": r[1],
+            "filePath": r[2],
+            "fileType": r[3],
+            "fileData": _image_path_to_url(r[2]),
+        }
+        for r in rows
+    ]
+
+
+def _get_product_variants(db: Session, product_id: int) -> list[dict]:
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                "ProductVariantId", "ProductId", "VariantName",
+                "VariantDescription", "ProductCode", "Color",
+                "IsBestSeller", "IsReturnAvailable", "IsCupSize",
+                "IsActive", "DeletedInd", "CreatedDate", "ModifiedDate"
+            FROM twam."ProductVariants"
+            WHERE "ProductId" = :pid
+              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+            ORDER BY "ProductVariantId" ASC
+            """
+        ),
+        {"pid": product_id},
+    ).fetchall()
+
+    return [
+        {
+            "productVariantId": r[0],
+            "productId": r[1],
+            "variantName": r[2],
+            "variantDescription": r[3],
+            "productCode": r[4],
+            "color": r[5],
+            "colorName": r[5],
+            "isBestSeller": r[6],
+            "isReturnAvailable": r[7],
+            "isCupSize": r[8],
+            "isActive": True if r[9] is None else bool(r[9]),
+            "deletedInd": False if r[10] is None else bool(r[10]),
+            "createdDate": r[11],
+            "modifiedDate": r[12],
+            "images": _get_variant_images(db, r[0], product_id),
+        }
+        for r in rows
+    ]
+
+
 def _to_response(db: Session, product: Products) -> dict:
     """Attach brandName + brand visibility flags, categoryName and imageUrl from joins."""
     brand_name       = None
@@ -97,6 +187,7 @@ def _to_response(db: Session, product: Products) -> dict:
         "createdDate":      product.createdDate,
         "modifiedDate":     product.modifiedDate,
         "imageUrl":         image_url,
+        "allVariants":     _get_product_variants(db, product.productId),
     }
 
 

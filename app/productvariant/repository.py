@@ -96,7 +96,7 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "isBestSeller":       variant.isBestSeller,
         "isReturnAvailable":  variant.isReturnAvailable,
         "isCupSize":          variant.isCupSize,
-        "taxHSNCodeId":       variant.taxHSNCodeId,
+        "taxHSNCodeId":       getattr(variant, "taxHSNCodeId", None),
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
         "images":             _get_images(db, variant.productVariantId, variant.productId),
@@ -115,7 +115,11 @@ def get_all_variants(
     page_index: int = 1,
     page_size: int = 50,
 ):
-    query = db.query(ProductVariant)
+    from sqlalchemy import or_
+    query = db.query(ProductVariant).filter(
+        # Treat NULL deletedInd the same as False (many rows were inserted before the column existed)
+        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd == None)  # noqa: E711, E712
+    )
 
     # ✅ APPLY FILTERS
     if filters:
@@ -123,7 +127,6 @@ def get_all_variants(
             prop = f.get("property")
             value = f.get("value")
 
-            # 🔥 IMPORTANT: match DB field name EXACTLY
             if prop in ["ProductId", "productId"]:
                 query = query.filter(ProductVariant.productId == int(value))
 
@@ -136,22 +139,27 @@ def get_all_variants(
         if column is not None:
             query = query.order_by(asc(column) if order_ascending else desc(column))
 
+    #  COUNT before pagination
+    total = query.count()
+
     #  PAGINATION
     if page_index and page_size:
         query = query.offset((page_index - 1) * page_size).limit(page_size)
 
     results = query.all()
 
+    # Return full dicts (with images) so the frontend receives images[] on every variant
     return {
-        "list": results,
-        "count": len(results)
+        "list": [_to_response(db, v) for v in results],
+        "count": total,
     }
 # ── Single by ID ──────────────────────────────────────────────────────────────
 
 def get_variant_by_id(db: Session, variant_id: int) -> Optional[dict]:
+    from sqlalchemy import or_
     variant = db.query(ProductVariant).filter(
         ProductVariant.productVariantId == variant_id,
-        ProductVariant.deletedInd == False
+        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd == None)  # noqa: E711, E712
     ).first()
     if not variant:
         return None
@@ -178,7 +186,6 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
         isBestSeller       = data.isBestSeller,
         isReturnAvailable  = data.isReturnAvailable,
         isCupSize          = data.isCupSize,
-        taxHSNCodeId       = data.taxHSNCodeId,
         createdBy          = data.createdBy,
         createdDate        = datetime.now(timezone.utc),
         deletedInd         = False,
@@ -231,7 +238,8 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
     variant.isBestSeller       = data.isBestSeller       if data.isBestSeller       is not None else variant.isBestSeller
     variant.isReturnAvailable  = data.isReturnAvailable  if data.isReturnAvailable  is not None else variant.isReturnAvailable
     variant.isCupSize          = data.isCupSize          if data.isCupSize          is not None else variant.isCupSize
-    variant.taxHSNCodeId       = data.taxHSNCodeId       if data.taxHSNCodeId       is not None else variant.taxHSNCodeId
+    if hasattr(variant, "taxHSNCodeId") and data.taxHSNCodeId is not None:
+        variant.taxHSNCodeId = data.taxHSNCodeId
     variant.modifiedBy         = data.modifiedBy         if data.modifiedBy         is not None else variant.modifiedBy
     variant.modifiedDate       = datetime.now(timezone.utc)
 

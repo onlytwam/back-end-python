@@ -115,9 +115,23 @@ def toggle_variant_active(variant_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{variant_id}/images")
 def get_variant_images(variant_id: int, db: Session = Depends(get_db)):
+    variant = db.query(ProductVariant).filter(
+        ProductVariant.productVariantId == variant_id,
+        (ProductVariant.deletedInd == False) | (ProductVariant.deletedInd.is_(None)),
+    ).first()
+    if not variant:
+        raise HTTPException(status_code=404, detail="Variant not found")
+
     images = db.query(ProductImage).filter(
-        ProductImage.productVariantId == variant_id
-    ).all()
+        ProductImage.productVariantId == variant_id,
+        (ProductImage.deletedInd == False) | (ProductImage.deletedInd.is_(None)),
+    ).order_by(ProductImage.productImageId.asc()).all()
+
+    if not images:
+        images = db.query(ProductImage).filter(
+            ProductImage.productId == variant.productId,
+            (ProductImage.deletedInd == False) | (ProductImage.deletedInd.is_(None)),
+        ).order_by(ProductImage.productImageId.asc()).all()
 
     return [
         {

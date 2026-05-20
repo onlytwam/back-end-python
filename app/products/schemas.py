@@ -38,6 +38,39 @@ class ProductUpdate(BaseModel):
 
 # ── Response ──────────────────────────────────────────────────────────────────
 
+
+class ProductImageResponse(BaseModel):
+    productImageId: Optional[int] = None
+    fileName:       Optional[str] = None
+    filePath:       Optional[str] = None
+    fileType:       Optional[str] = None
+    fileData:       Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProductVariantSummary(BaseModel):
+    productVariantId:   int
+    productId:          int
+    variantName:        Optional[str] = None
+    variantDescription: Optional[str] = None
+    productCode:        Optional[str] = None
+    color:              Optional[str] = None
+    colorName:          Optional[str] = None
+    isBestSeller:       Optional[bool] = None
+    isReturnAvailable:  Optional[bool] = None
+    isCupSize:          Optional[bool] = None
+    isActive:           Optional[bool] = True
+    deletedInd:         Optional[bool] = False
+    createdDate:        Optional[datetime] = None
+    modifiedDate:       Optional[datetime] = None
+    images:             Optional[List[ProductImageResponse]] = []
+
+    class Config:
+        from_attributes = True
+
+
 class ProductResponse(BaseModel):
     productId:        int
     productCode:      Optional[str]  = None
@@ -67,6 +100,8 @@ class ProductResponse(BaseModel):
     categoryDeletedInd:  Optional[bool] = None   # True  = category has been soft-deleted
     # First image URL (variant-level, falls back to product-level)
     imageUrl:            Optional[str]  = None
+    # Variant collection for admin cards/user-style swatches
+    allVariants:         Optional[List[ProductVariantSummary]] = []
 
     class Config:
         from_attributes = True
