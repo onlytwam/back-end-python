@@ -354,6 +354,14 @@ def get_payg_order_detail(
     return code=0 (Initiated) or a response with no PaymentResponseCode at all.
     We retry up to 3 times with a 2-second delay to give PayG time to settle.
     A resolved code (1 or 2) exits early; code=0/4/absent retries.
+
+    IMPORTANT — PayG Detail API does NOT require an Authorization header.
+    The official doc shows only { OrderKeyId/UniqueRequestId, MID } in the body.
+    Sending an Authorization header does not break it, but the Detail API is
+    IP-allowlisted: if the server's outbound IP is not registered with PayG,
+    every call returns HTTP 403 "Host not in allowlist".  In that case there
+    is NOTHING we can do programmatically — the merchant must log into the PayG
+    portal and add the server's IP to the allowlist.
     """
     import time
 
@@ -368,6 +376,10 @@ def get_payg_order_detail(
     else:
         raise ValueError("Provide either order_key_id or unique_request_id")
 
+    # PayG Detail API doc shows only Content-Type — no Authorization header.
+    # We include it anyway (some PayG accounts require it, some don't),
+    # but 403 "Host not in allowlist" means the server IP is blocked, not
+    # that auth is wrong.
     headers = {
         "Authorization": _build_auth_header(),
         "Content-Type": "application/json",
@@ -396,6 +408,32 @@ def get_payg_order_detail(
                 f"[PayG] Detail API HTTP {resp.status_code} | "
                 f"body={resp.text[:500]!r}"
             )
+
+            # ── 403 = "Host not in allowlist" ────────────────────────────────
+            # PayG IP-allowlists the Detail API endpoint. This is NOT an auth
+            # error and NOT a transient error — retrying won't help.
+            # The merchant MUST add this server's public IP to the PayG portal:
+            #   UAT portal:  https://uat.payg.in/merchant/#/login
+            #   Live portal: https://payg.in/merchant/#/login
+            #   → Settings → IP Whitelist → Add server IP
+            if resp.status_code == 403:
+                body_text = resp.text.strip()
+                print(
+                    f"[PayG] Detail API ❌ 403 FORBIDDEN — '{body_text}'\n"
+                    f"  This means your server's public IP is NOT whitelisted in the PayG portal.\n"
+                    f"  ACTION REQUIRED:\n"
+                    f"    1. Find your server's public IP (run: curl ifconfig.me)\n"
+                    f"    2. Log into PayG portal → Settings → IP Whitelist → Add IP\n"
+                    f"  Until the IP is whitelisted, the Detail API will always fail\n"
+                    f"  and every payment callback will show as 'declined' even when\n"
+                    f"  the user's payment was successful."
+                )
+                # Don't retry — 403 is deterministic
+                raise RuntimeError(
+                    f"PayG Detail API blocked: {body_text}. "
+                    f"Add this server's IP to the PayG portal IP whitelist."
+                )
+
             resp.raise_for_status()
             data = resp.json()
             code = data.get("PaymentResponseCode")
@@ -413,6 +451,8 @@ def get_payg_order_detail(
                 f"PayG detail HTTP error {exc.response.status_code}: {exc.response.text}"
             )
             print(f"[PayG] Detail API attempt {attempt} ❌ HTTP error: {exc.response.status_code}")
+        except RuntimeError:
+            raise  # re-raise our own errors (e.g. the 403 above) without retry
         except Exception as exc:
             last_exc = RuntimeError(f"PayG detail request failed: {exc}")
             print(f"[PayG] Detail API attempt {attempt} ❌ Exception: {exc}")
