@@ -71,6 +71,8 @@ class ProductVariantResponse(BaseModel):
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
     images:             Optional[List[ImageResponse]] = []
+    isActive:           Optional[bool] = True
+    deletedInd:         Optional[bool] = False
 
     class Config:
         from_attributes = True

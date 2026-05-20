@@ -1001,14 +1001,26 @@ def cancel_order(db: Session, order_id: int, is_refund: bool, reason: str, platf
         createdDate=datetime.now(timezone.utc)
     ))
 
-    # Revert stock via stored procedure
+    # Revert stock: increment ReturnedQuantity for each item in the order.
+    # AvailableQuantity is recomputed in-Python: total - processed + refunded.
     try:
-        db.execute(
-            text("CALL twam.RevertStockQuantity(:order_id, :is_revert)"),
-            {"order_id": order_id, "is_revert": "1"}
-        )
-    except Exception:
-        pass
+        from app.productvariantdetail.repository import increment_returned_quantity
+        _now = datetime.now(timezone.utc)
+        pvd_rows = db.execute(
+            text("""
+                SELECT "ProductVariantDetailId", SUM("Quantity")::INTEGER AS qty
+                FROM   twam."OrderItems"
+                WHERE  "OrderId"    = :oid
+                  AND  "DeletedInd" = false
+                  AND  "ProductVariantDetailId" IS NOT NULL
+                GROUP BY "ProductVariantDetailId"
+            """),
+            {"oid": order_id}
+        ).fetchall()
+        for pvd_id_row, qty in pvd_rows:
+            increment_returned_quantity(db, pvd_id_row, qty, now=_now)
+    except Exception as _se:
+        print(f"[Order] Stock revert failed for order {order_id}: {_se}")
 
     # TODO: Integrate IPaymentService.RefundPaymentAsync
     db.commit()

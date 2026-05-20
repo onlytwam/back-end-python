@@ -115,7 +115,11 @@ def get_all_variants(
     page_index: int = 1,
     page_size: int = 50,
 ):
-    query = db.query(ProductVariant)
+    from sqlalchemy import or_
+    query = db.query(ProductVariant).filter(
+        # Treat NULL deletedInd the same as False (many rows were inserted before the column existed)
+        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd == None)  # noqa: E711, E712
+    )
 
     # ✅ APPLY FILTERS
     if filters:
@@ -123,7 +127,6 @@ def get_all_variants(
             prop = f.get("property")
             value = f.get("value")
 
-            # 🔥 IMPORTANT: match DB field name EXACTLY
             if prop in ["ProductId", "productId"]:
                 query = query.filter(ProductVariant.productId == int(value))
 
@@ -136,22 +139,27 @@ def get_all_variants(
         if column is not None:
             query = query.order_by(asc(column) if order_ascending else desc(column))
 
+    #  COUNT before pagination
+    total = query.count()
+
     #  PAGINATION
     if page_index and page_size:
         query = query.offset((page_index - 1) * page_size).limit(page_size)
 
     results = query.all()
 
+    # Return full dicts (with images) so the frontend receives images[] on every variant
     return {
-        "list": results,
-        "count": len(results)
+        "list": [_to_response(db, v) for v in results],
+        "count": total,
     }
 # ── Single by ID ──────────────────────────────────────────────────────────────
 
 def get_variant_by_id(db: Session, variant_id: int) -> Optional[dict]:
+    from sqlalchemy import or_
     variant = db.query(ProductVariant).filter(
         ProductVariant.productVariantId == variant_id,
-        ProductVariant.deletedInd == False
+        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd == None)  # noqa: E711, E712
     ).first()
     if not variant:
         return None

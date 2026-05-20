@@ -430,36 +430,37 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             f"State=Processing | TrackingId={result.awb_number!r}"
         )
 
-        # ── STEP 9b: Deduct stock now that Ekart shipment is confirmed ───────
-        print(f"[Payment→Ekart] STEP 9b — Deducting stock from ProductVariantDetail for order {order_id}...")
+        # ── STEP 9b: Increment ProcessedQuantity for each order item ─────────
+        # Stock formula: available = stockQuantity - processedQuantity + returnedQuantity
+        # We increment ProcessedQuantity here; AvailableQuantity is recomputed in-Python.
+        print(f"[Payment→Ekart] STEP 9b — Updating ProcessedQuantity for order {order_id}...")
         try:
-            deduct_res = db.execute(text("""
-                UPDATE twam."ProductVariantDetail" pvd
-                SET "AvailableQuantity" = GREATEST(
-                        0,
-                        COALESCE(pvd."AvailableQuantity", 0) - oi.ordered_qty
-                    ),
-                    "ModifiedDate" = :now
-                FROM (
-                    SELECT "ProductVariantDetailId",
-                           SUM("Quantity") AS ordered_qty
-                    FROM   twam."OrderItems"
-                    WHERE  "OrderId"               = :oid
-                      AND  "DeletedInd"             = false
-                      AND  "ProductVariantDetailId" IS NOT NULL
-                    GROUP BY "ProductVariantDetailId"
-                ) oi
-                WHERE pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
-            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+            from app.productvariantdetail.repository import increment_processed_quantity
+            _now = datetime.now(timezone.utc)
+            # Fetch (pvd_id, sum_qty) for this order
+            pvd_rows = db.execute(text("""
+                SELECT "ProductVariantDetailId", SUM("Quantity")::INTEGER AS ordered_qty
+                FROM   twam."OrderItems"
+                WHERE  "OrderId"               = :oid
+                  AND  "DeletedInd"             = false
+                  AND  "ProductVariantDetailId" IS NOT NULL
+                GROUP BY "ProductVariantDetailId"
+            """), {"oid": order_id}).fetchall()
+
+            updated_count = 0
+            for pvd_id_row, qty in pvd_rows:
+                if increment_processed_quantity(db, pvd_id_row, qty, now=_now):
+                    updated_count += 1
+
             db.commit()
             print(
-                f"[Payment→Ekart] STEP 9b ✅ Stock deducted for order {order_id} — "
-                f"{deduct_res.rowcount} variant(s) updated"
+                f"[Payment→Ekart] STEP 9b ✅ ProcessedQuantity updated for order {order_id} — "
+                f"{updated_count} variant(s) updated"
             )
         except Exception as _se:
             db.rollback()
             print(
-                f"[Payment→Ekart] STEP 9b ⚠️  Stock deduction FAILED (non-fatal) "
+                f"[Payment→Ekart] STEP 9b ⚠️  Stock update FAILED (non-fatal) "
                 f"for order {order_id}: {_se}"
             )
 
