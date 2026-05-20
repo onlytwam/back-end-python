@@ -8,7 +8,7 @@ from .models import Products
 
 
 def _to_response(db: Session, product: Products) -> dict:
-    """Attach brandName + brand visibility flags, and categoryName from joins."""
+    """Attach brandName + brand visibility flags, categoryName and imageUrl from joins."""
     brand_name       = None
     brand_is_active  = None
     brand_deleted    = None
@@ -49,6 +49,28 @@ def _to_response(db: Session, product: Products) -> dict:
             if category_deleted:
                 category_is_active = False
 
+    # Resolve the first image for this product (variant image first, then product-level fallback)
+    image_url = None
+    try:
+        img_row = db.execute(text(
+            """
+            SELECT "FilePath" FROM twam."ProductImage"
+            WHERE "ProductId" = :pid
+              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+              AND "FilePath" IS NOT NULL
+            ORDER BY "ProductImageId" ASC
+            LIMIT 1
+            """
+        ), {"pid": product.productId}).fetchone()
+        if img_row and img_row[0]:
+            fp = img_row[0]
+            if fp.startswith("http"):
+                image_url = fp
+            else:
+                image_url = "http://127.0.0.1:8000/" + fp.lstrip("/")
+    except Exception:
+        pass
+
     return {
         "productId":        product.productId,
         "productCode":      product.productCode,
@@ -74,6 +96,7 @@ def _to_response(db: Session, product: Products) -> dict:
         "modifiedBy":       product.modifiedBy,
         "createdDate":      product.createdDate,
         "modifiedDate":     product.modifiedDate,
+        "imageUrl":         image_url,
     }
 
 
