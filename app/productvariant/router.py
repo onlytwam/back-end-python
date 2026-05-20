@@ -223,19 +223,28 @@ def delete_variant_image(
     image_id: int,
     db: Session = Depends(get_db)
 ):
+    variant = db.query(ProductVariant).filter(
+        ProductVariant.productVariantId == variant_id,
+        (ProductVariant.deletedInd == False) | (ProductVariant.deletedInd.is_(None)),
+    ).first()
+    if not variant:
+        raise HTTPException(status_code=404, detail="Variant not found")
+
     img = db.query(ProductImage).filter(
         ProductImage.productImageId == image_id,
-        ProductImage.productVariantId == variant_id
+        (ProductImage.deletedInd == False) | (ProductImage.deletedInd.is_(None)),
     ).first()
 
-    if not img:
+    if not img or (img.productVariantId not in (None, variant_id) and img.productId != variant.productId):
         raise HTTPException(status_code=404, detail="Image not found")
 
-    # delete_image handles both Azure URLs and local /uploads/… paths
+    # delete_image handles both Azure URLs and local /uploads/... paths
     if img.filePath:
         delete_image(img.filePath)
 
-    db.delete(img)
+    img.deletedInd = True
     db.commit()
 
     return {"deleted": image_id}
+
+
