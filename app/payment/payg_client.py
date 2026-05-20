@@ -347,12 +347,20 @@ def get_payg_order_detail(
       1 – Approved  ✓
       2 – Declined  ✗
       4 – Pending
-    """
-    _mid = mid or _cfg("payg_mid")
 
-    body: dict = {
-        "MID": _mid,
-    }
+    RETRY LOGIC: PayG sometimes redirects the browser to the callback URL
+    *before* the payment is fully committed on their end (race condition).
+    When the Detail API is called immediately after the redirect, PayG may
+    return code=0 (Initiated) or a response with no PaymentResponseCode at all.
+    We retry up to 3 times with a 2-second delay to give PayG time to settle.
+    A resolved code (1 or 2) exits early; code=0/4/absent retries.
+    """
+    import time
+
+    _mid = mid or _cfg("payg_mid")
+    ref = order_key_id or unique_request_id or "?"
+
+    body: dict = {"MID": _mid}
     if order_key_id:
         body["OrderKeyId"] = order_key_id
     elif unique_request_id:
@@ -365,21 +373,67 @@ def get_payg_order_detail(
         "Content-Type": "application/json",
     }
 
-    try:
-        resp = httpx.post(
-            _get_detail_url(),
-            json=body,
-            headers=headers,
-            timeout=15.0,
+    detail_url = _get_detail_url()
+    MAX_ATTEMPTS = 3
+    RETRY_DELAY  = 2.0  # seconds between attempts
+
+    last_exc: Exception | None = None
+    last_data: dict = {}
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(
+                f"[PayG] Detail API attempt {attempt}/{MAX_ATTEMPTS} | "
+                f"ref={ref!r} | url={detail_url}"
+            )
+            resp = httpx.post(
+                detail_url,
+                json=body,
+                headers=headers,
+                timeout=15.0,
+            )
+            print(
+                f"[PayG] Detail API HTTP {resp.status_code} | "
+                f"body={resp.text[:500]!r}"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            code = data.get("PaymentResponseCode")
+            print(
+                f"[PayG] Detail API attempt {attempt} → "
+                f"PaymentResponseCode={code!r} | OrderStatus={data.get('OrderStatus')!r}"
+            )
+            # A resolved code (1=Approved, 2=Declined) means we're done — return immediately.
+            # Code 0 (Initiated) or 4 (Pending) or absent → retry after delay if we have attempts left.
+            if code in (1, 2):
+                return data
+            last_data = data
+        except httpx.HTTPStatusError as exc:
+            last_exc = RuntimeError(
+                f"PayG detail HTTP error {exc.response.status_code}: {exc.response.text}"
+            )
+            print(f"[PayG] Detail API attempt {attempt} ❌ HTTP error: {exc.response.status_code}")
+        except Exception as exc:
+            last_exc = RuntimeError(f"PayG detail request failed: {exc}")
+            print(f"[PayG] Detail API attempt {attempt} ❌ Exception: {exc}")
+
+        if attempt < MAX_ATTEMPTS:
+            print(f"[PayG] Detail API — waiting {RETRY_DELAY}s before retry...")
+            time.sleep(RETRY_DELAY)
+
+    # All attempts exhausted — return whatever we got last (may have code=0/4/absent),
+    # or raise if we got nothing but exceptions.
+    if last_data:
+        print(
+            f"[PayG] Detail API all {MAX_ATTEMPTS} attempts done — "
+            f"returning last data (code={last_data.get('PaymentResponseCode')!r})"
         )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(
-            f"PayG detail HTTP error {exc.response.status_code}: {exc.response.text}"
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(f"PayG detail request failed: {exc}") from exc
+        return last_data
+
+    if last_exc:
+        raise last_exc
+
+    raise RuntimeError(f"PayG detail API: no response after {MAX_ATTEMPTS} attempts")
 
 
 # ── Response code → order state mapping ───────────────────────────────────
@@ -387,8 +441,9 @@ def get_payg_order_detail(
 def payment_code_to_order_state(code: int) -> str:
     """Map PayG PaymentResponseCode to our internal order state string."""
     return {
-        0: "Pending",
-        1: "Confirmed",
-        2: "Payment Failed",
-        4: "Payment Pending",
+        0:  "AwaitingPayment",   # Initiated — not settled yet
+        1:  "Confirmed",         # Approved ✓
+        2:  "Payment Failed",    # Declined ✗ (bank said no)
+        4:  "Payment Pending",   # Awaiting bank confirmation
+        -1: "AwaitingPayment",   # Unknown — Detail API failed; do NOT mark as failed
     }.get(code, "Payment Failed")

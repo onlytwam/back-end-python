@@ -650,15 +650,27 @@ async def payment_callback(
     )
 
     # ── STEP 6: Update order state in DB ──────────────────────────────────
+    # BUG FIX: Do NOT call _update_order_after_payment when response_code=-1
+    # (unknown — Detail API failed even after retries).  Calling it would set
+    # order.state = "AwaitingPayment" which is fine, but we must not wipe out a
+    # state that may have already been set to "Confirmed" by a prior callback
+    # (duplicate redirect scenario).  When code=-1, leave the order exactly as
+    # it is in the DB and let the frontend polling resolve it.
     print(f"[Payment:Callback] STEP 6 — Updating order {order_id} state → {new_state!r} in DB...")
-    try:
-        _update_order_after_payment(db, order, response_code, params)
-        _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
-        db.commit()
-        print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
-    except Exception as exc:
-        db.rollback()
-        print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
+    if response_code == -1:
+        print(
+            f"[Payment:Callback] STEP 6 ℹ️  code=-1 (unknown) — "
+            f"skipping state update; order stays as '{order.state}' until resolved"
+        )
+    else:
+        try:
+            _update_order_after_payment(db, order, response_code, params)
+            _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
+            db.commit()
+            print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
 
     # ── STEP 7: On success — remove cart items + queue Ekart shipment ────────
     #
@@ -772,35 +784,34 @@ async def payment_callback(
 
     # ── STEP 9: Redirect user ─────────────────────────────────────────────
     #
-    # BUG FIX: Previously response_code=-1 (Detail API failure) and
-    # response_code=0/4 (payment still pending) were all redirected with
-    # reason="declined" (the default), making it look like the bank rejected
-    # the transaction.  Now we use appropriate reason strings per code:
-    #   code=2  → "declined"  (bank actually said no)
-    #   code=0  → "pending"   (payment initiated but not settled)
-    #   code=4  → "pending"   (payment explicitly in pending state)
-    #   code=-1 → "error"     (could not determine outcome — Detail API down)
+    # code=1 (success)   → /order-confirm/{id}?payment=success
+    # code=2 (declined)  → /payment-callback?status=failed&reason=declined
+    # code=0/4 (pending) → /order-confirm/{id}?payment=pending   (frontend polls)
+    # code=-1 (unknown)  → /order-confirm/{id}?payment=pending   (frontend polls)
+    #
+    # BUG FIX: Previously codes 0, 4, -1 all redirected to the "Payment Not
+    # Completed" failure page, which destroyed the user's confidence even though
+    # their money may have already left their account.  For ambiguous outcomes
+    # we now redirect to order-confirm with ?payment=pending so the frontend
+    # can poll /Payment/Status/{orderId} every few seconds and resolve the true
+    # outcome without the user seeing a false "declined" screen.
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
-    else:
-        if response_code == 2:
-            reason = params.get("PaymentReasonCode") or "declined"
-        elif response_code in (0, 4):
-            reason = "pending"
-        else:
-            # code=-1: Detail API failed or PayG returned an unrecognised code.
-            # Do NOT say "declined" — we genuinely don't know the outcome.
-            reason = params.get("PaymentReasonCode") or "error"
+    elif response_code == 2:
+        # Definitive bank decline — safe to show failure page
+        reason = params.get("PaymentReasonCode") or "declined"
         redirect_url = (
             f"{_frontend_url()}/user-products/payment-callback"
             f"?status=failed&orderId={order_id}&code={response_code}&reason={reason}"
         )
+    else:
+        # code=0, 4, -1: ambiguous — send to order-confirm with pending flag.
+        # The frontend polls /Payment/Status until the outcome is known.
+        redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=pending"
 
     print(f"[Payment:Callback] STEP 9 — Redirecting → {redirect_url}")
     print(f"{SEP}\n")
     return RedirectResponse(url=redirect_url, status_code=302)
-
-
 # ── Debug endpoint (admin only) ────────────────────────────────────────────
 
 @router.get("/Debug/{order_id}")
