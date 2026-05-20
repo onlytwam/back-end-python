@@ -65,6 +65,8 @@ class ProductResponse(BaseModel):
     categoryName:        Optional[str]  = None
     categoryIsActive:    Optional[bool] = None   # False = category is inactive or deleted
     categoryDeletedInd:  Optional[bool] = None   # True  = category has been soft-deleted
+    # First image URL (variant-level, falls back to product-level)
+    imageUrl:            Optional[str]  = None
 
     class Config:
         from_attributes = True
