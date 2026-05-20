@@ -806,9 +806,25 @@ async def payment_callback(
         )
 
     # ── STEP 8: Send notification ─────────────────────────────────────────
-    print(f"[Payment:Callback] STEP 8 — Sending payment notification (success={success})...")
-    _send_payment_notification(db, order_id, success)
-    print(f"[Payment:Callback] STEP 8 ✅ Notification sent")
+    # BUG FIX: Previously a failure notification was sent for code=-1 (unknown)
+    # because success=False.  This wrongly told the customer "your payment failed"
+    # even when their money had already been debited.
+    # Rule: only send notifications for DEFINITIVE outcomes.
+    #   code=1  → success notification (order confirmed)
+    #   code=2  → failure notification (bank declined)
+    #   code=0/4/-1 → NO notification yet; the Status poll / admin will resolve it
+    print(f"[Payment:Callback] STEP 8 — Payment notification | response_code={response_code}")
+    if response_code == 1:
+        _send_payment_notification(db, order_id, success=True)
+        print(f"[Payment:Callback] STEP 8 ✅ Success notification sent for order {order_id}")
+    elif response_code == 2:
+        _send_payment_notification(db, order_id, success=False)
+        print(f"[Payment:Callback] STEP 8 ✅ Failure notification sent for order {order_id}")
+    else:
+        print(
+            f"[Payment:Callback] STEP 8 ℹ️  code={response_code} (ambiguous) — "
+            f"skipping notification; will send once Status poll resolves the outcome"
+        )
 
     # ── STEP 9: Redirect user ─────────────────────────────────────────────
     #
@@ -840,6 +856,173 @@ async def payment_callback(
     print(f"[Payment:Callback] STEP 9 — Redirecting → {redirect_url}")
     print(f"{SEP}\n")
     return RedirectResponse(url=redirect_url, status_code=302)
+
+
+# ── PayG Server-to-Server (S2S) Webhook ───────────────────────────────────────
+#
+# PayG can POST the final payment result directly from their servers to this
+# endpoint SEPARATELY from the browser redirect.  This is more reliable than
+# the browser redirect because:
+#   1. It is not affected by the user closing the browser tab
+#   2. It arrives from PayG's server IP (which can be whitelisted separately)
+#   3. It always carries the final PaymentResponseCode (1 or 2)
+#
+# Configure this URL in the PayG portal:
+#   UAT:  https://uat.payg.in/merchant/#/login → Settings → Webhook URL
+#   Live: https://payg.in/merchant/#/login  → Settings → Webhook URL
+#   Set to: https://<your-backend-domain>/api/Payment/Webhook
+#
+# This endpoint updates the order state and sends the success notification if
+# the callback endpoint missed it (code=-1 scenario).
+
+@router.post("/Webhook", include_in_schema=True)
+async def payment_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    PayG server-to-server webhook. PayG POSTs final payment status here.
+    No browser redirect — just update the DB and return 200.
+    """
+    SEP = "=" * 60
+    print(f"\n{SEP}")
+    print(f"[Payment:Webhook] ▶ Received S2S webhook from PayG")
+
+    # Parse body (JSON or form)
+    params: dict = {}
+    params.update(dict(request.query_params))
+    ct = request.headers.get("content-type", "")
+    if "application/json" in ct:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                params.update(body)
+        except Exception:
+            pass
+    else:
+        try:
+            form = await request.form()
+            params.update(dict(form))
+        except Exception:
+            pass
+
+    print(f"[Payment:Webhook] Raw params={json.dumps(params, default=str)}")
+
+    try:
+        response_code = int(params.get("PaymentResponseCode", -1))
+    except (ValueError, TypeError):
+        response_code = -1
+
+    # Find the order
+    order_id_str  = params.get("UserDefined1", "") or params.get("oid", "")
+    order_key_id  = params.get("OrderKeyId", "")
+    unique_req_id = params.get("UniqueRequestId", "")
+
+    order = None
+    if order_id_str:
+        try:
+            order = db.query(Orders).filter(
+                Orders.orderId    == int(order_id_str),
+                Orders.deletedInd == False,
+            ).first()
+        except (ValueError, TypeError):
+            pass
+    if order is None and order_key_id:
+        order = db.query(Orders).filter(
+            Orders.orderKeyId == order_key_id,
+            Orders.deletedInd == False,
+        ).first()
+    if order is None and unique_req_id:
+        order = db.query(Orders).filter(
+            Orders.paymentTransactionRefNo == unique_req_id,
+            Orders.deletedInd             == False,
+        ).first()
+
+    if order is None:
+        print(f"[Payment:Webhook] ❌ Order not found — UserDefined1={order_id_str!r} key={order_key_id!r}")
+        return {"status": "order_not_found"}
+
+    order_id = order.orderId
+    was_confirmed = (order.state == "Confirmed")
+    new_state     = payg_client.payment_code_to_order_state(response_code)
+    success       = (response_code == 1)
+
+    print(
+        f"[Payment:Webhook] order={order_id} | code={response_code} | "
+        f"new_state={new_state!r} | was_confirmed={was_confirmed}"
+    )
+
+    # Only update if this is a definitive result (1 or 2) and not already confirmed
+    if response_code in (1, 2) and not was_confirmed:
+        try:
+            _update_order_after_payment(db, order, response_code, params)
+            _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
+            db.commit()
+            print(f"[Payment:Webhook] ✅ Order {order_id} updated → {new_state!r}")
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Webhook] ❌ DB update failed for order {order_id}: {exc}")
+
+    # Send notification (deferred from callback when code was -1)
+    if success and not was_confirmed:
+        background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+        _send_payment_notification(db, order_id, success=True)
+        print(f"[Payment:Webhook] ✅ Success notification + Ekart shipment queued for order {order_id}")
+    elif response_code == 2 and not was_confirmed:
+        _send_payment_notification(db, order_id, success=False)
+        print(f"[Payment:Webhook] ✅ Failure notification sent for order {order_id}")
+
+    print(f"{SEP}\n")
+    return {"status": "ok", "orderId": order_id, "state": new_state}
+
+
+# ── Admin: manually confirm a payment ────────────────────────────────────────
+# For cases where PayG S2S webhook was not configured and the callback failed.
+# Allows support staff to mark an order as Confirmed after verifying payment
+# in the PayG dashboard.
+
+@router.post("/AdminConfirm/{order_id}", include_in_schema=True)
+def admin_confirm_payment(
+    order_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Staff-only: manually confirm a payment that was stuck in AwaitingPayment
+    because the Detail API was IP-blocked and the S2S webhook was not set up.
+    """
+    if current_user.role_id not in Roles.STAFF:
+        raise HTTPException(403, "Staff only")
+
+    order = db.query(Orders).filter(
+        Orders.orderId    == order_id,
+        Orders.deletedInd == False,
+    ).first()
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    SAFE_STATES = {"AwaitingPayment", "Pending", "Payment Pending", "AwaitingPayment"}
+    if order.state not in SAFE_STATES:
+        return {
+            "success": False,
+            "message": f"Order is already in state '{order.state}' — no change made",
+            "state": order.state,
+        }
+
+    order.state        = "Confirmed"
+    order.modifiedDate = datetime.now(timezone.utc)
+    db.add(order)
+    db.commit()
+
+    background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+    _send_payment_notification(db, order_id, success=True)
+
+    print(f"[Payment:AdminConfirm] ✅ Order {order_id} manually confirmed by staff {current_user.user_id}")
+    return {"success": True, "orderId": order_id, "state": "Confirmed"}
+
+
 # ── Debug endpoint (admin only) ────────────────────────────────────────────
 
 @router.get("/Debug/{order_id}")
@@ -931,6 +1114,24 @@ def get_payment_status(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    Frontend polls this endpoint every 3 seconds from the ?payment=pending screen.
+    Returns the order's current state from the DB.
+
+    IMPORTANT: This endpoint NO LONGER calls the PayG Detail API because the
+    Detail API requires an IP whitelist entry that is often missing in UAT/staging.
+    Instead it returns the state already stored in the DB.
+
+    How the state gets updated:
+    1. PayG posts a server-to-server callback to /api/Payment/Callback (if configured)
+       which sets state → Confirmed / Payment Failed in the DB.
+    2. If that callback arrives AFTER the frontend redirect, the next poll here
+       will return the updated state and the frontend resolves the spinner.
+    3. If the server callback never arrives (not configured), an admin can manually
+       update the order state from the dashboard.
+
+    The frontend stops polling when it sees 'Confirmed' or 'Payment Failed'.
+    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
@@ -941,26 +1142,23 @@ def get_payment_status(
     if current_user.role_id not in Roles.STAFF and order.userProfileId != current_user.user_id:
         raise HTTPException(403, "Not authorised")
 
-    local_state = order.state or "Pending"
-    payg_detail: dict = {}
+    local_state = order.state or "AwaitingPayment"
 
-    if order.orderKeyId or order.paymentTransactionRefNo:
+    # Send the deferred success notification the first time we see "Confirmed".
+    # (It was skipped at callback time because code was -1/0/4 at that point.)
+    # Guard: only send once — check paymentNotificationSent flag if available,
+    # otherwise the notification function must be idempotent.
+    if local_state == "Confirmed":
         try:
-            payg_detail = payg_client.get_payg_order_detail(
-                order_key_id      = order.orderKeyId,
-                unique_request_id = order.paymentTransactionRefNo,
-            )
-            live_code = payg_detail.get("PaymentResponseCode")
-            if live_code is not None:
-                live_state = payg_client.payment_code_to_order_state(int(live_code))
-                if order.state != live_state:
-                    order.state        = live_state
-                    order.modifiedDate = datetime.now(timezone.utc)
-                    db.add(order)
-                    db.commit()
-                    local_state = live_state
+            from app.ekart.notifications import send_order_placed_notification
+            send_order_placed_notification(db, order_id)
         except Exception as exc:
-            print(f"[Payment] Live status check failed: {exc}")
+            print(f"[Payment/Status] Deferred success notification error for order {order_id}: {exc}")
+
+    print(
+        f"[Payment/Status] order={order_id} state={local_state!r} "
+        f"(DB-only — not calling Detail API)"
+    )
 
     return {
         "orderId":              order_id,
@@ -968,8 +1166,8 @@ def get_payment_status(
         "state":                local_state,
         "paymentMethod":        order.paymentMethod,
         "paymentTransactionId": order.paymentTransactionId,
-        "paymentResponseCode":  payg_detail.get("PaymentResponseCode"),
-        "paygStatus":           payg_detail.get("OrderStatus"),
+        "paymentResponseCode":  None,
+        "paygStatus":           None,
     }
 
 

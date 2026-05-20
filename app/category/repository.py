@@ -7,6 +7,16 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import Category
 
 
+def _to_url(path):
+    """Resolve a stored image path to an absolute URL path."""
+    if not path:
+        return None
+    if path.startswith("/") or path.startswith("http"):
+        return path
+    return "/" + path.replace("\\", "/")
+
+
+
 # ── Admin grid ────────────────────────────────────────────────────────────────
 
 def get_all_categories(
@@ -81,7 +91,7 @@ def get_all_categories(
             "parentCategoryName": parent_map.get(r.parentCategoryId, ""),
             "groupCategoryId":    r.groupCategoryId,
             "isActive":           r.isActive,
-            "categoryImage":      r.categoryImage,
+            "categoryImage":      _to_url(r.categoryImage),
             "createdDate":        r.createdDate,
             "modifiedDate":       r.modifiedDate,
             "deletedInd":         bool(r.deletedInd) if r.deletedInd is not None else False,
