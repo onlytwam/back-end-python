@@ -493,22 +493,29 @@ async def payment_callback(
 ):
     SEP = "=" * 60
     # ── STEP 1: Parse incoming params from PayG ───────────────────────────
+    # PayG sends the redirect as a browser GET with query params appended to
+    # the RedirectUrl.  In some configurations it POSTs form data instead.
+    # We merge BOTH query-string params AND body params so we never miss a field.
     params: dict = {}
-    if request.method == "GET":
-        params = dict(request.query_params)
-    else:
+
+    # Always read query-string params (present on both GET and POST)
+    params.update(dict(request.query_params))
+
+    if request.method == "POST":
         ct = request.headers.get("content-type", "")
         if "application/json" in ct:
             try:
-                params = await request.json()
+                body_params = await request.json()
+                if isinstance(body_params, dict):
+                    params.update(body_params)
             except Exception:
-                params = {}
+                pass
         else:
             try:
                 form = await request.form()
-                params = dict(form)
+                params.update(dict(form))
             except Exception:
-                params = {}
+                pass
 
     print(f"\n{SEP}")
     print(f"[Payment:Callback] ▶ STEP 1 — Received {request.method} callback from PayG")
@@ -518,49 +525,70 @@ async def payment_callback(
     oid = params.get("oid", "")
     rid = params.get("rid", "")
 
-    # ── BUG FIX: Only treat params as "complete" when PaymentResponseCode is a
-    # real resolved value (0, 1, 2, 4, …).  PayG sometimes redirects with
-    # OrderKeyId / UserDefined1 present but PaymentResponseCode absent or "-1"
-    # (meaning it hasn't settled yet).  The old code treated any OrderKeyId or
-    # UserDefined1 as sufficient, which caused STEP 2 (Detail API) to be
-    # skipped — the backend then defaulted to code=-1, marked the order as
-    # PaymentFailed, and redirected to the failure page even on a successful
-    # payment.  Now we ALWAYS call the Detail API unless PaymentResponseCode is
-    # already a valid resolved value.
-    payg_gave_us_params = bool(
-        params.get("PaymentResponseCode") not in (None, "", "-1", -1)
-    )
+    # PayG appends payment result fields to the RedirectUrl as query params:
+    #   PaymentResponseCode, OrderKeyId, UniqueRequestId, UserDefined1, HashData, …
+    # We treat params as "complete" when PaymentResponseCode is a real resolved
+    # value (1=approved, 2=declined).  Codes 0/4 (pending) and absent/-1 mean
+    # the payment hasn't settled yet — we still need to call the Detail API.
+    payg_response_code_raw = params.get("PaymentResponseCode")
+    try:
+        payg_response_code_direct = int(payg_response_code_raw) if payg_response_code_raw not in (None, "", "-1") else None
+    except (ValueError, TypeError):
+        payg_response_code_direct = None
+
+    payg_gave_us_params = payg_response_code_direct in (1, 2)
 
     print(
         f"[Payment:Callback] STEP 1 ✅ Parsed | oid={oid!r} | rid={rid!r} | "
         f"payg_gave_us_params={payg_gave_us_params} | "
-        f"PaymentResponseCode={params.get('PaymentResponseCode')!r} | "
-        f"OrderKeyId={params.get('OrderKeyId')!r}"
+        f"PaymentResponseCode={payg_response_code_raw!r} | "
+        f"OrderKeyId={params.get('OrderKeyId')!r} | "
+        f"UserDefined1={params.get('UserDefined1')!r}"
     )
 
-    # ── STEP 2: Enrich from Detail API if PayG gave no resolved code ──────
-    # Trigger when: no valid PaymentResponseCode AND we have any identifier
-    # (oid from URL, rid from URL, or OrderKeyId that PayG appended to the
-    # redirect URL — all are usable to query PayG's Detail API).
+    # ── STEP 2: Enrich from Detail API if PayG didn't give a resolved code ──
+    # If PayG gave us code=1 or code=2 directly in the redirect params → skip.
+    # If Detail API is IP-blocked (403) → log clearly and proceed with code=-1
+    #   (frontend will poll via /Payment/Status and resolve the outcome).
     order_key_id_from_cb = params.get("OrderKeyId", "")
     if not payg_gave_us_params and (oid or rid or order_key_id_from_cb):
         print(
-            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved; "
+            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved ({payg_response_code_raw!r}); "
             f"calling PayG Detail API (oid={oid!r} rid={rid!r} key={order_key_id_from_cb!r})..."
         )
         enriched = _enrich_params_via_detail_api(oid, rid, order_key_id=order_key_id_from_cb)
-        if enriched:
+        if enriched and enriched.get("PaymentResponseCode") not in (None, "", -1):
             params = enriched
             print(
-                f"[Payment:Callback] STEP 2 ✅ Detail API enriched params | "
+                f"[Payment:Callback] STEP 2 ✅ Detail API resolved | "
                 f"code={params.get('PaymentResponseCode')!r} | status={params.get('OrderStatus')!r}"
             )
         else:
-            print(f"[Payment:Callback] STEP 2 ⚠️  Detail API returned nothing — payment code defaults to -1 (FAILED)")
+            # Detail API failed (likely 403 IP not whitelisted) or returned code=0/4.
+            # CRITICAL: If PayG sent PaymentResponseCode directly in the redirect
+            # params (even as 0 or 4), trust that over the Detail API failure.
+            if payg_response_code_direct is not None:
+                print(
+                    f"[Payment:Callback] STEP 2 ⚠️  Detail API failed but PayG gave "
+                    f"code={payg_response_code_direct} directly in redirect — using that"
+                )
+                # params already has the direct code — no change needed
+            else:
+                print(
+                    f"[Payment:Callback] STEP 2 ❌ Detail API returned nothing AND PayG "
+                    f"gave no code in redirect params — code defaults to -1 (UNKNOWN).\n"
+                    f"  If this keeps happening: log into PayG portal and add this\n"
+                    f"  server's public IP to the IP Whitelist so the Detail API works."
+                )
+    elif payg_gave_us_params:
+        print(
+            f"[Payment:Callback] STEP 2 — Skipped Detail API — "
+            f"PayG already gave PaymentResponseCode={payg_response_code_raw!r} in redirect params"
+        )
     else:
         print(
-            f"[Payment:Callback] STEP 2 — Skipped Detail API "
-            f"(PaymentResponseCode={params.get('PaymentResponseCode')!r} already resolved)"
+            f"[Payment:Callback] STEP 2 ❌ Cannot call Detail API — "
+            f"no oid, rid, or OrderKeyId available in params"
         )
 
     # ── STEP 3: Find order in DB ──────────────────────────────────────────
