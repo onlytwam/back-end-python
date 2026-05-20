@@ -96,7 +96,7 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "isBestSeller":       variant.isBestSeller,
         "isReturnAvailable":  variant.isReturnAvailable,
         "isCupSize":          variant.isCupSize,
-        "taxHSNCodeId":       variant.taxHSNCodeId,
+        "taxHSNCodeId":       getattr(variant, "taxHSNCodeId", None),
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
         "images":             _get_images(db, variant.productVariantId, variant.productId),
@@ -186,7 +186,6 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
         isBestSeller       = data.isBestSeller,
         isReturnAvailable  = data.isReturnAvailable,
         isCupSize          = data.isCupSize,
-        taxHSNCodeId       = data.taxHSNCodeId,
         createdBy          = data.createdBy,
         createdDate        = datetime.now(timezone.utc),
         deletedInd         = False,
@@ -239,7 +238,8 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
     variant.isBestSeller       = data.isBestSeller       if data.isBestSeller       is not None else variant.isBestSeller
     variant.isReturnAvailable  = data.isReturnAvailable  if data.isReturnAvailable  is not None else variant.isReturnAvailable
     variant.isCupSize          = data.isCupSize          if data.isCupSize          is not None else variant.isCupSize
-    variant.taxHSNCodeId       = data.taxHSNCodeId       if data.taxHSNCodeId       is not None else variant.taxHSNCodeId
+    if hasattr(variant, "taxHSNCodeId") and data.taxHSNCodeId is not None:
+        variant.taxHSNCodeId = data.taxHSNCodeId
     variant.modifiedBy         = data.modifiedBy         if data.modifiedBy         is not None else variant.modifiedBy
     variant.modifiedDate       = datetime.now(timezone.utc)
 

@@ -26,7 +26,6 @@ class ProductVariant(Base):
     modifiedDate        = Column("ModifiedDate",        DateTime(timezone=True), onupdate=func.now(), nullable=True)
     isActive            = Column("IsActive",            Boolean,    default=True)
     deletedInd          = Column("DeletedInd",          Boolean,    default=False)
-    taxHSNCodeId        = Column("TaxHSNCodeId",        BigInteger, nullable=True)
 
 
 
