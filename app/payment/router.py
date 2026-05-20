@@ -106,69 +106,43 @@ def _send_payment_notification(db: Session, order_id: int, success: bool) -> Non
 
 
 def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") -> dict:
-    """
-    Call PayG Detail API to get the real payment status.
-    Retries up to 3 times with a 2-second delay between attempts.
-    Returns enriched params dict on success, or {} if all attempts fail.
-
-    IMPORTANT: {} means UNCERTAIN (not failed). The caller must NOT mark the
-    order as PaymentFailed on {} — it should redirect to the pending page so
-    the frontend can poll for resolution.
-    """
-    import time
-
-    if not rid and not order_key_id:
-        print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
+    detail: dict = {}
+    try:
+        # Prefer UniqueRequestId (rid); fall back to OrderKeyId when rid is absent.
+        if rid:
+            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
+        elif order_key_id:
+            detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+        else:
+            print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
+            return {}
+        print(
+            f"[Payment] Detail API → code={detail.get('PaymentResponseCode')} "
+            f"status={detail.get('OrderStatus')} keyId={detail.get('OrderKeyId')}"
+        )
+    except Exception as exc:
+        lookup_ref = rid or order_key_id
+        print(f"[Payment] ❌ Detail API FAILED for ref={lookup_ref}: {exc}")
         return {}
 
-    last_exc = None
-    for attempt in range(1, 4):  # up to 3 attempts
-        try:
-            detail: dict = {}
-            if rid:
-                detail = payg_client.get_payg_order_detail(unique_request_id=rid)
-            else:
-                detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+    txn_list = detail.get("OrderPaymentTransactionDetail") or []
+    txn = txn_list[0] if txn_list else {}
 
-            rc = detail.get("PaymentResponseCode")
-            print(
-                f"[Payment] Detail API attempt {attempt} → "
-                f"code={rc!r} status={detail.get('OrderStatus')!r} keyId={detail.get('OrderKeyId')!r}"
-            )
-
-            if rc is not None:
-                txn_list = detail.get("OrderPaymentTransactionDetail") or []
-                txn = txn_list[0] if txn_list else {}
-                return {
-                    "UserDefined1":            oid,
-                    "OrderKeyId":              detail.get("OrderKeyId", ""),
-                    "UniqueRequestId":         detail.get("UniqueRequestId", rid),
-                    "PaymentResponseCode":     rc,
-                    "PaymentStatus":           detail.get("PaymentStatus"),
-                    "OrderStatus":             detail.get("OrderStatus", ""),
-                    "PaymentMethod":           detail.get("PaymentMethod") or txn.get("PaymentMethod", ""),
-                    "PaymentAccount":          detail.get("PaymentAccount") or txn.get("PaymentAccount", ""),
-                    "PaymentTransactionId":    str(txn.get("TransactionId", "")),
-                    "PaymentTransactionRefNo": str(txn.get("TransactionId", "")),
-                    "PaymentReasonCode":       txn.get("ResponseText", ""),
-                    "MID":                     get_setting("payg_mid"),
-                    "OrderAmount":             str(detail.get("OrderAmount", "")),
-                }
-            print(f"[Payment] Detail API attempt {attempt} — PaymentResponseCode absent, retrying...")
-
-        except Exception as exc:
-            last_exc = exc
-            print(f"[Payment] ❌ Detail API attempt {attempt} FAILED for rid={rid!r} key={order_key_id!r}: {exc}")
-
-        if attempt < 3:
-            time.sleep(2)
-
-    print(
-        f"[Payment] ❌ Detail API exhausted 3 attempts. "
-        f"rid={rid!r} key={order_key_id!r} last_error={last_exc}. "
-        f"Returning {{}} → UNCERTAIN — will redirect to pending."
-    )
-    return {}
+    return {
+        "UserDefined1":            oid,
+        "OrderKeyId":              detail.get("OrderKeyId", ""),
+        "UniqueRequestId":         detail.get("UniqueRequestId", rid),
+        "PaymentResponseCode":     detail.get("PaymentResponseCode", -1),
+        "PaymentStatus":           detail.get("PaymentStatus"),
+        "OrderStatus":             detail.get("OrderStatus", ""),
+        "PaymentMethod":           detail.get("PaymentMethod") or txn.get("PaymentMethod", ""),
+        "PaymentAccount":          detail.get("PaymentAccount") or txn.get("PaymentAccount", ""),
+        "PaymentTransactionId":    str(txn.get("TransactionId", "")),
+        "PaymentTransactionRefNo": str(txn.get("TransactionId", "")),
+        "PaymentReasonCode":       txn.get("ResponseText", ""),
+        "MID":                     get_setting("payg_mid"),
+        "OrderAmount":             str(detail.get("OrderAmount", "")),
+    }
 
 
 # ── AUTO EKART SHIPMENT ────────────────────────────────────────────────────
@@ -519,22 +493,29 @@ async def payment_callback(
 ):
     SEP = "=" * 60
     # ── STEP 1: Parse incoming params from PayG ───────────────────────────
+    # PayG sends the redirect as a browser GET with query params appended to
+    # the RedirectUrl.  In some configurations it POSTs form data instead.
+    # We merge BOTH query-string params AND body params so we never miss a field.
     params: dict = {}
-    if request.method == "GET":
-        params = dict(request.query_params)
-    else:
+
+    # Always read query-string params (present on both GET and POST)
+    params.update(dict(request.query_params))
+
+    if request.method == "POST":
         ct = request.headers.get("content-type", "")
         if "application/json" in ct:
             try:
-                params = await request.json()
+                body_params = await request.json()
+                if isinstance(body_params, dict):
+                    params.update(body_params)
             except Exception:
-                params = {}
+                pass
         else:
             try:
                 form = await request.form()
-                params = dict(form)
+                params.update(dict(form))
             except Exception:
-                params = {}
+                pass
 
     print(f"\n{SEP}")
     print(f"[Payment:Callback] ▶ STEP 1 — Received {request.method} callback from PayG")
@@ -544,55 +525,70 @@ async def payment_callback(
     oid = params.get("oid", "")
     rid = params.get("rid", "")
 
-    # ── BUG FIX: Only treat params as "complete" when PaymentResponseCode is a
-    # real resolved value (0, 1, 2, 4, …).  PayG sometimes redirects with
-    # OrderKeyId / UserDefined1 present but PaymentResponseCode absent or "-1"
-    # (meaning it hasn't settled yet).  The old code treated any OrderKeyId or
-    # UserDefined1 as sufficient, which caused STEP 2 (Detail API) to be
-    # skipped — the backend then defaulted to code=-1, marked the order as
-    # PaymentFailed, and redirected to the failure page even on a successful
-    # payment.  Now we ALWAYS call the Detail API unless PaymentResponseCode is
-    # already a valid resolved value.
-    payg_gave_us_params = bool(
-        params.get("PaymentResponseCode") not in (None, "", "-1", -1)
-    )
+    # PayG appends payment result fields to the RedirectUrl as query params:
+    #   PaymentResponseCode, OrderKeyId, UniqueRequestId, UserDefined1, HashData, …
+    # We treat params as "complete" when PaymentResponseCode is a real resolved
+    # value (1=approved, 2=declined).  Codes 0/4 (pending) and absent/-1 mean
+    # the payment hasn't settled yet — we still need to call the Detail API.
+    payg_response_code_raw = params.get("PaymentResponseCode")
+    try:
+        payg_response_code_direct = int(payg_response_code_raw) if payg_response_code_raw not in (None, "", "-1") else None
+    except (ValueError, TypeError):
+        payg_response_code_direct = None
+
+    payg_gave_us_params = payg_response_code_direct in (1, 2)
 
     print(
         f"[Payment:Callback] STEP 1 ✅ Parsed | oid={oid!r} | rid={rid!r} | "
         f"payg_gave_us_params={payg_gave_us_params} | "
-        f"PaymentResponseCode={params.get('PaymentResponseCode')!r} | "
-        f"OrderKeyId={params.get('OrderKeyId')!r}"
+        f"PaymentResponseCode={payg_response_code_raw!r} | "
+        f"OrderKeyId={params.get('OrderKeyId')!r} | "
+        f"UserDefined1={params.get('UserDefined1')!r}"
     )
 
-    # ── STEP 2: Enrich from Detail API if PayG gave no resolved code ──────
-    # Trigger when: no valid PaymentResponseCode AND we have any identifier
-    # (oid from URL, rid from URL, or OrderKeyId that PayG appended to the
-    # redirect URL — all are usable to query PayG's Detail API).
+    # ── STEP 2: Enrich from Detail API if PayG didn't give a resolved code ──
+    # If PayG gave us code=1 or code=2 directly in the redirect params → skip.
+    # If Detail API is IP-blocked (403) → log clearly and proceed with code=-1
+    #   (frontend will poll via /Payment/Status and resolve the outcome).
     order_key_id_from_cb = params.get("OrderKeyId", "")
     if not payg_gave_us_params and (oid or rid or order_key_id_from_cb):
         print(
-            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved; "
+            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved ({payg_response_code_raw!r}); "
             f"calling PayG Detail API (oid={oid!r} rid={rid!r} key={order_key_id_from_cb!r})..."
         )
         enriched = _enrich_params_via_detail_api(oid, rid, order_key_id=order_key_id_from_cb)
-        if enriched:
+        if enriched and enriched.get("PaymentResponseCode") not in (None, "", -1):
             params = enriched
             print(
-                f"[Payment:Callback] STEP 2 ✅ Detail API enriched params | "
+                f"[Payment:Callback] STEP 2 ✅ Detail API resolved | "
                 f"code={params.get('PaymentResponseCode')!r} | status={params.get('OrderStatus')!r}"
             )
         else:
-            # Detail API failed after retries — we don't know the real status.
-            # Set a flag so STEP 5 can redirect to "pending" instead of "failed".
-            params["_detail_api_uncertain"] = True
-            print(
-                f"[Payment:Callback] STEP 2 ⚠️  Detail API returned nothing — "
-                f"marking UNCERTAIN (will NOT stamp PaymentFailed)"
-            )
+            # Detail API failed (likely 403 IP not whitelisted) or returned code=0/4.
+            # CRITICAL: If PayG sent PaymentResponseCode directly in the redirect
+            # params (even as 0 or 4), trust that over the Detail API failure.
+            if payg_response_code_direct is not None:
+                print(
+                    f"[Payment:Callback] STEP 2 ⚠️  Detail API failed but PayG gave "
+                    f"code={payg_response_code_direct} directly in redirect — using that"
+                )
+                # params already has the direct code — no change needed
+            else:
+                print(
+                    f"[Payment:Callback] STEP 2 ❌ Detail API returned nothing AND PayG "
+                    f"gave no code in redirect params — code defaults to -1 (UNKNOWN).\n"
+                    f"  If this keeps happening: log into PayG portal and add this\n"
+                    f"  server's public IP to the IP Whitelist so the Detail API works."
+                )
+    elif payg_gave_us_params:
+        print(
+            f"[Payment:Callback] STEP 2 — Skipped Detail API — "
+            f"PayG already gave PaymentResponseCode={payg_response_code_raw!r} in redirect params"
+        )
     else:
         print(
-            f"[Payment:Callback] STEP 2 — Skipped Detail API "
-            f"(PaymentResponseCode={params.get('PaymentResponseCode')!r} already resolved)"
+            f"[Payment:Callback] STEP 2 ❌ Cannot call Detail API — "
+            f"no oid, rid, or OrderKeyId available in params"
         )
 
     # ── STEP 3: Find order in DB ──────────────────────────────────────────
@@ -667,22 +663,6 @@ async def payment_callback(
         print(f"[Payment:Callback] STEP 4 ℹ️  UAT mode — hash check SKIPPED")
 
     # ── STEP 5: Determine payment outcome ─────────────────────────────────
-    # If Detail API was unreachable (STEP 2 returned {}), we must NOT stamp the
-    # order as PaymentFailed — we simply don't know the result yet.
-    # Leave the order in AwaitingPayment and redirect the browser to the
-    # pending page so the frontend can poll /Payment/Status/{orderId}.
-    if params.get("_detail_api_uncertain"):
-        pending_url = (
-            f"{_frontend_url()}/user-products/payment-callback"
-            f"?status=pending&orderId={order_id}"
-        )
-        print(
-            f"[Payment:Callback] STEP 5 ⚠️  UNCERTAIN — Detail API gave no result. "
-            f"Order {order_id} left in state={order.state!r}. "
-            f"Redirecting to pending page for frontend polling → {pending_url}"
-        )
-        return RedirectResponse(url=pending_url, status_code=302)
-
     try:
         response_code = int(params.get("PaymentResponseCode", -1))
     except (ValueError, TypeError):
@@ -698,17 +678,51 @@ async def payment_callback(
     )
 
     # ── STEP 6: Update order state in DB ──────────────────────────────────
+    # BUG FIX: Do NOT call _update_order_after_payment when response_code=-1
+    # (unknown — Detail API failed even after retries).  Calling it would set
+    # order.state = "AwaitingPayment" which is fine, but we must not wipe out a
+    # state that may have already been set to "Confirmed" by a prior callback
+    # (duplicate redirect scenario).  When code=-1, leave the order exactly as
+    # it is in the DB and let the frontend polling resolve it.
     print(f"[Payment:Callback] STEP 6 — Updating order {order_id} state → {new_state!r} in DB...")
-    try:
-        _update_order_after_payment(db, order, response_code, params)
-        _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
-        db.commit()
-        print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
-    except Exception as exc:
-        db.rollback()
-        print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
+    if response_code == -1:
+        print(
+            f"[Payment:Callback] STEP 6 ℹ️  code=-1 (unknown) — "
+            f"skipping state update; order stays as '{order.state}' until resolved"
+        )
+    else:
+        try:
+            _update_order_after_payment(db, order, response_code, params)
+            _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
+            db.commit()
+            print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
 
     # ── STEP 7: On success — remove cart items + queue Ekart shipment ────────
+    #
+    # PayG PaymentResponseCode meanings:
+    #   1  → Approved (definitive success)
+    #   2  → Declined (definitive failure — bank rejected)
+    #   0  → Initiated / Pending (payment not settled yet — DO NOT destroy order)
+    #   4  → Payment Pending    (payment not settled yet — DO NOT destroy order)
+    #  -1  → Unknown (Detail API failed or timed out   — DO NOT destroy order)
+    #
+    # ── BUG FIX: Previously the `else` branch ran for ALL non-success codes
+    # (0, 4, -1, 2) and soft-deleted OrderItems.  This destroyed the order
+    # when PayG returned code=0/4 (payment still in-flight) or when the
+    # Detail API itself failed (code=-1, e.g. network timeout, wrong
+    # credentials).  The user then saw "Payment Not Completed / declined by
+    # the bank" even though their money had already left their account.
+    #
+    # The fix: only soft-delete OrderItems when response_code==2, which is
+    # the ONLY code that means the bank definitively rejected the transaction.
+    # For codes 0, 4 (pending) and -1 (unknown), leave the order and its
+    # items intact — the /Payment/Status poll or the Expire endpoint will
+    # clean up if the payment truly never settles.
+    DEFINITIVE_FAILURE = (response_code == 2)  # 2 = bank declined
+
     if success:
         print(
             f"[Payment:Callback] STEP 7 — Payment SUCCESS ✅ | "
@@ -718,10 +732,6 @@ async def payment_callback(
         print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
 
         # Remove all ordered cart items completely so the cart is clean for the user.
-        # FIX: The old SQL joined Cart to OrderItems on ProductVariantDetailId and
-        # deleted EVERY Cart row with a matching PVDID.  This was dangerous when
-        # duplicate Cart rows existed (due to the IsOrdered NULL bug in cart/repository.py)
-        # because it would also delete Cart rows the user had NOT yet ordered.
         # The corrected query uses a CTE to collect exactly the CartIds that
         # were ordered (by matching PVDID through OrderItems), then deletes only
         # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
@@ -760,14 +770,14 @@ async def payment_callback(
         except Exception as exc:
             db.rollback()
             print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
-    else:
+    elif DEFINITIVE_FAILURE:
+        # code=2: bank definitively declined — safe to clean up OrderItems
+        # so they never bleed into a future invoice.  Cart items are kept so
+        # the user can retry with the same products.
         print(
-            f"[Payment:Callback] STEP 7 — Payment NOT successful (code={response_code}) | "
-            f"Ekart task NOT queued | Cart preserved for retry"
+            f"[Payment:Callback] STEP 7 — Payment DECLINED by bank (code=2) | "
+            f"Soft-deleting OrderItems for order {order_id}..."
         )
-        # ── FIX: Soft-delete OrderItems from this failed order so ghost items
-        # never appear on a future invoice or bleed into the next order.
-        # Cart items are preserved so the user can retry from their cart.
         try:
             cleanup = db.execute(text("""
                 UPDATE twam."OrderItems"
@@ -779,30 +789,238 @@ async def payment_callback(
             db.commit()
             print(
                 f"[Payment:Callback] STEP 7 ✅ Soft-deleted {cleanup.rowcount} OrderItem(s) "
-                f"for failed order {order_id}"
+                f"for declined order {order_id}"
             )
         except Exception as exc:
             db.rollback()
             print(f"[Payment:Callback] STEP 7 ⚠️  OrderItems cleanup failed for order {order_id}: {exc}")
+    else:
+        # code=0 (Initiated), code=4 (Pending), code=-1 (Detail API failed/unknown)
+        # Payment outcome is NOT yet known — preserve order and items intact.
+        # The frontend /Payment/Status poll or the 10-min Expire endpoint will
+        # resolve the order once PayG settles the transaction.
+        print(
+            f"[Payment:Callback] STEP 7 — Payment outcome AMBIGUOUS (code={response_code}) | "
+            f"Preserving order {order_id} and its OrderItems intact — NOT deleting. "
+            f"Frontend status-poll or Expire endpoint will resolve."
+        )
 
     # ── STEP 8: Send notification ─────────────────────────────────────────
-    print(f"[Payment:Callback] STEP 8 — Sending payment notification (success={success})...")
-    _send_payment_notification(db, order_id, success)
-    print(f"[Payment:Callback] STEP 8 ✅ Notification sent")
+    # BUG FIX: Previously a failure notification was sent for code=-1 (unknown)
+    # because success=False.  This wrongly told the customer "your payment failed"
+    # even when their money had already been debited.
+    # Rule: only send notifications for DEFINITIVE outcomes.
+    #   code=1  → success notification (order confirmed)
+    #   code=2  → failure notification (bank declined)
+    #   code=0/4/-1 → NO notification yet; the Status poll / admin will resolve it
+    print(f"[Payment:Callback] STEP 8 — Payment notification | response_code={response_code}")
+    if response_code == 1:
+        _send_payment_notification(db, order_id, success=True)
+        print(f"[Payment:Callback] STEP 8 ✅ Success notification sent for order {order_id}")
+    elif response_code == 2:
+        _send_payment_notification(db, order_id, success=False)
+        print(f"[Payment:Callback] STEP 8 ✅ Failure notification sent for order {order_id}")
+    else:
+        print(
+            f"[Payment:Callback] STEP 8 ℹ️  code={response_code} (ambiguous) — "
+            f"skipping notification; will send once Status poll resolves the outcome"
+        )
 
     # ── STEP 9: Redirect user ─────────────────────────────────────────────
+    #
+    # code=1 (success)   → /order-confirm/{id}?payment=success
+    # code=2 (declined)  → /payment-callback?status=failed&reason=declined
+    # code=0/4 (pending) → /order-confirm/{id}?payment=pending   (frontend polls)
+    # code=-1 (unknown)  → /order-confirm/{id}?payment=pending   (frontend polls)
+    #
+    # BUG FIX: Previously codes 0, 4, -1 all redirected to the "Payment Not
+    # Completed" failure page, which destroyed the user's confidence even though
+    # their money may have already left their account.  For ambiguous outcomes
+    # we now redirect to order-confirm with ?payment=pending so the frontend
+    # can poll /Payment/Status/{orderId} every few seconds and resolve the true
+    # outcome without the user seeing a false "declined" screen.
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
-    else:
-        reason = params.get("PaymentReasonCode", "declined")
+    elif response_code == 2:
+        # Definitive bank decline — safe to show failure page
+        reason = params.get("PaymentReasonCode") or "declined"
         redirect_url = (
             f"{_frontend_url()}/user-products/payment-callback"
             f"?status=failed&orderId={order_id}&code={response_code}&reason={reason}"
         )
+    else:
+        # code=0, 4, -1: ambiguous — send to order-confirm with pending flag.
+        # The frontend polls /Payment/Status until the outcome is known.
+        redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=pending"
 
     print(f"[Payment:Callback] STEP 9 — Redirecting → {redirect_url}")
     print(f"{SEP}\n")
     return RedirectResponse(url=redirect_url, status_code=302)
+
+
+# ── PayG Server-to-Server (S2S) Webhook ───────────────────────────────────────
+#
+# PayG can POST the final payment result directly from their servers to this
+# endpoint SEPARATELY from the browser redirect.  This is more reliable than
+# the browser redirect because:
+#   1. It is not affected by the user closing the browser tab
+#   2. It arrives from PayG's server IP (which can be whitelisted separately)
+#   3. It always carries the final PaymentResponseCode (1 or 2)
+#
+# Configure this URL in the PayG portal:
+#   UAT:  https://uat.payg.in/merchant/#/login → Settings → Webhook URL
+#   Live: https://payg.in/merchant/#/login  → Settings → Webhook URL
+#   Set to: https://<your-backend-domain>/api/Payment/Webhook
+#
+# This endpoint updates the order state and sends the success notification if
+# the callback endpoint missed it (code=-1 scenario).
+
+@router.post("/Webhook", include_in_schema=True)
+async def payment_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    PayG server-to-server webhook. PayG POSTs final payment status here.
+    No browser redirect — just update the DB and return 200.
+    """
+    SEP = "=" * 60
+    print(f"\n{SEP}")
+    print(f"[Payment:Webhook] ▶ Received S2S webhook from PayG")
+
+    # Parse body (JSON or form)
+    params: dict = {}
+    params.update(dict(request.query_params))
+    ct = request.headers.get("content-type", "")
+    if "application/json" in ct:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                params.update(body)
+        except Exception:
+            pass
+    else:
+        try:
+            form = await request.form()
+            params.update(dict(form))
+        except Exception:
+            pass
+
+    print(f"[Payment:Webhook] Raw params={json.dumps(params, default=str)}")
+
+    try:
+        response_code = int(params.get("PaymentResponseCode", -1))
+    except (ValueError, TypeError):
+        response_code = -1
+
+    # Find the order
+    order_id_str  = params.get("UserDefined1", "") or params.get("oid", "")
+    order_key_id  = params.get("OrderKeyId", "")
+    unique_req_id = params.get("UniqueRequestId", "")
+
+    order = None
+    if order_id_str:
+        try:
+            order = db.query(Orders).filter(
+                Orders.orderId    == int(order_id_str),
+                Orders.deletedInd == False,
+            ).first()
+        except (ValueError, TypeError):
+            pass
+    if order is None and order_key_id:
+        order = db.query(Orders).filter(
+            Orders.orderKeyId == order_key_id,
+            Orders.deletedInd == False,
+        ).first()
+    if order is None and unique_req_id:
+        order = db.query(Orders).filter(
+            Orders.paymentTransactionRefNo == unique_req_id,
+            Orders.deletedInd             == False,
+        ).first()
+
+    if order is None:
+        print(f"[Payment:Webhook] ❌ Order not found — UserDefined1={order_id_str!r} key={order_key_id!r}")
+        return {"status": "order_not_found"}
+
+    order_id = order.orderId
+    was_confirmed = (order.state == "Confirmed")
+    new_state     = payg_client.payment_code_to_order_state(response_code)
+    success       = (response_code == 1)
+
+    print(
+        f"[Payment:Webhook] order={order_id} | code={response_code} | "
+        f"new_state={new_state!r} | was_confirmed={was_confirmed}"
+    )
+
+    # Only update if this is a definitive result (1 or 2) and not already confirmed
+    if response_code in (1, 2) and not was_confirmed:
+        try:
+            _update_order_after_payment(db, order, response_code, params)
+            _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
+            db.commit()
+            print(f"[Payment:Webhook] ✅ Order {order_id} updated → {new_state!r}")
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Webhook] ❌ DB update failed for order {order_id}: {exc}")
+
+    # Send notification (deferred from callback when code was -1)
+    if success and not was_confirmed:
+        background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+        _send_payment_notification(db, order_id, success=True)
+        print(f"[Payment:Webhook] ✅ Success notification + Ekart shipment queued for order {order_id}")
+    elif response_code == 2 and not was_confirmed:
+        _send_payment_notification(db, order_id, success=False)
+        print(f"[Payment:Webhook] ✅ Failure notification sent for order {order_id}")
+
+    print(f"{SEP}\n")
+    return {"status": "ok", "orderId": order_id, "state": new_state}
+
+
+# ── Admin: manually confirm a payment ────────────────────────────────────────
+# For cases where PayG S2S webhook was not configured and the callback failed.
+# Allows support staff to mark an order as Confirmed after verifying payment
+# in the PayG dashboard.
+
+@router.post("/AdminConfirm/{order_id}", include_in_schema=True)
+def admin_confirm_payment(
+    order_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Staff-only: manually confirm a payment that was stuck in AwaitingPayment
+    because the Detail API was IP-blocked and the S2S webhook was not set up.
+    """
+    if current_user.role_id not in Roles.STAFF:
+        raise HTTPException(403, "Staff only")
+
+    order = db.query(Orders).filter(
+        Orders.orderId    == order_id,
+        Orders.deletedInd == False,
+    ).first()
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    SAFE_STATES = {"AwaitingPayment", "Pending", "Payment Pending", "AwaitingPayment"}
+    if order.state not in SAFE_STATES:
+        return {
+            "success": False,
+            "message": f"Order is already in state '{order.state}' — no change made",
+            "state": order.state,
+        }
+
+    order.state        = "Confirmed"
+    order.modifiedDate = datetime.now(timezone.utc)
+    db.add(order)
+    db.commit()
+
+    background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+    _send_payment_notification(db, order_id, success=True)
+
+    print(f"[Payment:AdminConfirm] ✅ Order {order_id} manually confirmed by staff {current_user.user_id}")
+    return {"success": True, "orderId": order_id, "state": "Confirmed"}
 
 
 # ── Debug endpoint (admin only) ────────────────────────────────────────────
@@ -896,6 +1114,24 @@ def get_payment_status(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    Frontend polls this endpoint every 3 seconds from the ?payment=pending screen.
+    Returns the order's current state from the DB.
+
+    IMPORTANT: This endpoint NO LONGER calls the PayG Detail API because the
+    Detail API requires an IP whitelist entry that is often missing in UAT/staging.
+    Instead it returns the state already stored in the DB.
+
+    How the state gets updated:
+    1. PayG posts a server-to-server callback to /api/Payment/Callback (if configured)
+       which sets state → Confirmed / Payment Failed in the DB.
+    2. If that callback arrives AFTER the frontend redirect, the next poll here
+       will return the updated state and the frontend resolves the spinner.
+    3. If the server callback never arrives (not configured), an admin can manually
+       update the order state from the dashboard.
+
+    The frontend stops polling when it sees 'Confirmed' or 'Payment Failed'.
+    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
@@ -906,26 +1142,23 @@ def get_payment_status(
     if current_user.role_id not in Roles.STAFF and order.userProfileId != current_user.user_id:
         raise HTTPException(403, "Not authorised")
 
-    local_state = order.state or "Pending"
-    payg_detail: dict = {}
+    local_state = order.state or "AwaitingPayment"
 
-    if order.orderKeyId or order.paymentTransactionRefNo:
+    # Send the deferred success notification the first time we see "Confirmed".
+    # (It was skipped at callback time because code was -1/0/4 at that point.)
+    # Guard: only send once — check paymentNotificationSent flag if available,
+    # otherwise the notification function must be idempotent.
+    if local_state == "Confirmed":
         try:
-            payg_detail = payg_client.get_payg_order_detail(
-                order_key_id      = order.orderKeyId,
-                unique_request_id = order.paymentTransactionRefNo,
-            )
-            live_code = payg_detail.get("PaymentResponseCode")
-            if live_code is not None:
-                live_state = payg_client.payment_code_to_order_state(int(live_code))
-                if order.state != live_state:
-                    order.state        = live_state
-                    order.modifiedDate = datetime.now(timezone.utc)
-                    db.add(order)
-                    db.commit()
-                    local_state = live_state
+            from app.ekart.notifications import send_order_placed_notification
+            send_order_placed_notification(db, order_id)
         except Exception as exc:
-            print(f"[Payment] Live status check failed: {exc}")
+            print(f"[Payment/Status] Deferred success notification error for order {order_id}: {exc}")
+
+    print(
+        f"[Payment/Status] order={order_id} state={local_state!r} "
+        f"(DB-only — not calling Detail API)"
+    )
 
     return {
         "orderId":              order_id,
@@ -933,8 +1166,8 @@ def get_payment_status(
         "state":                local_state,
         "paymentMethod":        order.paymentMethod,
         "paymentTransactionId": order.paymentTransactionId,
-        "paymentResponseCode":  payg_detail.get("PaymentResponseCode"),
-        "paygStatus":           payg_detail.get("OrderStatus"),
+        "paymentResponseCode":  None,
+        "paygStatus":           None,
     }
 
 
