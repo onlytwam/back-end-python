@@ -5,6 +5,7 @@ from sqlalchemy import asc, desc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import ProductVariantDetail
+from app.stocklog.models import StockLog
 
 # ── Stock formula helper ──────────────────────────────────────────────────────
 
@@ -173,6 +174,28 @@ def create_variant_detail(db: Session, data) -> int:
     except Exception:
         pass
 
+    # ── Auto-create initial StockLog entry ───────────────────────────────────
+    try:
+        log_entry = StockLog(
+            productVariantDetailId = pvd.productVariantDetailId,
+            productId              = pvd.productId,
+            productVariantId       = pvd.productVariantId,
+            stockId                = pvd.stockId,
+            changeType             = "INITIAL_STOCK",
+            previousValue          = None,
+            newValue               = pvd.stockQuantity or 0,
+            totalStock             = pvd.stockQuantity or 0,
+            processedQuantity      = pvd.processedQuantity or 0,
+            returnedQuantity       = pvd.returnedQuantity or 0,
+            availableQuantity      = pvd.availableQuantity or 0,
+            note                   = "Created with product variant detail",
+            changedBy              = getattr(data, "createdBy", None) or "system",
+        )
+        db.add(log_entry)
+        db.commit()
+    except Exception:
+        pass  # Never block product creation if stock log fails
+
     return pvd.productVariantDetailId
 
 
@@ -192,6 +215,11 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
     ).first()
     if not pvd:
         return None
+
+    # Snapshot BEFORE changes for stock log diff
+    prev_stock     = pvd.stockQuantity     or 0
+    prev_processed = pvd.processedQuantity or 0
+    prev_returned  = pvd.returnedQuantity  or 0
 
     # Price / meta fields — apply only when provided
     simple_fields = {
@@ -236,6 +264,38 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         db.commit()
     except Exception:
         pass
+
+    # ── Auto-create StockLog entries for any changed stock fields ────────────
+    try:
+        stock_changes = []
+        if data.stockQuantity is not None and data.stockQuantity != prev_stock:
+            stock_changes.append(("TOTAL_STOCK", prev_stock, pvd.stockQuantity or 0))
+        if data.processedQuantity is not None and data.processedQuantity != prev_processed:
+            stock_changes.append(("PROCESSED", prev_processed, pvd.processedQuantity or 0))
+        if data.returnedQuantity is not None and data.returnedQuantity != prev_returned:
+            stock_changes.append(("RETURNED", prev_returned, pvd.returnedQuantity or 0))
+
+        for change_type, prev_val, new_val in stock_changes:
+            log_entry = StockLog(
+                productVariantDetailId = pvd_id,
+                productId              = pvd.productId,
+                productVariantId       = pvd.productVariantId,
+                stockId                = pvd.stockId,
+                changeType             = change_type,
+                previousValue          = prev_val,
+                newValue               = new_val,
+                totalStock             = pvd.stockQuantity or 0,
+                processedQuantity      = pvd.processedQuantity or 0,
+                returnedQuantity       = pvd.returnedQuantity or 0,
+                availableQuantity      = pvd.availableQuantity or 0,
+                note                   = "Updated via product variant detail",
+                changedBy              = getattr(data, "modifiedBy", None) or "system",
+            )
+            db.add(log_entry)
+        if stock_changes:
+            db.commit()
+    except Exception:
+        pass  # Never block product update if stock log fails
 
     return pvd_id
 
@@ -329,4 +389,138 @@ def get_user_product_detail(db: Session, pvd_id: int) -> Optional[dict]:
         # Expose available (not total) stock to the storefront
         "stockQuantity":          pvd.availableQuantity,
         "processedQuantity":      pvd.processedQuantity,
+    }
+
+# ── Admin: full size palette for a variant ────────────────────────────────────
+
+def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
+    """
+    Returns every MDM band size and cup size together with their PVD data
+    for the given variant. Used by the admin product detail size palette.
+
+    Band sizes:  all rows from mdm.Size WHERE isCupSize IS NOT TRUE,
+                 filtered to the SizeType the variant actually uses
+                 (alphabetical | numerical). Falls back to all sizes.
+    Cup sizes:   all rows from mdm.CupSize (always shown when isCupSize=true).
+    For each MDM size, pvd data is embedded when a matching PVD row exists.
+    """
+
+    # ── Fetch all PVDs for this variant ──────────────────────────────────────
+    pvds = db.query(ProductVariantDetail).filter(
+        ProductVariantDetail.productVariantId == product_variant_id,
+        ProductVariantDetail.deletedInd == False,
+    ).all()
+
+    variant_size_ids = {p.sizeId for p in pvds if p.sizeId}
+    variant_cup_ids  = {p.cupSizeId for p in pvds if p.cupSizeId}
+    has_cup_size     = bool(variant_cup_ids)
+
+    # ── Load ALL MDM band sizes (both alphabetical and numerical) ────────────
+    # We intentionally do NOT filter by SizeType so that the admin palette
+    # always shows every band size regardless of what sizes are already added.
+    all_band_rows = db.execute(text("""
+        SELECT "SizeId", "SizeLabel", "SizeCode", "SizeType", "OrderNo"
+        FROM mdm."Size"
+        WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
+          AND ("IsActive" = true OR "IsActive" IS NULL)
+          AND ("IsCupSize" IS NULL OR "IsCupSize" = false)
+        ORDER BY "SizeType" NULLS LAST, "OrderNo" NULLS LAST, "SizeId"
+    """)).fetchall()
+
+    # ── Load all MDM cup sizes ───────────────────────────────────────────────
+    all_cup_rows = db.execute(text("""
+        SELECT "CupSizeId", "SizeLabel"
+        FROM mdm."CupSize"
+        WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
+          AND ("IsActive" = true OR "IsActive" IS NULL)
+        ORDER BY "CupSizeId"
+    """)).fetchall()
+
+    # ── Index PVDs by sizeId and cupSizeId ───────────────────────────────────
+    def _pvd_dict(p: ProductVariantDetail) -> dict:
+        total     = p.stockQuantity     or 0
+        processed = p.processedQuantity or 0
+        refunded  = p.returnedQuantity  or 0
+        available = p.availableQuantity if p.availableQuantity is not None \
+                    else max(0, total - processed + refunded)
+        return {
+            "productVariantDetailId": p.productVariantDetailId,
+            "productId":              p.productId,
+            "productVariantId":       p.productVariantId,
+            "sizeId":                 p.sizeId,
+            "cupSizeId":              p.cupSizeId,
+            "stockQuantity":          total,
+            "processedQuantity":      processed,
+            "returnedQuantity":       refunded,
+            "availableQuantity":      available,
+            "mrpPrice":               float(p.mrpPrice)        if p.mrpPrice        else 0,
+            "discountPercent":        float(p.discountPercent) if p.discountPercent else 0,
+            "finalPrice":             float(p.finalPrice)      if p.finalPrice      else 0,
+            "cgst":                   float(p.cgst)            if p.cgst            else 0,
+            "sgst":                   float(p.sgst)            if p.sgst            else 0,
+            "isActive":               p.isActive,
+        }
+
+    # Index PVDs for band sizes — include even when cupSizeId is also set
+    # (bra PVDs have both sizeId=band AND cupSizeId=cup, e.g. 34D)
+    pvd_by_size_list: dict[int, list] = {}
+    pvd_by_cup: dict[int, list] = {}
+    for p in pvds:
+        if p.sizeId:
+            pvd_by_size_list.setdefault(p.sizeId, []).append(_pvd_dict(p))
+        if p.cupSizeId:
+            pvd_by_cup.setdefault(p.cupSizeId, []).append(_pvd_dict(p))
+
+    # Aggregate stock across all cup-size combos for each band size
+    pvd_by_size: dict[int, dict] = {}
+    for size_id, pvd_list in pvd_by_size_list.items():
+        if len(pvd_list) == 1:
+            pvd_by_size[size_id] = pvd_list[0]
+        else:
+            base = dict(pvd_list[0])
+            base["stockQuantity"]    = sum(p["stockQuantity"]    for p in pvd_list)
+            base["processedQuantity"]= sum(p["processedQuantity"] for p in pvd_list)
+            base["returnedQuantity"] = sum(p["returnedQuantity"]  for p in pvd_list)
+            base["availableQuantity"]= sum(p["availableQuantity"] for p in pvd_list)
+            base["isAggregate"]      = True
+            base["pvdCount"]         = len(pvd_list)
+            pvd_by_size[size_id]     = base
+
+    # ── Build response ────────────────────────────────────────────────────────
+    band_sizes = [
+        {
+            "sizeId":    r[0],
+            "sizeLabel": r[1],
+            "sizeCode":  r[2],
+            "sizeType":  r[3],
+            "orderNo":   r[4],
+            "inVariant": r[0] in variant_size_ids,
+            "pvd":       pvd_by_size.get(r[0]),
+        }
+        for r in all_band_rows
+    ]
+
+    cup_sizes = [
+        {
+            "cupSizeId": r[0],
+            "sizeLabel": r[1],
+            "inVariant": r[0] in variant_cup_ids,
+            "pvds":      pvd_by_cup.get(r[0], []),
+        }
+        for r in all_cup_rows
+    ]
+
+    # ── Group band sizes by SizeType for easier frontend rendering ───────────
+    from collections import defaultdict
+    band_sizes_by_type: dict = defaultdict(list)
+    for s in band_sizes:
+        key = s["sizeType"] or "other"
+        band_sizes_by_type[key].append(s)
+
+    return {
+        "productVariantId": product_variant_id,
+        "hasCupSize":       has_cup_size,
+        "bandSizes":        band_sizes,
+        "bandSizesByType":  dict(band_sizes_by_type),
+        "cupSizes":         cup_sizes,
     }

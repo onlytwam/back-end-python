@@ -101,13 +101,16 @@ def delete_variant(variant_id: int, db: Session = Depends(get_db)):
 @router.patch("/{variant_id}/toggle-active", dependencies=[Depends(get_current_user)])
 def toggle_variant_active(variant_id: int, db: Session = Depends(get_db)):
     from datetime import datetime, timezone
+    from sqlalchemy import or_
     v = db.query(ProductVariant).filter(
         ProductVariant.productVariantId == variant_id,
-        ProductVariant.deletedInd == False,
+        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd.is_(None)),
     ).first()
     if not v:
         raise HTTPException(status_code=404, detail="Variant not found.")
-    new_state      = not bool(v.isActive)
+    # Treat NULL isActive as True (active), then toggle to False
+    current_state  = v.isActive if v.isActive is not None else True
+    new_state      = not current_state
     v.isActive     = new_state
     v.modifiedDate = datetime.now(timezone.utc)
     db.commit()
@@ -246,5 +249,3 @@ def delete_variant_image(
     db.commit()
 
     return {"deleted": image_id}
-
-
