@@ -39,5 +39,3 @@ class ProductVariantDetail(Base):
     modifiedDate           = Column("ModifiedDate",           DateTime(timezone=True), onupdate=func.now(), nullable=True)
     isActive               = Column("IsActive",               Boolean,    default=True)
     deletedInd             = Column("DeletedInd",             Boolean,    default=False)
-    purchasePrice          = Column("PurchasePrice", Integer, nullable=True)
-    storeId                = Column("StoreId", BigInteger, nullable=True)

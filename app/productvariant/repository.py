@@ -335,6 +335,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
         LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
+          AND (pv."IsActive" = true OR pv."IsActive" IS NULL)
           AND {where}
         LIMIT 1
     """
@@ -466,7 +467,9 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
                AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
              LIMIT 1) AS image
         FROM twam."ProductVariants" pv2
-        WHERE pv2."ProductId" = :pid AND (pv2."DeletedInd" = false OR pv2."DeletedInd" IS NULL)
+        WHERE pv2."ProductId" = :pid
+          AND (pv2."DeletedInd" = false OR pv2."DeletedInd" IS NULL)
+          AND (pv2."IsActive" = true OR pv2."IsActive" IS NULL)
     """), {"pid": prod_id, "base": BASE_URL}).fetchall()
 
     return {
@@ -555,6 +558,11 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
     conds = [
         "(pv.\"DeletedInd\" = false OR pv.\"DeletedInd\" IS NULL)",
         "(p.\"DeletedInd\"  = false OR p.\"DeletedInd\"  IS NULL)",
+        # Hide variants that have been hidden by admin (isActive = false).
+        # NULL isActive is treated as active (visible).
+        "(pv.\"IsActive\" = true OR pv.\"IsActive\" IS NULL)",
+        # Hide products that have been deactivated (hidden) by admin.
+        "(p.\"IsActive\" = true OR p.\"IsActive\" IS NULL)",
         # Hide products whose parent category has been deleted or made inactive.
         # pc is LEFT JOINed so if CategoryId is NULL we allow it through.
         "(p.\"CategoryId\" IS NULL OR (pc.\"DeletedInd\" = false AND pc.\"IsActive\" = true))",
@@ -955,6 +963,7 @@ def get_new_arrivals(
     where = """
         (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
         AND (p."DeletedInd"  = false OR p."DeletedInd"  IS NULL)
+        AND (pv."IsActive" = true OR pv."IsActive" IS NULL)
         AND pv."CreatedDate" >= NOW() - INTERVAL '6 months'
         AND (p."CategoryId" IS NULL OR (pc."DeletedInd" = false AND pc."IsActive" = true))
         AND (p."ChildCategoryId" IS NULL OR (cc."DeletedInd" = false AND cc."IsActive" = true))

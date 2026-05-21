@@ -118,6 +118,15 @@ def get_user_product_detail(pvd_id: int, db: Session = Depends(get_db)):
 # ADMIN endpoints — require login — defined AFTER all specific public routes
 # ─────────────────────────────────────────────────────────────────────────────
 
+@router.get("/AdminSizePalette/{variant_id}", dependencies=[Depends(get_current_user)])
+def get_admin_size_palette(variant_id: int, db: Session = Depends(get_db)):
+    """
+    Returns all MDM band sizes and cup sizes with embedded PVD data for the
+    given variant. Used by the admin product detail size palette component.
+    """
+    return repository.get_admin_size_palette(db, variant_id)
+
+
 @router.get("", response_model=schemas.ProductVariantDetailListResponse,
             dependencies=[Depends(get_current_user)])
 def get_variant_details(
