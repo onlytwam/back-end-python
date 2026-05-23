@@ -5,6 +5,7 @@ trigger:
       - backend-setup/Vishnu
       - feature/*
       - backend/v2/Mamatha
+      - feature/Eshwar
 
 pr:
   branches:
