@@ -74,6 +74,22 @@ def get_variant(variant_id: int, db: Session = Depends(get_db)):
 @router.post("", status_code=201)
 def create_variant(command: schemas.ProductVariantCreate, db: Session = Depends(get_db)):
     new_id = repository.create_variant(db, command)
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        add_event(
+            db,
+            product_id         = getattr(command, "productId", 0),
+            product_variant_id = new_id,
+            event_type         = "VARIANT_ADDED",
+            event_source       = "ProductDetail",
+            description        = f"Variant added: {getattr(command, 'variantName', '') or ''} [{getattr(command, 'color', '') or ''}]",
+            changed_by         = getattr(command, "createdBy", None) or "Admin",
+            product_code       = getattr(command, "productCode", None),
+            variant_name       = getattr(command, "variantName", None),
+        )
+    except Exception:
+        pass
     return {"productVariantId": new_id}
 
 
@@ -87,9 +103,30 @@ def update_variant(variant_id: int, command: schemas.ProductVariantUpdate, db: S
 
 @router.delete("/{variant_id}", status_code=204)
 def delete_variant(variant_id: int, db: Session = Depends(get_db)):
+    # Snapshot before deletion for audit log
+    variant_snap = None
+    try:
+        variant_snap = repository.get_variant_by_id(db, variant_id)
+    except Exception:
+        pass
     result = repository.delete_variant(db, variant_id)
     if not result:
         raise HTTPException(status_code=404, detail="ProductVariant not found.")
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        add_event(
+            db,
+            product_id         = variant_snap.get("productId", 0) if variant_snap else 0,
+            product_variant_id = variant_id,
+            event_type         = "VARIANT_DELETED",
+            event_source       = "ProductDetail",
+            description        = f"Variant deleted: {variant_snap.get('variantName','') if variant_snap else ''} [ID {variant_id}]",
+            changed_by         = "Admin",
+            variant_name       = variant_snap.get("variantName") if variant_snap else None,
+        )
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────

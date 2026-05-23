@@ -1,10 +1,6 @@
 # Stock Log module — add to main.py:
 #   from app.stocklog.router import router as stocklog_router
 #   app.include_router(stocklog_router)
-#
-# No SQL migration needed — Base.metadata.create_all creates twam."StockLog"
-# automatically on first startup once this module is imported.
-# The new StockId column IS added via Alembic / ALTER TABLE — see migration note below.
 
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -33,6 +29,12 @@ def list_variants(product_id: int, db: Session = Depends(get_db)):
 
 @router.get("/pvds/{variant_id}", dependencies=[Depends(get_current_user)])
 def list_pvds(variant_id: int, db: Session = Depends(get_db)):
+    """
+    Returns PVDs for a variant.
+    Automatically runs DB-change detection on each PVD.
+    Each item has a `dbChangeAlert: bool` field — when true the admin
+    should be notified that a direct database change was detected.
+    """
     return repository.get_pvds_for_variant(db, variant_id)
 
 
@@ -42,6 +44,11 @@ def get_logs(
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
+    """
+    Returns the stock change history for a PVD.
+    INITIAL_STOCK entries are included in the raw log but excluded from
+    the history UI on the frontend (they are system bootstrap entries).
+    """
     logs = repository.get_logs_for_pvd(db, pvd_id, limit=limit)
     return [
         {
@@ -69,6 +76,10 @@ def update_stock(
     body: schemas.StockUpdateRequest,
     db: Session = Depends(get_db),
 ):
+    """
+    The ONLY authoritative endpoint for manual stock changes.
+    All changes are logged with changedBy='Admin' (or the value in body.changedBy).
+    """
     result = repository.update_stock_with_log(
         db,
         pvd_id=pvd_id,
@@ -76,22 +87,68 @@ def update_stock(
         processed_quantity=body.processedQuantity,
         returned_quantity=body.returnedQuantity,
         note=body.note,
-        changed_by=body.changedBy,
+        changed_by=body.changedBy or "Admin",
     )
     if result is None:
         raise HTTPException(404, "ProductVariantDetail not found.")
     return result
 
 
+@router.post("/auto-seed", dependencies=[Depends(get_current_user)])
+def auto_seed_stock_logs(db: Session = Depends(get_db)):
+    """
+    Called automatically when the Stock Page loads.
+    Seeds StockLog with INITIAL_STOCK entries for any PVD that has no log yet.
+    INITIAL_STOCK entries are system bootstrap entries — they are NOT shown
+    in the history UI. Safe to call multiple times.
+    """
+    result = repository.backfill_initial_stock(db)
+    return {
+        "seeded":  result["seeded"],
+        "skipped": result["skipped"],
+        "total":   result["total"],
+    }
+
+
 @router.post("/backfill", dependencies=[Depends(get_current_user)])
 def backfill_stock_logs(db: Session = Depends(get_db)):
     """
-    One-time backfill: seeds StockLog with INITIAL_STOCK entries for every
-    existing ProductVariantDetail that has no log yet.
-    Safe to call multiple times — already-logged PVDs are skipped.
+    Legacy endpoint — kept for backwards compatibility.
+    Delegates to auto-seed logic.
     """
     result = repository.backfill_initial_stock(db)
     return {
         "message": f"Backfill complete. Seeded {result['seeded']} entries, skipped {result['skipped']} already-logged.",
         **result,
     }
+
+
+# ─── Product Audit History endpoints (folded into /api/StockLog) ──────────────
+
+@router.get("/product-history/{product_id}", dependencies=[Depends(get_current_user)])
+def get_product_audit_history(
+    product_id: int,
+    limit: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """
+    Full chronological event history for one product.
+    Covers: product created/deleted, variants added/deleted,
+    sizes added/deleted, stock changes. Newest first.
+    Frontend: GET /api/StockLog/product-history/{productId}
+    """
+    return repository.get_product_audit_history(db, product_id, limit=limit)
+
+
+@router.get("/all-history", dependencies=[Depends(get_current_user)])
+def get_all_audit_history(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Paginated global product lifecycle history across all products.
+    Used by the 📋 History button in the Stock Management page header.
+    Frontend: GET /api/StockLog/all-history
+    """
+    return repository.get_all_audit_history(db, page=page, size=size)
