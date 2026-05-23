@@ -197,60 +197,6 @@ def detect_and_log_db_changes(db: Session, pvd: ProductVariantDetail) -> bool:
 
 # ─── Backfill: seed StockLog from existing ProductVariantDetail rows ──────────
 
-def backfill_initial_stock(db: Session) -> dict:
-    """
-    For every active ProductVariantDetail that has NO entry in StockLog yet,
-    insert a single INITIAL_STOCK log row using the current stock values.
-    Skips PVDs that already have at least one log entry.
-    Returns counts: { seeded, skipped, total }.
-    Called automatically when the Stock Page loads — not shown in history UI.
-    """
-    pvds: List[ProductVariantDetail] = db.query(ProductVariantDetail).filter(
-        ProductVariantDetail.deletedInd == False,
-    ).all()
-
-    # Collect PVD IDs that already have at least one log
-    existing_pvd_ids: set = set()
-    logged_ids = db.execute(
-        text('SELECT DISTINCT "ProductVariantDetailId" FROM twam."StockLog"')
-    ).fetchall()
-    for row in logged_ids:
-        existing_pvd_ids.add(row[0])
-
-    seeded  = 0
-    skipped = 0
-
-    for pvd in pvds:
-        if pvd.productVariantDetailId in existing_pvd_ids:
-            skipped += 1
-            continue
-
-        total     = pvd.stockQuantity     or 0
-        processed = pvd.processedQuantity or 0
-        returned  = pvd.returnedQuantity  or 0
-        available = pvd.availableQuantity if pvd.availableQuantity is not None \
-                    else max(0, total - processed + returned)
-
-        log_entry = StockLog(
-            productVariantDetailId = pvd.productVariantDetailId,
-            productId              = pvd.productId,
-            productVariantId       = pvd.productVariantId,
-            stockId                = pvd.stockId,
-            changeType             = "INITIAL_STOCK",
-            previousValue          = None,
-            newValue               = total,
-            totalStock             = total,
-            processedQuantity      = processed,
-            returnedQuantity       = returned,
-            availableQuantity      = available,
-            note                   = "Auto-seeded from existing ProductVariantDetail data",
-            changedBy              = "system",
-        )
-        db.add(log_entry)
-        seeded += 1
-
-    db.commit()
-    return {"seeded": seeded, "skipped": skipped, "total": len(pvds)}
 
 
 # ─── Stock summary (used by admin stock page) ─────────────────────────────────
@@ -711,16 +657,29 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
             "createdDate":           r.createdDate.isoformat() if r.createdDate else None,
         })
 
-    # Serialize stock events
+    # Serialize stock events — skip INITIAL_STOCK (seeded bootstrap data)
     for r in stock_rows:
+        # Skip auto-seeded initial stock entries — not meaningful history
+        if r["ChangeType"] == "INITIAL_STOCK":
+            continue
+
         size_parts = [r["size_label"], r["cup_size_label"]]
         size_display = " / ".join(p for p in size_parts if p) or None
         variant_display = r["VariantName"] or None
 
+        # DB_CHANGE — treat as an Admin stock correction, not a system alert
+        change_type = r["ChangeType"]
+        changed_by  = r["ChangedBy"]
+        note        = r["Note"]
+        if change_type == "DB_CHANGE":
+            change_type = "TOTAL_STOCK"
+            changed_by  = changed_by if (changed_by and changed_by not in ("db_direct", "system")) else "Admin"
+            note        = (note or "").replace("⚠️ Direct DB change detected:", "Stock corrected:").strip() or "Stock corrected"
+
         events.append({
             "eventId":               f"stock-{r['StockLogId']}",
             "eventCategory":         "stock",
-            "eventType":             r["ChangeType"],
+            "eventType":             change_type,
             "productId":             r["ProductId"],
             "productVariantId":      r["ProductVariantId"],
             "productVariantDetailId":r["ProductVariantDetailId"],
@@ -729,9 +688,9 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
             "variantName":           variant_display,
             "sizeLabel":             size_display,
             "stockId":               r["StockId"],
-            "description":           r["Note"] or r["ChangeType"],
-            "changedBy":             r["ChangedBy"],
-            "eventSource":           r["ChangedBy"],
+            "description":           note or change_type,
+            "changedBy":             changed_by,
+            "eventSource":           changed_by,
             "stockBefore":           r["PreviousValue"],
             "stockAfter":            r["NewValue"],
             "changeType":            r["ChangeType"],
@@ -744,6 +703,28 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
             "note":                  r["Note"],
             "createdDate":           r["CreatedDate"].isoformat() if r["CreatedDate"] else None,
         })
+
+    # ─── 6. Role lookup — enrich every event with the changedBy user role ──────
+    unique_users = list({e["changedBy"] for e in events if e.get("changedBy") and e["changedBy"] not in ("system", "db_direct", "Admin", "order_system")})
+    role_map: dict = {}
+    if unique_users:
+        in_params = {f"u{i}": v for i, v in enumerate(unique_users)}
+        in_clause = ", ".join(f":u{i}" for i in range(len(unique_users)))
+        role_rows = db.execute(text(f"""
+            SELECT iu."UserName", ur."RoleName"
+            FROM twam."IdentityUser" iu
+            LEFT JOIN twam."UserRole" ur ON ur."UserRoleId" = iu."UserRoleId"
+            WHERE iu."UserName" IN ({in_clause})
+        """), in_params).fetchall()
+        for username, rolename in role_rows:
+            role_map[username] = rolename or "Admin"
+    role_map["system"]       = "System"
+    role_map["db_direct"]    = "Direct DB"
+    role_map["Admin"]        = "Admin"
+    role_map["order_system"] = "Order System"
+    for e in events:
+        cb = e.get("changedBy") or ""
+        e["role"] = role_map.get(cb, "")
 
     events.sort(key=lambda x: x["createdDate"] or "", reverse=True)
     return events[:limit]
@@ -877,3 +858,156 @@ def _serialize_audit(r: "_PAL") -> dict:
         "stockId":                r.stockId,
         "createdDate":            r.createdDate.isoformat() if r.createdDate else None,
     }
+
+
+def get_product_directory(db: Session, page: int = 1, size: int = 50, search: str = "") -> dict:
+    """
+    Product Directory for the global History modal.
+    Returns each product with:
+      - name, code, image
+      - creation: date, day, time, by (username + role)
+      - modifications: list of {date, what changed (VARIANT_ADDED/VARIANT_DETAIL_MODIFIED/etc), changedBy}
+    Only PRODUCT_CREATED, VARIANT_ADDED, VARIANT_DELETED, SIZE_ADDED, SIZE_DELETED from
+    ProductAuditLog count as "modifications" (not stock changes).
+    """
+    from sqlalchemy import text
+
+    offset = (page - 1) * size
+
+    search_clause = ""
+    params: dict = {"lim": size, "off": offset}
+    if search.strip():
+        search_clause = """
+            AND (
+                p."Name"        ILIKE :q
+                OR p."ProductCode" ILIKE :q
+            )
+        """
+        params["q"] = f"%{search.strip()}%"
+
+    count_sql = text(f"""
+        SELECT COUNT(*) FROM twam."Products" p
+        WHERE (p."DeletedInd" IS DISTINCT FROM TRUE)
+        {search_clause}
+    """)
+    total = db.execute(count_sql, params).scalar() or 0
+
+    product_sql = text(f"""
+        SELECT
+            p."ProductId",
+            p."Name",
+            p."ProductCode",
+            p."CreatedDate",
+            p."CreatedBy",
+            (
+                SELECT pi."FilePath"
+                FROM twam."ProductImage" pi
+                WHERE pi."ProductId" = p."ProductId"
+                  AND (pi."DeletedInd" IS DISTINCT FROM TRUE)
+                  AND pi."FilePath" IS NOT NULL
+                ORDER BY pi."ProductImageId" ASC
+                LIMIT 1
+            ) AS image
+        FROM twam."Products" p
+        WHERE (p."DeletedInd" IS DISTINCT FROM TRUE)
+        {search_clause}
+        ORDER BY p."CreatedDate" DESC NULLS LAST
+        LIMIT :lim OFFSET :off
+    """)
+    products = db.execute(product_sql, params).fetchall()
+
+    if not products:
+        return {"items": [], "total": total, "page": page, "size": size}
+
+    product_ids = [r[0] for r in products]
+
+    # Fetch creator role info: join IdentityUser -> UserRole
+    creator_usernames = list({r[4] for r in products if r[4]})
+    role_map: dict = {}
+    if creator_usernames:
+        # Build parameterized IN clause
+        in_params = {f"u{i}": v for i, v in enumerate(creator_usernames)}
+        in_clause = ", ".join(f":u{i}" for i in range(len(creator_usernames)))
+        role_sql = text(f"""
+            SELECT iu."UserName", ur."RoleName"
+            FROM twam."IdentityUser" iu
+            LEFT JOIN twam."UserRole" ur ON ur."UserRoleId" = iu."UserRoleId"
+            WHERE iu."UserName" IN ({in_clause})
+        """)
+        role_rows = db.execute(role_sql, in_params).fetchall()
+        for username, rolename in role_rows:
+            role_map[username] = rolename or "Admin"
+
+    # Fetch modifications from ProductAuditLog (structural events only, not stock)
+    structural_types = (
+        "PRODUCT_UPDATED",
+        "VARIANT_ADDED", "VARIANT_DELETED",
+        "SIZE_ADDED", "SIZE_DELETED",
+    )
+    if product_ids:
+        in_pids = {f"p{i}": v for i, v in enumerate(product_ids)}
+        in_clause2 = ", ".join(f":p{i}" for i in range(len(product_ids)))
+        in_types = {f"t{i}": v for i, v in enumerate(structural_types)}
+        in_clause3 = ", ".join(f":t{i}" for i in range(len(structural_types)))
+
+        mod_sql = text(f"""
+            SELECT
+                pal."ProductId",
+                pal."EventType",
+                pal."ChangedBy",
+                pal."VariantName",
+                pal."SizeLabel",
+                pal."Description",
+                pal."CreatedDate"
+            FROM twam."ProductAuditLog" pal
+            WHERE pal."ProductId" IN ({in_clause2})
+              AND pal."EventType" IN ({in_clause3})
+            ORDER BY pal."CreatedDate" DESC NULLS LAST
+        """)
+        mod_params = {**in_pids, **in_types}
+        mod_rows = db.execute(mod_sql, mod_params).fetchall()
+    else:
+        mod_rows = []
+
+    # Group modifications by product
+    from collections import defaultdict
+    mods_by_product: dict = defaultdict(list)
+    for pid, etype, changed_by, variant_name, size_label, description, created_date in mod_rows:
+        # Human-friendly label
+        label_map = {
+            "PRODUCT_UPDATED":  "Product details modified",
+            "VARIANT_ADDED":    "Variant added",
+            "VARIANT_DELETED":  "Variant deleted",
+            "SIZE_ADDED":       "Variant detail added",
+            "SIZE_DELETED":     "Variant detail deleted",
+        }
+        label = label_map.get(etype, etype.replace("_", " ").title())
+        context = ""
+        if variant_name:
+            context = variant_name
+            if size_label:
+                context += f" / {size_label}"
+        mods_by_product[pid].append({
+            "eventType":   etype,
+            "label":       label,
+            "context":     context,
+            "changedBy":   changed_by,
+            "role":        role_map.get(changed_by, ""),
+            "createdDate": created_date.isoformat() if created_date else None,
+        })
+
+    items = []
+    for row in products:
+        pid, name, code, created_date, created_by, image = row
+        items.append({
+            "productId":     pid,
+            "productName":   name,
+            "productCode":   code,
+            "image":         image,
+            "createdDate":   created_date.isoformat() if created_date else None,
+            "createdBy":     created_by,
+            "createdByRole": role_map.get(created_by or "", ""),
+            "modifications": mods_by_product.get(pid, []),
+        })
+
+    return {"items": items, "total": total, "page": page, "size": size}

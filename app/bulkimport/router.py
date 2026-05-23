@@ -1997,23 +1997,85 @@ async def import_product_bulk(
     inserted_products = inserted_variants = inserted_details = 0
     runtime_dup_warnings: list[dict] = []
 
+    # Import audit helper once — safe even if stocklog module is unavailable
+    try:
+        from app.stocklog.repository import add_audit_event as _add_audit
+    except Exception:
+        _add_audit = None
+
+    _bulk_actor = getattr(current_user, "username", None) or getattr(current_user, "user_name", None) or "BulkUpload"
+
     try:
         for pcode, chain in chains.items():
             product_id = _pb_insert_product(db, chain["rec"])
             inserted_products += 1
 
+            # Audit: product created via bulk upload
+            if _add_audit:
+                try:
+                    _add_audit(
+                        db,
+                        product_id   = product_id,
+                        event_type   = "PRODUCT_CREATED",
+                        event_source = "BulkUpload",
+                        description  = f"Product created via bulk upload: {chain['rec'].get('name', '')} [{chain['rec'].get('productCode', '')}]",
+                        changed_by   = _bulk_actor,
+                        product_code = chain["rec"].get("productCode"),
+                        product_name = chain["rec"].get("name"),
+                    )
+                except Exception:
+                    pass
+
             for var in chain["variants"]:
                 variant_id = _pb_insert_variant(db, var["rec"], product_id)
                 inserted_variants += 1
+
+                # Audit: variant created via bulk upload
+                if _add_audit:
+                    try:
+                        _add_audit(
+                            db,
+                            product_id         = product_id,
+                            product_variant_id = variant_id,
+                            event_type         = "VARIANT_ADDED",
+                            event_source       = "BulkUpload",
+                            description        = f"Variant added via bulk upload: {var['rec'].get('variantName', '')} [{var['rec'].get('color', '')}]",
+                            changed_by         = _bulk_actor,
+                            product_code       = var["rec"].get("variantCode") or chain["rec"].get("productCode"),
+                            variant_name       = var["rec"].get("variantName"),
+                        )
+                    except Exception:
+                        pass
 
                 for slot in var["slots"]:
                     # Use SAVEPOINT so only THIS slot rolls back on duplicate,
                     # not the entire transaction
                     try:
                         sp = db.begin_nested()          # SAVEPOINT
-                        _pb_insert_detail(db, slot, product_id, variant_id, var["rec"]["variantCode"])
+                        pvd_id = _pb_insert_detail(db, slot, product_id, variant_id, var["rec"]["variantCode"])
                         sp.commit()                     # RELEASE SAVEPOINT
                         inserted_details += 1
+
+                        # Audit: PVD (size/detail) created via bulk upload
+                        if _add_audit:
+                            try:
+                                _add_audit(
+                                    db,
+                                    product_id               = product_id,
+                                    product_variant_id       = variant_id,
+                                    product_variant_detail_id = pvd_id,
+                                    event_type               = "SIZE_ADDED",
+                                    event_source             = "BulkUpload",
+                                    description              = f"Size added via bulk upload — stock: {slot.get('availableQuantity', 0)}",
+                                    stock_before             = None,
+                                    stock_after              = slot.get("availableQuantity"),
+                                    changed_by               = _bulk_actor,
+                                    product_code             = var["rec"].get("variantCode"),
+                                    stock_id                 = str(slot["stockId"]) if slot.get("stockId") is not None else None,
+                                )
+                            except Exception:
+                                pass
+
                     except IntegrityError:
                         sp.rollback()                   # rolls back SAVEPOINT only
                         sid = str(slot.get("stockId", "unknown"))
