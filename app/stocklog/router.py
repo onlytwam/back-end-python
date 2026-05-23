@@ -94,34 +94,6 @@ def update_stock(
     return result
 
 
-@router.post("/auto-seed", dependencies=[Depends(get_current_user)])
-def auto_seed_stock_logs(db: Session = Depends(get_db)):
-    """
-    Called automatically when the Stock Page loads.
-    Seeds StockLog with INITIAL_STOCK entries for any PVD that has no log yet.
-    INITIAL_STOCK entries are system bootstrap entries — they are NOT shown
-    in the history UI. Safe to call multiple times.
-    """
-    result = repository.backfill_initial_stock(db)
-    return {
-        "seeded":  result["seeded"],
-        "skipped": result["skipped"],
-        "total":   result["total"],
-    }
-
-
-@router.post("/backfill", dependencies=[Depends(get_current_user)])
-def backfill_stock_logs(db: Session = Depends(get_db)):
-    """
-    Legacy endpoint — kept for backwards compatibility.
-    Delegates to auto-seed logic.
-    """
-    result = repository.backfill_initial_stock(db)
-    return {
-        "message": f"Backfill complete. Seeded {result['seeded']} entries, skipped {result['skipped']} already-logged.",
-        **result,
-    }
-
 
 # ─── Product Audit History endpoints (folded into /api/StockLog) ──────────────
 
@@ -152,3 +124,19 @@ def get_all_audit_history(
     Frontend: GET /api/StockLog/all-history
     """
     return repository.get_all_audit_history(db, page=page, size=size)
+
+
+@router.get("/product-directory", dependencies=[Depends(get_current_user)])
+def get_product_directory(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    search: str = Query(""),
+    db: Session = Depends(get_db),
+):
+    """
+    Product-level history directory for the global History modal.
+    Returns each product with name, code, image, creation info (date + who + role),
+    and a list of structural modifications (variant/size added/deleted/updated).
+    Frontend: GET /api/StockLog/product-directory
+    """
+    return repository.get_product_directory(db, page=page, size=size, search=search)
