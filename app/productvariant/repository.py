@@ -558,11 +558,22 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
     conds = [
         "(pv.\"DeletedInd\" = false OR pv.\"DeletedInd\" IS NULL)",
         "(p.\"DeletedInd\"  = false OR p.\"DeletedInd\"  IS NULL)",
-        # Hide variants that have been hidden by admin (isActive = false).
-        # NULL isActive is treated as active (visible).
+        # Only show the currently selected variant if it is active.
+        # If a specific variant is hidden, skip it — but the product still
+        # appears in the listing if it has OTHER active variants (handled via
+        # the DISTINCT ON logic: only active variants drive the listing rows).
         "(pv.\"IsActive\" = true OR pv.\"IsActive\" IS NULL)",
-        # Hide products that have been deactivated (hidden) by admin.
+        # Hide products that have been deactivated at product level by admin.
         "(p.\"IsActive\" = true OR p.\"IsActive\" IS NULL)",
+        # Ensure the product has AT LEAST ONE active, non-deleted variant.
+        # This prevents a product with ALL hidden variants from disappearing
+        # due to a count-of-zero issue while still being correct.
+        """EXISTS (
+            SELECT 1 FROM twam.\"ProductVariants\" pv2
+            WHERE pv2.\"ProductId\" = p.\"ProductId\"
+              AND (pv2.\"DeletedInd\" = false OR pv2.\"DeletedInd\" IS NULL)
+              AND (pv2.\"IsActive\" = true OR pv2.\"IsActive\" IS NULL)
+        )""",
         # Hide products whose parent category has been deleted or made inactive.
         # pc is LEFT JOINed so if CategoryId is NULL we allow it through.
         "(p.\"CategoryId\" IS NULL OR (pc.\"DeletedInd\" = false AND pc.\"IsActive\" = true))",

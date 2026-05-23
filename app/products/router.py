@@ -1,16 +1,12 @@
 # app/products/router.py
-# FIX: Removed router-level auth that blocked guests from browsing products.
-#      Auth is now per-route on write operations only (POST, PUT, DELETE).
-
 import json
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from database import get_db
 from . import schemas, repository
 from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
 
-# No global dependencies= here — public browse must work unauthenticated
 router = APIRouter(prefix="/api/Products", tags=["Products"])
 
 
@@ -24,7 +20,7 @@ def parse_filters(raw: Optional[str]) -> Optional[list]:
         raise HTTPException(status_code=400, detail="Invalid Filters format.")
 
 
-# ── PUBLIC: list products (guests + logged-in users) ─────────────────────────
+# ── PUBLIC: list products ─────────────────────────────────────────────────────
 @router.get("/", response_model=schemas.ProductListResponse)
 def get_products(
     Filters:         Optional[str]  = Query(None, alias="Filters"),
@@ -32,7 +28,6 @@ def get_products(
     Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
     Page_Index:      Optional[int]  = Query(None, alias="Page.Index", ge=1),
     Page_Size:       Optional[int]  = Query(None, alias="Page.Size",  ge=1),
-    # Admin product manager passes adminView=true to see products of hidden/deleted brands
     adminView:       bool           = Query(False, alias="adminView"),
     db: Session = Depends(get_db),
 ):
@@ -43,7 +38,7 @@ def get_products(
         order_property=Order_Property,
         page_index=Page_Index,
         page_size=Page_Size,
-        public_only=not adminView,   # public_only=True hides inactive/hidden-brand/deleted-brand products
+        public_only=not adminView,
     )
 
 
@@ -56,11 +51,29 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
     return result
 
 
-# ── PROTECTED: create product (staff only) ────────────────────────────────────
+# ── PROTECTED: create product ─────────────────────────────────────────────────
 @router.post("/", status_code=201,
              dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
-def create_product(command: schemas.ProductCreate, db: Session = Depends(get_db)):
+def create_product(command: schemas.ProductCreate, request: Request, db: Session = Depends(get_db)):
     new_id = repository.create_product(db, command)
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        source = request.headers.get("X-Event-Source", "ProductDetail")
+        add_event(
+            db,
+            product_id   = new_id,
+            event_type   = "PRODUCT_CREATED",
+            event_source = source,
+            description  = f"Product created: {getattr(command, 'name', '') or ''} [{getattr(command, 'productCode', '') or ''}]",
+            changed_by   = getattr(command, "createdBy", None) or "system",
+            product_code = getattr(command, "productCode", None),
+            product_name = getattr(command, "name", None),
+        )
+    except Exception:
+        pass
+
     return {"productId": new_id}
 
 
@@ -75,7 +88,7 @@ def update_product(product_id: int, command: schemas.ProductUpdate, db: Session 
     return {"productId": result}
 
 
-# ── PROTECTED: toggle product active/inactive (isActive only — NOT deletedInd) ──
+# ── PROTECTED: toggle active/inactive ────────────────────────────────────────
 @router.patch("/{product_id}/toggle-active",
               dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def toggle_product_active(product_id: int, db: Session = Depends(get_db)):
@@ -85,13 +98,36 @@ def toggle_product_active(product_id: int, db: Session = Depends(get_db)):
     return result
 
 
-# ── PROTECTED: delete product (hard soft-delete — separate from isActive) ─────
+# ── PROTECTED: delete product ─────────────────────────────────────────────────
 @router.delete("/{product_id}", status_code=204,
                dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
 def delete_product(product_id: int, db: Session = Depends(get_db)):
+    # Fetch name before deletion for the audit log
+    product = None
+    try:
+        product = repository.get_product_by_id(db, product_id)
+    except Exception:
+        pass
+
     result = repository.delete_product(db, product_id)
     if not result:
         raise HTTPException(status_code=404, detail="Product not found.")
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        add_event(
+            db,
+            product_id   = product_id,
+            event_type   = "PRODUCT_DELETED",
+            event_source = "ProductDetail",
+            description  = f"Product deleted: {product.get('name', '') if product else ''} [{product.get('productCode', '') if product else product_id}]",
+            changed_by   = "Admin",
+            product_code = product.get("productCode") if product else None,
+            product_name = product.get("name") if product else None,
+        )
+    except Exception:
+        pass
 
 
 # ── PROTECTED: validate product ───────────────────────────────────────────────
