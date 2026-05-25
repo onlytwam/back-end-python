@@ -712,7 +712,7 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
         in_clause = ", ".join(f":u{i}" for i in range(len(unique_users)))
         role_rows = db.execute(text(f"""
             SELECT iu."UserName", ur."RoleName"
-            FROM twam."IdentityUser" iu
+            FROM auth."IdentityUser" iu
             LEFT JOIN twam."UserRole" ur ON ur."UserRoleId" = iu."UserRoleId"
             WHERE iu."UserName" IN ({in_clause})
         """), in_params).fetchall()
@@ -930,7 +930,7 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
         in_clause = ", ".join(f":u{i}" for i in range(len(creator_usernames)))
         role_sql = text(f"""
             SELECT iu."UserName", ur."RoleName"
-            FROM twam."IdentityUser" iu
+            FROM auth."IdentityUser" iu
             LEFT JOIN twam."UserRole" ur ON ur."UserRoleId" = iu."UserRoleId"
             WHERE iu."UserName" IN ({in_clause})
         """)
@@ -1011,3 +1011,429 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
         })
 
     return {"items": items, "total": total, "page": page, "size": size}
+
+# ─── Excel Export helpers ──────────────────────────────────────────────────────
+
+def export_changes_excel(db: Session) -> bytes:
+    """
+    Hierarchical Excel — Product > Variant > Sizes.
+    Colors: Burgundy #6B0F2A, Warm Ivory #F5F0E6, White, Black text.
+    No level-marker column.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+    from collections import OrderedDict
+
+    rows = db.execute(text("""
+        SELECT
+            pal."CreatedDate",
+            pal."ProductCode",
+            pal."ProductName",
+            pal."EventType",
+            pal."VariantName",
+            pal."SizeLabel",
+            pal."StockAfter",
+            pal."ChangedBy",
+            COALESCE(ur."RoleName", pal."ChangedBy", 'system') AS role
+        FROM twam."ProductAuditLog" pal
+        LEFT JOIN auth."IdentityUser" iu ON iu."UserName" = pal."ChangedBy"
+        LEFT JOIN twam."UserRole"     ur ON ur."UserRoleId" = iu."UserRoleId"
+        WHERE pal."EventType" IN (
+            'PRODUCT_CREATED','PRODUCT_UPDATED','PRODUCT_DELETED',
+            'VARIANT_ADDED','VARIANT_DELETED',
+            'SIZE_ADDED','SIZE_DELETED'
+        )
+        ORDER BY pal."ProductCode" ASC, pal."VariantName" ASC NULLS FIRST, pal."CreatedDate" ASC NULLS LAST
+    """)).fetchall()
+
+    # ── Colors ───────────────────────────────────────────────────────────────
+    BURGUNDY      = "6B0F2A"
+    BURGUNDY_SOFT = "8C1A37"   # slightly lighter for variant header
+    IVORY         = "F5F0E6"
+    IVORY_ALT     = "EDE8DC"   # slightly darker ivory for alternating rows
+    WHITE         = "FFFFFF"
+    BLACK         = "000000"
+    PURPLE_TEXT   = "5B0E7F"
+    BLUE_TEXT     = "0A4F8A"
+    GREEN_TEXT    = "1A5C1A"
+    RED_TEXT      = "8B0000"
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    thin = Side(style="thin",   color="C8BEB4")
+    med  = Side(style="medium", color=BURGUNDY)
+
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def bord(left_side=None):
+        s = left_side or thin
+        return Border(left=s, right=thin, top=thin, bottom=thin)
+
+    def font(bold=False, color=BLACK, size=10, italic=False):
+        return Font(name="Arial", bold=bold, color=color, size=size, italic=italic)
+
+    C  = Alignment(horizontal="center", vertical="center")
+    L  = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    LC = Alignment(horizontal="left",   vertical="center")
+
+    EVENT_LABEL = {
+        "PRODUCT_CREATED": "Product Created",
+        "PRODUCT_UPDATED": "Product Updated",
+        "PRODUCT_DELETED": "Product Deleted",
+        "VARIANT_ADDED":   "Variant Added",
+        "VARIANT_DELETED": "Variant Deleted",
+        "SIZE_ADDED":      "Size Added",
+        "SIZE_DELETED":    "Size Removed",
+    }
+    EVENT_COLOR = {
+        "PRODUCT_CREATED": GREEN_TEXT,
+        "PRODUCT_UPDATED": BLUE_TEXT,
+        "PRODUCT_DELETED": RED_TEXT,
+        "VARIANT_ADDED":   PURPLE_TEXT,
+        "VARIANT_DELETED": RED_TEXT,
+        "SIZE_ADDED":      BLUE_TEXT,
+        "SIZE_DELETED":    RED_TEXT,
+    }
+
+    # ── Build hierarchy ───────────────────────────────────────────────────────
+    products = OrderedDict()
+    for r in rows:
+        created_date, prod_code, prod_name, event_type, variant, size, stock_after, changed_by, role = r
+        key = prod_code or "(no code)"
+        if key not in products:
+            products[key] = {"name": prod_name or "", "prod_rows": [], "variants": OrderedDict()}
+        p = products[key]
+        if event_type in ("PRODUCT_CREATED", "PRODUCT_UPDATED", "PRODUCT_DELETED"):
+            p["prod_rows"].append(r)
+            continue
+        vkey = variant or "(no variant)"
+        if vkey not in p["variants"]:
+            p["variants"][vkey] = {"variant_rows": [], "size_rows": []}
+        v = p["variants"][vkey]
+        if event_type in ("VARIANT_ADDED", "VARIANT_DELETED"):
+            v["variant_rows"].append(r)
+        else:
+            v["size_rows"].append(r)
+
+    # ── Workbook ──────────────────────────────────────────────────────────────
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Product Changes"
+
+    # Columns: Date | Time | Event | Detail / Variant | Size | Stock | Changed By | Role
+    NCOLS      = 8
+    HDR_COLS   = ["Date",  "Time", "Event",          "Detail / Variant",  "Size",  "Stock", "Changed By",  "Role"]
+    COL_WIDTHS = [15,       9,      22,               34,                   12,      10,      22,             16   ]
+
+    ws.row_dimensions[1].height = 30
+    for ci, (h, w) in enumerate(zip(HDR_COLS, COL_WIDTHS), 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        c.font      = Font(name="Arial", bold=True, color=WHITE, size=10)
+        c.fill      = fill(BURGUNDY)
+        c.alignment = C
+        c.border    = bord(med if ci == 1 else thin)
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+    row_idx = 2
+    total_records = len(rows)
+
+    def write_merged_header(ri, text, bg, text_color, text_size=10, bold=True, height=22):
+        ws.row_dimensions[ri].height = height
+        for ci in range(1, NCOLS + 1):
+            c = ws.cell(row=ri, column=ci, value="")
+            c.fill   = fill(bg)
+            c.border = bord(med if ci == 1 else thin)
+        c0 = ws.cell(row=ri, column=1, value=text)
+        c0.font      = Font(name="Arial", bold=bold, color=text_color, size=text_size)
+        c0.fill      = fill(bg)
+        c0.alignment = LC
+        ws.merge_cells(start_row=ri, start_column=1, end_row=ri, end_column=NCOLS)
+
+    def write_data_row(ri, date_str, time_str, event, detail, size, stock, by, role,
+                       row_fill_hex, evt_color, bold=False):
+        ws.row_dimensions[ri].height = 18
+        values = [date_str, time_str, event, detail, size, stock, by, role]
+        aligns = [C,         C,         C,     L,      C,     C,    LC,   C  ]
+        for ci, (val, aln) in enumerate(zip(values, aligns), 1):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.font      = Font(name="Arial", bold=(bold and ci == 3), color=(evt_color if ci == 3 else BLACK), size=10)
+            c.fill      = fill(row_fill_hex)
+            c.alignment = aln
+            c.border    = bord(med if ci == 1 else thin)
+
+    def write_spacer(ri, height=5):
+        ws.row_dimensions[ri].height = height
+        for ci in range(1, NCOLS + 1):
+            c = ws.cell(row=ri, column=ci, value="")
+            c.fill   = fill(IVORY)
+            c.border = bord(thin)
+
+    for prod_code, pdata in products.items():
+        prod_name = pdata["name"]
+
+        # ══ PRODUCT header ══════════════════════════════════════════════════
+        write_merged_header(row_idx,
+            f"  {prod_code}   {prod_name}",
+            bg=BURGUNDY, text_color=WHITE, text_size=11, height=26)
+        row_idx += 1
+
+        # ── Product Created/Updated/Deleted — FIRST row after product header ──
+        for r in pdata["prod_rows"]:
+            created_date, _, _, event_type, _, _, _, changed_by, role = r
+            date_str = created_date.strftime("%d %b %Y") if created_date else ""
+            time_str = created_date.strftime("%H:%M")     if created_date else ""
+            write_data_row(row_idx,
+                date_str, time_str,
+                EVENT_LABEL.get(event_type, event_type),
+                prod_name, "", "", changed_by or "", role or "",
+                IVORY, EVENT_COLOR.get(event_type, BLACK), bold=True)
+            row_idx += 1
+
+        # ── Variants ─────────────────────────────────────────────────────────
+        for vname, vdata in pdata["variants"].items():
+            vname_clean = vname
+            if vname_clean.startswith(prod_name):
+                vname_clean = vname_clean[len(prod_name):].lstrip(" -–—")
+            if not vname_clean or vname_clean == "(no variant)":
+                vname_clean = vname
+
+            # ▸ Variant sub-header
+            write_merged_header(row_idx,
+                f"      {vname_clean}",
+                bg=IVORY_ALT, text_color=BURGUNDY, text_size=10, bold=True, height=20)
+            row_idx += 1
+
+            # Variant Added / Deleted rows
+            for r in vdata["variant_rows"]:
+                created_date, _, _, event_type, _, _, _, changed_by, role = r
+                date_str = created_date.strftime("%d %b %Y") if created_date else ""
+                time_str = created_date.strftime("%H:%M")     if created_date else ""
+                write_data_row(row_idx,
+                    date_str, time_str,
+                    EVENT_LABEL.get(event_type, event_type),
+                    vname_clean, "", "", changed_by or "", role or "",
+                    IVORY, EVENT_COLOR.get(event_type, BLACK), bold=True)
+                row_idx += 1
+
+            # Size rows
+            size_rows_sorted = sorted(vdata["size_rows"],
+                key=lambda r: (str(r[5] or ""), str(r[0] or "")))
+            for alt, r in enumerate(size_rows_sorted):
+                created_date, _, _, event_type, _, size, stock_after, changed_by, role = r
+                date_str  = created_date.strftime("%d %b %Y") if created_date else ""
+                time_str  = created_date.strftime("%H:%M")     if created_date else ""
+                stock_val = int(stock_after) if stock_after is not None else ""
+                row_bg    = WHITE if alt % 2 == 0 else IVORY
+                write_data_row(row_idx,
+                    date_str, time_str,
+                    EVENT_LABEL.get(event_type, event_type),
+                    "", size or "", stock_val, changed_by or "", role or "",
+                    row_bg, EVENT_COLOR.get(event_type, BLACK), bold=False)
+                row_idx += 1
+
+            write_spacer(row_idx)
+            row_idx += 1
+
+        # Gap between products
+        write_spacer(row_idx, height=10)
+        row_idx += 1
+
+    # Summary row
+    ws.row_dimensions[row_idx].height = 20
+    c = ws.cell(row=row_idx, column=1,
+                value=f"  Total: {total_records} records  ·  {len(products)} products")
+    c.font      = Font(name="Arial", bold=True, size=10, color=BURGUNDY)
+    c.fill      = fill(IVORY)
+    c.alignment = LC
+    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=NCOLS)
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def export_stock_excel(db: Session) -> bytes:
+    """
+    Hierarchical Excel — identical template to Product Changes.
+    Product header (Burgundy) > Variant sub-header (Ivory-alt) > Stock rows (White/Ivory alternating).
+    Columns: Date | Time | Event | Size | Stock ID | Prev | New | Change | Changed By | Role
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+    from collections import OrderedDict
+
+    rows = db.execute(text("""
+        SELECT
+            sl."CreatedDate",
+            p."ProductCode",
+            p."Name"               AS product_name,
+            pv."VariantName",
+            COALESCE(sz."SizeLabel", cs."SizeLabel", pvd."Size"::TEXT, '') AS size_label,
+            sl."StockId",
+            sl."PreviousValue",
+            sl."NewValue",
+            sl."ChangedBy",
+            COALESCE(ur."RoleName", sl."ChangedBy", 'Admin') AS role
+        FROM twam."StockLog" sl
+        LEFT JOIN twam."Products"             p   ON p."ProductId"               = sl."ProductId"
+        LEFT JOIN twam."ProductVariants"      pv  ON pv."ProductVariantId"       = sl."ProductVariantId"
+        LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId"= sl."ProductVariantDetailId"
+        LEFT JOIN mdm."Size"    sz ON sz."SizeId"    = pvd."Size"
+        LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
+        LEFT JOIN auth."IdentityUser" iu ON iu."UserName" = sl."ChangedBy"
+        LEFT JOIN twam."UserRole"     ur ON ur."UserRoleId" = iu."UserRoleId"
+        WHERE sl."ChangeType" = 'TOTAL_STOCK'
+        ORDER BY p."ProductCode" ASC, pv."VariantName" ASC NULLS FIRST, sl."CreatedDate" ASC NULLS LAST
+    """)).fetchall()
+
+    # ── Colors — identical to Product Changes ────────────────────────────────
+    BURGUNDY  = "6B0F2A"
+    IVORY     = "F5F0E6"
+    IVORY_ALT = "EDE8DC"
+    WHITE     = "FFFFFF"
+    BLACK     = "000000"
+    GREEN_T   = "1A5C1A"
+    RED_T     = "8B0000"
+    BLUE_T    = "0A4F8A"
+
+    thin = Side(style="thin",   color="C8BEB4")
+    med  = Side(style="medium", color=BURGUNDY)
+
+    def fill(h):      return PatternFill("solid", fgColor=h)
+    def bord(l=None): return Border(left=l or thin, right=thin, top=thin, bottom=thin)
+    C  = Alignment(horizontal="center", vertical="center")
+    L  = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    LC = Alignment(horizontal="left",   vertical="center")
+
+    # ── Build hierarchy ───────────────────────────────────────────────────────
+    products = OrderedDict()
+    for r in rows:
+        created_date, prod_code, prod_name, variant, size, stock_id, prev_val, new_val, changed_by, role = r
+        key = prod_code or "(no code)"
+        if key not in products:
+            products[key] = {"name": prod_name or "", "variants": OrderedDict()}
+        vkey = variant or "(no variant)"
+        if vkey not in products[key]["variants"]:
+            products[key]["variants"][vkey] = []
+        products[key]["variants"][vkey].append(r)
+
+    # ── Workbook ──────────────────────────────────────────────────────────────
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Stock Changes"
+
+    NCOLS      = 10
+    HDR_COLS   = ["Date",  "Time",  "Event",         "Size",  "Stock ID", "Previous", "New Total", "Change", "Changed By",  "Role"]
+    COL_WIDTHS = [15,       9,       20,               12,      14,         12,          12,          10,       22,            16   ]
+
+    ws.row_dimensions[1].height = 30
+    for ci, (h, w) in enumerate(zip(HDR_COLS, COL_WIDTHS), 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        c.font      = Font(name="Arial", bold=True, color=WHITE, size=10)
+        c.fill      = fill(BURGUNDY)
+        c.alignment = C
+        c.border    = bord(med if ci == 1 else thin)
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.freeze_panes = "A2"
+
+    row_idx       = 2
+    total_records = len(rows)
+
+    def write_merged(ri, text, bg, text_color, size=10, bold=True, height=22):
+        ws.row_dimensions[ri].height = height
+        for ci in range(1, NCOLS + 1):
+            c = ws.cell(row=ri, column=ci, value="")
+            c.fill   = fill(bg)
+            c.border = bord(med if ci == 1 else thin)
+        c0 = ws.cell(row=ri, column=1, value=text)
+        c0.font      = Font(name="Arial", bold=bold, color=text_color, size=size)
+        c0.fill      = fill(bg)
+        c0.alignment = LC
+        ws.merge_cells(start_row=ri, start_column=1, end_row=ri, end_column=NCOLS)
+
+    def write_stock_row(ri, date_str, time_str, size, stock_id, prev, nxt, delta_val, by, role, row_bg):
+        ws.row_dimensions[ri].height = 18
+        delta_str = (f"+{delta_val}" if delta_val > 0 else str(delta_val)) if delta_val != 0 else "±0"
+        delta_col = GREEN_T if delta_val > 0 else (RED_T if delta_val < 0 else BLACK)
+        values = [date_str, time_str, "Total Stock Updated", size, stock_id, prev, nxt, delta_str, by, role]
+        aligns = [C,         C,        C,                     C,    C,         C,    C,   C,          LC,  C  ]
+        for ci, (val, aln) in enumerate(zip(values, aligns), 1):
+            is_event = ci == 3
+            is_delta = ci == 8
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.font = Font(
+                name="Arial",
+                bold=(is_event or is_delta),
+                color=(BLUE_T if is_event else delta_col if is_delta else BLACK),
+                size=10
+            )
+            c.fill      = fill(row_bg)
+            c.alignment = aln
+            c.border    = bord(med if ci == 1 else thin)
+
+    def write_spacer(ri, height=5):
+        ws.row_dimensions[ri].height = height
+        for ci in range(1, NCOLS + 1):
+            ws.cell(row=ri, column=ci).fill   = fill(IVORY)
+            ws.cell(row=ri, column=ci).border = bord(thin)
+
+    for prod_code, pdata in products.items():
+        prod_name = pdata["name"]
+
+        # ══ Product header ════════════════════════════════════════════════════
+        write_merged(row_idx, f"  {prod_code}   {prod_name}",
+                     BURGUNDY, WHITE, size=11, height=26)
+        row_idx += 1
+
+        for vname, vrows in pdata["variants"].items():
+            # Clean variant name
+            vname_clean = vname
+            if vname_clean.startswith(prod_name):
+                vname_clean = vname_clean[len(prod_name):].lstrip(" -–—")
+            if not vname_clean or vname_clean == "(no variant)":
+                vname_clean = vname
+
+            # ▸ Variant sub-header — identical style to product changes
+            write_merged(row_idx, f"      {vname_clean}",
+                         IVORY_ALT, BURGUNDY, size=10, height=20)
+            row_idx += 1
+
+            # Stock rows sorted by size then date
+            vrows_sorted = sorted(vrows,
+                key=lambda r: (str(r[4] or ""), str(r[0] or "")))
+            for alt, r in enumerate(vrows_sorted):
+                created_date, _, _, _, size, stock_id, prev_val, new_val, changed_by, role = r
+                date_str  = created_date.strftime("%d %b %Y") if created_date else ""
+                time_str  = created_date.strftime("%H:%M")     if created_date else ""
+                prev      = int(prev_val) if prev_val is not None else 0
+                nxt       = int(new_val)  if new_val  is not None else 0
+                delta_val = nxt - prev
+                row_bg    = WHITE if alt % 2 == 0 else IVORY
+                write_stock_row(row_idx, date_str, time_str,
+                    size or "", str(stock_id) if stock_id else "",
+                    prev, nxt, delta_val, changed_by or "Admin", role or "Admin", row_bg)
+                row_idx += 1
+
+            write_spacer(row_idx, height=5)
+            row_idx += 1
+
+        write_spacer(row_idx, height=10)
+        row_idx += 1
+
+    # Summary — identical style
+    ws.row_dimensions[row_idx].height = 20
+    c = ws.cell(row=row_idx, column=1,
+                value=f"  Total: {total_records} stock changes  ·  {len(products)} products")
+    c.font      = Font(name="Arial", bold=True, size=10, color=BURGUNDY)
+    c.fill      = fill(IVORY)
+    c.alignment = LC
+    ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=NCOLS)
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

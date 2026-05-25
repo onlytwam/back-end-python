@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime
+from sqlalchemy import Column, BigInteger, String, Boolean, DateTime
 from sqlalchemy.sql import func
 from database import Base
 
@@ -17,6 +17,7 @@ class ProductVariant(Base):
     productCode         = Column("ProductCode",         String,     nullable=True)
     fabricId            = Column("FabricId",            BigInteger, nullable=True)
     color               = Column("Color",               String,     nullable=True)
+    colorFamily         = Column("ColorFamily",         String,     nullable=True)
     isBestSeller        = Column("IsBestSeller",        Boolean,    nullable=True)
     isReturnAvailable   = Column("IsReturnAvailable",   Boolean,    nullable=True)
     isCupSize           = Column("IsCupSize",           Boolean,    nullable=True)
@@ -26,7 +27,6 @@ class ProductVariant(Base):
     modifiedDate        = Column("ModifiedDate",        DateTime(timezone=True), onupdate=func.now(), nullable=True)
     isActive            = Column("IsActive",            Boolean,    default=True)
     deletedInd          = Column("DeletedInd",          Boolean,    default=False)
-
 
 
 class ProductImage(Base):
