@@ -140,3 +140,33 @@ def get_product_directory(
     Frontend: GET /api/StockLog/product-directory
     """
     return repository.get_product_directory(db, page=page, size=size, search=search)
+
+# ─── Excel Download endpoints ─────────────────────────────────────────────────
+
+from fastapi.responses import Response
+
+@router.get("/export/changes", dependencies=[Depends(get_current_user)])
+def export_changes(db: Session = Depends(get_db)):
+    """
+    Download all product structural changes (variant/size added/deleted)
+    as a formatted Excel file.
+    """
+    data = repository.export_changes_excel(db)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=product_changes.xlsx"},
+    )
+
+
+@router.get("/export/stock", dependencies=[Depends(get_current_user)])
+def export_stock(db: Session = Depends(get_db)):
+    """
+    Download all Total Stock changes across all products as a formatted Excel file.
+    """
+    data = repository.export_stock_excel(db)
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=stock_changes.xlsx"},
+    )

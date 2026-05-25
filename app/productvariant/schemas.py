@@ -3,19 +3,15 @@ from typing import Optional, List, Any
 from datetime import datetime
 
 
-# ── Image ─────────────────────────────────────────────────────────────────────
-
 class ImageResponse(BaseModel):
-    productImageId:   Optional[int] = None
-    fileName:         Optional[str] = None
-    filePath:         Optional[str] = None
-    fileType:         Optional[str] = None
+    productImageId: Optional[int] = None
+    fileName:       Optional[str] = None
+    filePath:       Optional[str] = None
+    fileType:       Optional[str] = None
 
     class Config:
         from_attributes = True
 
-
-# ── Create ────────────────────────────────────────────────────────────────────
 
 class ProductVariantCreate(BaseModel):
     productId:          int
@@ -26,6 +22,7 @@ class ProductVariantCreate(BaseModel):
     productCode:        Optional[str]  = None
     fabricId:           Optional[int]  = None
     color:              Optional[str]  = None
+    colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
@@ -33,8 +30,6 @@ class ProductVariantCreate(BaseModel):
     createdBy:          Optional[str]  = None
     modifiedBy:         Optional[str]  = None
 
-
-# ── Update ────────────────────────────────────────────────────────────────────
 
 class ProductVariantUpdate(BaseModel):
     productId:          Optional[int]  = None
@@ -45,14 +40,13 @@ class ProductVariantUpdate(BaseModel):
     productCode:        Optional[str]  = None
     fabricId:           Optional[int]  = None
     color:              Optional[str]  = None
+    colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
     taxHSNCodeId:       Optional[int]  = None
     modifiedBy:         Optional[str]  = None
 
-
-# ── Response ──────────────────────────────────────────────────────────────────
 
 class ProductVariantResponse(BaseModel):
     productVariantId:   int
@@ -64,6 +58,7 @@ class ProductVariantResponse(BaseModel):
     productCode:        Optional[str]  = None
     fabricId:           Optional[int]  = None
     color:              Optional[str]  = None
+    colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
@@ -84,29 +79,28 @@ class ProductVariantListResponse(BaseModel):
     parameters: Optional[Any] = None
 
 
-# ── User-facing product detail (from GetProductVariantUserListQuery) ───────────
-
 class SizeDetail(BaseModel):
-    sizeId:                int
-    sizeLabel:             Optional[str] = None
-    sizeCode:              Optional[str] = None
-    description:           Optional[str] = None
-    dimensions:            Optional[str] = None
-    productVariantId:      int
+    sizeId:                 int
+    sizeLabel:              Optional[str] = None
+    sizeCode:               Optional[str] = None
+    description:            Optional[str] = None
+    dimensions:             Optional[str] = None
+    productVariantId:       int
     productVariantDetailId: int
 
 
 class CupSizeDetail(BaseModel):
-    cupSizeId:             int
-    sizeLabel:             Optional[str] = None
-    dimensions:            Optional[str] = None
-    productVariantId:      int
+    cupSizeId:              int
+    sizeLabel:              Optional[str] = None
+    dimensions:             Optional[str] = None
+    productVariantId:       int
     productVariantDetailId: int
 
 
 class ColorDetail(BaseModel):
     productVariantId: int
     color:            Optional[str] = None
+    colorFamily:      Optional[str] = None
     image:            Optional[str] = None
 
 
@@ -129,6 +123,4 @@ class UserProductVariantResponse(BaseModel):
     sizes:              Optional[List[SizeDetail]] = []
     cupSizes:           Optional[List[CupSizeDetail]] = []
     colors:             Optional[List[ColorDetail]] = []
-    # categoryIsActive must be in the schema so FastAPI doesn't strip it.
-    # False means the product's category has been hidden by an admin.
     categoryIsActive:   Optional[bool] = True

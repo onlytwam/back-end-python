@@ -413,7 +413,7 @@ def build_phrase_hints() -> list[str]:
 
             # Colors
             rows = conn.execute(text(
-                'SELECT "ColorName" FROM public."ProductColor"'
+                'SELECT DISTINCT "Color" FROM twam."ProductVariants" WHERE "Color" IS NOT NULL AND ("DeletedInd" = false OR "DeletedInd" IS NULL)'
             )).fetchall()
             phrases.extend(r[0] for r in rows if r[0])
 

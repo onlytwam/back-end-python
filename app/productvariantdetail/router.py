@@ -101,10 +101,10 @@ def get_new_arrivals(
 @router.get("/GetProductColor")
 def get_product_colors(db: Session = Depends(get_db)):
     rows = db.execute(sqlalchemy.text(
-        'SELECT DISTINCT "Color" FROM twam."ProductVariants" '
+        'SELECT DISTINCT "Color", "ColorFamily" FROM twam."ProductVariants" '
         'WHERE "DeletedInd"=false AND "Color" IS NOT NULL ORDER BY "Color"'
     )).fetchall()
-    return [r[0] for r in rows]
+    return [{"color": r[0], "colorFamily": r[1]} for r in rows]
 
 
 @router.get("/ProductDetail/{pvd_id}", response_model=schemas.UserProductDetailResponse)
