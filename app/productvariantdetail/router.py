@@ -233,6 +233,27 @@ def delete_variant_detail(pvd_id: int, db: Session = Depends(get_db)):
         pass
 
 
+# ── Find by Stock ID (admin deep-link) ────────────────────────────────────────
+@router.get("/FindByStockId", dependencies=[Depends(get_current_user)])
+def find_by_stock_id(
+    stockId: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+):
+    """
+    Exact (case-insensitive) lookup of a ProductVariantDetail by StockId.
+    Returns productId + productVariantId + sizeId + cupSizeId so the
+    admin frontend can deep-link directly to the right variant tile.
+    Returns 404 when no match is found.
+    """
+    result = repository.find_by_stock_id(db, stockId.strip())
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No variant detail found with Stock ID '{stockId}'",
+        )
+    return result
+
+
 # /{pvd_id} MUST be last — it's a catch-all for any integer path segment
 @router.get("/{pvd_id}", response_model=schemas.ProductVariantDetailResponse,
             dependencies=[Depends(get_current_user)])
