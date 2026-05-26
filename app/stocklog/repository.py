@@ -391,8 +391,8 @@ def get_pvds_for_variant(db: Session, variant_id: int) -> list:
             "isActive":               r[16],
             "createdDate":            r[17].isoformat() if r[17] else None,
             "modifiedDate":           r[18].isoformat() if r[18] else None,
-            "sizeLabel":              r[19],
-            "cupSizeLabel":           r[20],
+            "sizeLabel":              _fmt_size(r[19] or "", r[20] or "") or (r[19] or ""),
+            "cupSizeLabel":           "",  # merged into sizeLabel
             "sizeId":                 r[21],
             "cupSizeId":              r[22],
             # ── DB change alert flag ──────────────────────────────────────────
@@ -405,6 +405,16 @@ def get_pvds_for_variant(db: Session, variant_id: int) -> list:
 # ─── ProductAuditLog helpers (folded into stocklog — no new module needed) ────
 
 from .models import ProductAuditLog as _PAL
+
+def _fmt_size(band: str, cup: str) -> str:
+    """Combine band and cup size into a single display string like '32B'.
+    Falls back gracefully if either part is missing."""
+    b = (band or "").strip()
+    c = (cup  or "").strip()
+    if b and c:
+        return f"{b}{c}"   # e.g. "32B"
+    return b or c or ""
+
 
 
 def add_audit_event(
@@ -538,7 +548,7 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
         (pvd_id, pv_id, stk, proc, ret, avail,
          s_id, s_date, s_by, s_del,
          size_lbl, cup_lbl, vname, vcolor) = row
-        size_display = " / ".join(p for p in [size_lbl, cup_lbl] if p) or "—"
+        size_display = _fmt_size(size_lbl, cup_lbl) or "—"
         variant_display = vname or vcolor or f"Variant {pv_id}"
         total = stk or 0
         is_del = bool(s_del)
@@ -663,8 +673,7 @@ def get_product_audit_history(db: Session, product_id: int, limit: int = 500) ->
         if r["ChangeType"] == "INITIAL_STOCK":
             continue
 
-        size_parts = [r["size_label"], r["cup_size_label"]]
-        size_display = " / ".join(p for p in size_parts if p) or None
+        size_display = _fmt_size(r["size_label"], r["cup_size_label"]) or None
         variant_display = r["VariantName"] or None
 
         # DB_CHANGE — treat as an Admin stock correction, not a system alert
@@ -956,10 +965,15 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
                 pal."EventType",
                 pal."ChangedBy",
                 pal."VariantName",
-                pal."SizeLabel",
+                COALESCE(sz."SizeLabel", '') AS band_label,
+                COALESCE(cs."SizeLabel", '') AS cup_label,
                 pal."Description",
-                pal."CreatedDate"
+                pal."CreatedDate",
+                pal."StockAfter"
             FROM twam."ProductAuditLog" pal
+            LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = pal."ProductVariantDetailId"
+            LEFT JOIN mdm."Size"    sz ON sz."SizeId"    = pvd."Size"
+            LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
             WHERE pal."ProductId" IN ({in_clause2})
               AND pal."EventType" IN ({in_clause3})
             ORDER BY pal."CreatedDate" DESC NULLS LAST
@@ -972,7 +986,7 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
     # Group modifications by product
     from collections import defaultdict
     mods_by_product: dict = defaultdict(list)
-    for pid, etype, changed_by, variant_name, size_label, description, created_date in mod_rows:
+    for pid, etype, changed_by, variant_name, band_label, cup_label, description, created_date, stock_after in mod_rows:
         # Human-friendly label
         label_map = {
             "PRODUCT_UPDATED":  "Product details modified",
@@ -983,10 +997,11 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
         }
         label = label_map.get(etype, etype.replace("_", " ").title())
         context = ""
+        size_display = _fmt_size(band_label, cup_label)
         if variant_name:
             context = variant_name
-            if size_label:
-                context += f" / {size_label}"
+            if size_display:
+                context += f" / {size_display}"
         mods_by_product[pid].append({
             "eventType":   etype,
             "label":       label,
@@ -994,6 +1009,8 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
             "changedBy":   changed_by,
             "role":        role_map.get(changed_by, ""),
             "createdDate": created_date.isoformat() if created_date else None,
+            "stockAfter":  int(stock_after) if stock_after is not None else None,
+            "sizeDisplay": _fmt_size(band_label, cup_label),
         })
 
     items = []
@@ -1033,11 +1050,15 @@ def export_changes_excel(db: Session) -> bytes:
             pal."ProductName",
             pal."EventType",
             pal."VariantName",
-            pal."SizeLabel",
+            COALESCE(sz."SizeLabel", '') AS band_label,
+            COALESCE(cs."SizeLabel", '') AS cup_label,
             pal."StockAfter",
             pal."ChangedBy",
             COALESCE(ur."RoleName", pal."ChangedBy", 'system') AS role
         FROM twam."ProductAuditLog" pal
+        LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = pal."ProductVariantDetailId"
+        LEFT JOIN mdm."Size"    sz ON sz."SizeId"    = pvd."Size"
+        LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
         LEFT JOIN auth."IdentityUser" iu ON iu."UserName" = pal."ChangedBy"
         LEFT JOIN twam."UserRole"     ur ON ur."UserRoleId" = iu."UserRoleId"
         WHERE pal."EventType" IN (
@@ -1100,7 +1121,7 @@ def export_changes_excel(db: Session) -> bytes:
     # ── Build hierarchy ───────────────────────────────────────────────────────
     products = OrderedDict()
     for r in rows:
-        created_date, prod_code, prod_name, event_type, variant, size, stock_after, changed_by, role = r
+        created_date, prod_code, prod_name, event_type, variant, band_lbl, cup_lbl, stock_after, changed_by, role = r
         key = prod_code or "(no code)"
         if key not in products:
             products[key] = {"name": prod_name or "", "prod_rows": [], "variants": OrderedDict()}
@@ -1182,7 +1203,7 @@ def export_changes_excel(db: Session) -> bytes:
 
         # ── Product Created/Updated/Deleted — FIRST row after product header ──
         for r in pdata["prod_rows"]:
-            created_date, _, _, event_type, _, _, _, changed_by, role = r
+            created_date, _, _, event_type, _, _, _, _, changed_by, role = r
             date_str = created_date.strftime("%d %b %Y") if created_date else ""
             time_str = created_date.strftime("%H:%M")     if created_date else ""
             write_data_row(row_idx,
@@ -1208,7 +1229,7 @@ def export_changes_excel(db: Session) -> bytes:
 
             # Variant Added / Deleted rows
             for r in vdata["variant_rows"]:
-                created_date, _, _, event_type, _, _, _, changed_by, role = r
+                created_date, _, _, event_type, _, _, _, _, changed_by, role = r
                 date_str = created_date.strftime("%d %b %Y") if created_date else ""
                 time_str = created_date.strftime("%H:%M")     if created_date else ""
                 write_data_row(row_idx,
@@ -1222,15 +1243,16 @@ def export_changes_excel(db: Session) -> bytes:
             size_rows_sorted = sorted(vdata["size_rows"],
                 key=lambda r: (str(r[5] or ""), str(r[0] or "")))
             for alt, r in enumerate(size_rows_sorted):
-                created_date, _, _, event_type, _, size, stock_after, changed_by, role = r
+                created_date, _, _, event_type, _, band_lbl, cup_lbl, stock_after, changed_by, role = r
                 date_str  = created_date.strftime("%d %b %Y") if created_date else ""
                 time_str  = created_date.strftime("%H:%M")     if created_date else ""
+                size_val  = _fmt_size(band_lbl, cup_lbl)
                 stock_val = int(stock_after) if stock_after is not None else ""
                 row_bg    = WHITE if alt % 2 == 0 else IVORY
                 write_data_row(row_idx,
                     date_str, time_str,
                     EVENT_LABEL.get(event_type, event_type),
-                    "", size or "", stock_val, changed_by or "", role or "",
+                    "", size_val, stock_val, changed_by or "", role or "",
                     row_bg, EVENT_COLOR.get(event_type, BLACK), bold=False)
                 row_idx += 1
 
@@ -1273,7 +1295,8 @@ def export_stock_excel(db: Session) -> bytes:
             p."ProductCode",
             p."Name"               AS product_name,
             pv."VariantName",
-            COALESCE(sz."SizeLabel", cs."SizeLabel", pvd."Size"::TEXT, '') AS size_label,
+            COALESCE(sz."SizeLabel", '') AS size_label,
+            COALESCE(cs."SizeLabel", '') AS cup_size_label,
             sl."StockId",
             sl."PreviousValue",
             sl."NewValue",
@@ -1313,7 +1336,7 @@ def export_stock_excel(db: Session) -> bytes:
     # ── Build hierarchy ───────────────────────────────────────────────────────
     products = OrderedDict()
     for r in rows:
-        created_date, prod_code, prod_name, variant, size, stock_id, prev_val, new_val, changed_by, role = r
+        created_date, prod_code, prod_name, variant, size_band, size_cup, stock_id, prev_val, new_val, changed_by, role = r
         key = prod_code or "(no code)"
         if key not in products:
             products[key] = {"name": prod_name or "", "variants": OrderedDict()}
@@ -1407,15 +1430,16 @@ def export_stock_excel(db: Session) -> bytes:
             vrows_sorted = sorted(vrows,
                 key=lambda r: (str(r[4] or ""), str(r[0] or "")))
             for alt, r in enumerate(vrows_sorted):
-                created_date, _, _, _, size, stock_id, prev_val, new_val, changed_by, role = r
+                created_date, _, _, _, size_band, cup_size_label, stock_id, prev_val, new_val, changed_by, role = r
                 date_str  = created_date.strftime("%d %b %Y") if created_date else ""
                 time_str  = created_date.strftime("%H:%M")     if created_date else ""
                 prev      = int(prev_val) if prev_val is not None else 0
                 nxt       = int(new_val)  if new_val  is not None else 0
                 delta_val = nxt - prev
                 row_bg    = WHITE if alt % 2 == 0 else IVORY
+                size_display = _fmt_size(size_band, cup_size_label) or ""
                 write_stock_row(row_idx, date_str, time_str,
-                    size or "", str(stock_id) if stock_id else "",
+                    size_display, str(stock_id) if stock_id else "",
                     prev, nxt, delta_val, changed_by or "Admin", role or "Admin", row_bg)
                 row_idx += 1
 
