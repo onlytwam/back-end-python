@@ -42,6 +42,45 @@ def get_products(
     )
 
 
+# ── ADMIN: search products by name or productCode ────────────────────────────
+# Must be defined BEFORE /{product_id} to avoid catch-all interception
+@router.get("/Search", response_model=schemas.ProductListResponse,
+            dependencies=[Depends(get_current_user)])
+def search_products(
+    q:          str           = Query(..., min_length=1, description="Search term for name or product code"),
+    Page_Index: Optional[int] = Query(1,   alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(20,  alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+):
+    """
+    Search products by name OR productCode (case-insensitive contains).
+    Returns the same ProductListResponse shape as the main listing.
+    """
+    filters = [
+        {"property": "name",        "comparison": "contains", "value": q},
+        {"property": "productCode", "comparison": "contains", "value": q},
+    ]
+    return repository.search_products_by_name_or_code(
+        db, q=q,
+        page_index=Page_Index or 1,
+        page_size=Page_Size  or 20,
+    )
+
+
+# ── ADMIN: find product by StockId (on any variant detail) ───────────────────
+@router.get("/SearchByStockId", response_model=schemas.ProductListResponse,
+            dependencies=[Depends(get_current_user)])
+def search_by_stock_id(
+    stockId: str = Query(..., min_length=1, description="StockId to look up in ProductVariantDetail"),
+    db: Session  = Depends(get_db),
+):
+    """
+    Find the product(s) that own a ProductVariantDetail with the given StockId.
+    Exact match — returns the parent product card(s).
+    """
+    return repository.search_products_by_stock_id(db, stock_id=stockId.strip())
+
+
 # ── PUBLIC: get single product ────────────────────────────────────────────────
 @router.get("/{product_id}", response_model=schemas.ProductResponse)
 def get_product(product_id: int, db: Session = Depends(get_db)):

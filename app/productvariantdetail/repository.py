@@ -399,6 +399,56 @@ def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None,
     return True
 
 
+# ── Find by Stock ID ──────────────────────────────────────────────────────────
+
+def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
+    """
+    Exact case-insensitive lookup of a ProductVariantDetail by StockId.
+    Returns the minimal navigation payload needed to deep-link into
+    AdminProductDetail: productId, productVariantId, sizeId, cupSizeId.
+    Returns None when no match is found.
+    """
+    pvd = db.query(ProductVariantDetail).filter(
+        ProductVariantDetail.deletedInd == False,
+        ProductVariantDetail.stockId.ilike(stock_id),
+    ).first()
+
+    if not pvd:
+        return None
+
+    # Resolve size label from MDM
+    size_label = None
+    if pvd.sizeId:
+        row = db.execute(
+            text('SELECT "SizeLabel" FROM mdm."Size" WHERE "SizeId" = :id LIMIT 1'),
+            {"id": pvd.sizeId},
+        ).fetchone()
+        size_label = row[0] if row else None
+
+    # Resolve cup size label from MDM
+    cup_size_label = None
+    if pvd.cupSizeId:
+        row = db.execute(
+            text('SELECT "SizeLabel" FROM mdm."CupSize" WHERE "CupSizeId" = :id LIMIT 1'),
+            {"id": pvd.cupSizeId},
+        ).fetchone()
+        cup_size_label = row[0] if row else None
+
+    return {
+        "found":                  True,
+        "productId":              pvd.productId,
+        "productVariantId":       pvd.productVariantId,
+        "productVariantDetailId": pvd.productVariantDetailId,
+        "sizeId":                 pvd.sizeId,
+        "sizeLabel":              size_label,
+        "cupSizeId":              pvd.cupSizeId,
+        "cupSizeLabel":           cup_size_label,
+        "stockId":                pvd.stockId,
+        "stockQuantity":          pvd.stockQuantity,
+        "availableQuantity":      pvd.availableQuantity,
+    }
+
+
 # ── Delete ────────────────────────────────────────────────────────────────────
 
 def delete_variant_detail(db: Session, detail_id: int):
@@ -512,6 +562,7 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
             "productVariantId":       p.productVariantId,
             "sizeId":                 p.sizeId,
             "cupSizeId":              p.cupSizeId,
+            "stockId":                p.stockId,          # ← was missing
             "stockQuantity":          total,
             "processedQuantity":      processed,
             "returnedQuantity":       refunded,
@@ -545,8 +596,10 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
             base["processedQuantity"]= sum(p["processedQuantity"] for p in pvd_list)
             base["returnedQuantity"] = sum(p["returnedQuantity"]  for p in pvd_list)
             base["availableQuantity"]= sum(p["availableQuantity"] for p in pvd_list)
+            base["stockId"]          = None   # stockId is per cup-combination, not per band
             base["isAggregate"]      = True
             base["pvdCount"]         = len(pvd_list)
+            base["pvds"]             = pvd_list  # pass all individual pvds so cup tiles can read their own stockId
             pvd_by_size[size_id]     = base
 
     # ── Build response ────────────────────────────────────────────────────────
