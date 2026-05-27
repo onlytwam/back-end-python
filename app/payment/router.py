@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+import os
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -54,7 +55,7 @@ async def get_current_user_optional(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _frontend_url() -> str:
-    return get_setting("frontend_base_url", "http://localhost:5173")
+    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"
 
 
 def _record_payment_log(
@@ -516,7 +517,9 @@ async def payment_callback(
     # the RedirectUrl.  In some configurations it POSTs form data instead.
     # We merge BOTH query-string params AND body params so we never miss a field.
     params: dict = {}
-
+    print(f"[Payment:Callback] frontend_base_url raw = {get_setting('frontend_base_url', 'NOT_FOUND')}")
+    print(f"[Payment:Callback] _frontend_url() = {_frontend_url()}")
+    print(f"Helloooooooooooooooooooooooooooooooooooooo")
     # Always read query-string params (present on both GET and POST)
     params.update(dict(request.query_params))
 
@@ -877,6 +880,14 @@ async def payment_callback(
     print(f"{SEP}\n")
     return RedirectResponse(url=redirect_url, status_code=302)
 
+
+@router.get("/debug-settings")
+def debug_settings():
+    return {
+        "frontend_base_url_raw": get_setting("frontend_base_url", "NOT_IN_DB"),
+        "frontend_url_fn": _frontend_url(),
+        "env_var": os.getenv("FRONTEND_BASE_URL", "NOT_SET"),
+    }
 
 # ── PayG Server-to-Server (S2S) Webhook ───────────────────────────────────────
 #
@@ -1312,7 +1323,7 @@ def get_payg_config():
         payg_secure_hash     = _mask(get_setting("payg_secure_hash", "")),
         payg_merchant_key_id = get_setting("payg_merchant_key_id", ""),
         payg_redirect_url    = get_setting("payg_redirect_url", ""),
-        frontend_base_url    = get_setting("frontend_base_url", "http://localhost:5173"),
+        frontend_base_url    = get_setting("frontend_base_url"),
     )
 
 
