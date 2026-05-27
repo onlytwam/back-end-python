@@ -174,7 +174,7 @@ def create_variant_detail(db: Session, data) -> int:
     except Exception:
         pass
 
-    # ── Auto-create initial StockLog entry ───────────────────────────────────
+    # ── Auto-create initial StockLog entry (system-only, not shown in history UI) ──
     try:
         log_entry = StockLog(
             productVariantDetailId = pvd.productVariantDetailId,
@@ -209,6 +209,10 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
     - returnedQuantity           → set by refunds; admin CAN override if needed.
     - availableQuantity          → ALWAYS auto-derived: total - processed + refunded.
     Price / discount / tax fields are updated normally.
+
+    NOTE: Stock changes made here are logged with changedBy="ProductDetail" so
+    they can be distinguished from Stock Page changes (changedBy="Admin") in
+    the stock log. Stock management should be done via the Stock Page.
     """
     pvd = db.query(ProductVariantDetail).filter(
         ProductVariantDetail.productVariantDetailId == pvd_id
@@ -266,6 +270,7 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         pass
 
     # ── Auto-create StockLog entries for any changed stock fields ────────────
+    # changedBy = "ProductDetail" so these are distinguishable in the stock log.
     try:
         stock_changes = []
         if data.stockQuantity is not None and data.stockQuantity != prev_stock:
@@ -288,8 +293,8 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
                 processedQuantity      = pvd.processedQuantity or 0,
                 returnedQuantity       = pvd.returnedQuantity or 0,
                 availableQuantity      = pvd.availableQuantity or 0,
-                note                   = "Updated via product variant detail",
-                changedBy              = getattr(data, "modifiedBy", None) or "system",
+                note                   = "Stock changed via Product Detail page",
+                changedBy              = "ProductDetail",
             )
             db.add(log_entry)
         if stock_changes:
@@ -302,10 +307,12 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
 
 # ── Dedicated stock-only update (called by order / refund flows) ──────────────
 
-def increment_processed_quantity(db: Session, pvd_id: int, qty: int, now=None) -> bool:
+def increment_processed_quantity(db: Session, pvd_id: int, qty: int, now=None,
+                                  order_id: Optional[int] = None) -> bool:
     """
     Increment ProcessedQuantity by `qty` (order placed / payment confirmed).
     Recomputes AvailableQuantity in place.
+    Creates a StockLog entry with changeType=ORDER_PROCESSED, changedBy=order_system.
     Returns True on success.
     """
     pvd = db.query(ProductVariantDetail).filter(
@@ -313,16 +320,45 @@ def increment_processed_quantity(db: Session, pvd_id: int, qty: int, now=None) -
     ).first()
     if not pvd:
         return False
-    pvd.processedQuantity = (pvd.processedQuantity or 0) + qty
+
+    prev_processed = pvd.processedQuantity or 0
+    pvd.processedQuantity = prev_processed + qty
     _apply_stock_formula(pvd)
     pvd.modifiedDate = now or datetime.now(timezone.utc)
+
+    # ── Log this order-driven processed change ────────────────────────────────
+    try:
+        note = f"Order processed — quantity +{qty}"
+        if order_id:
+            note = f"Order #{order_id} processed — quantity +{qty}"
+        log_entry = StockLog(
+            productVariantDetailId = pvd_id,
+            productId              = pvd.productId,
+            productVariantId       = pvd.productVariantId,
+            stockId                = pvd.stockId,
+            changeType             = "ORDER_PROCESSED",
+            previousValue          = prev_processed,
+            newValue               = pvd.processedQuantity,
+            totalStock             = pvd.stockQuantity or 0,
+            processedQuantity      = pvd.processedQuantity,
+            returnedQuantity       = pvd.returnedQuantity or 0,
+            availableQuantity      = pvd.availableQuantity,
+            note                   = note,
+            changedBy              = "order_system",
+        )
+        db.add(log_entry)
+    except Exception:
+        pass  # Never block order flow if stock log fails
+
     return True
 
 
-def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None) -> bool:
+def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None,
+                                 order_id: Optional[int] = None) -> bool:
     """
     Increment ReturnedQuantity by `qty` (refund / cancellation).
     Recomputes AvailableQuantity in place.
+    Creates a StockLog entry with changeType=ORDER_RETURNED, changedBy=order_system.
     Returns True on success.
     """
     pvd = db.query(ProductVariantDetail).filter(
@@ -330,10 +366,87 @@ def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None) ->
     ).first()
     if not pvd:
         return False
-    pvd.returnedQuantity = (pvd.returnedQuantity or 0) + qty
+
+    prev_returned = pvd.returnedQuantity or 0
+    pvd.returnedQuantity = prev_returned + qty
     _apply_stock_formula(pvd)
     pvd.modifiedDate = now or datetime.now(timezone.utc)
+
+    # ── Log this order-driven returned change ─────────────────────────────────
+    try:
+        note = f"Order returned/cancelled — quantity +{qty}"
+        if order_id:
+            note = f"Order #{order_id} returned/cancelled — quantity +{qty}"
+        log_entry = StockLog(
+            productVariantDetailId = pvd_id,
+            productId              = pvd.productId,
+            productVariantId       = pvd.productVariantId,
+            stockId                = pvd.stockId,
+            changeType             = "ORDER_RETURNED",
+            previousValue          = prev_returned,
+            newValue               = pvd.returnedQuantity,
+            totalStock             = pvd.stockQuantity or 0,
+            processedQuantity      = pvd.processedQuantity or 0,
+            returnedQuantity       = pvd.returnedQuantity,
+            availableQuantity      = pvd.availableQuantity,
+            note                   = note,
+            changedBy              = "order_system",
+        )
+        db.add(log_entry)
+    except Exception:
+        pass  # Never block order flow if stock log fails
+
     return True
+
+
+# ── Find by Stock ID ──────────────────────────────────────────────────────────
+
+def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
+    """
+    Exact case-insensitive lookup of a ProductVariantDetail by StockId.
+    Returns the minimal navigation payload needed to deep-link into
+    AdminProductDetail: productId, productVariantId, sizeId, cupSizeId.
+    Returns None when no match is found.
+    """
+    pvd = db.query(ProductVariantDetail).filter(
+        ProductVariantDetail.deletedInd == False,
+        ProductVariantDetail.stockId.ilike(stock_id),
+    ).first()
+
+    if not pvd:
+        return None
+
+    # Resolve size label from MDM
+    size_label = None
+    if pvd.sizeId:
+        row = db.execute(
+            text('SELECT "SizeLabel" FROM mdm."Size" WHERE "SizeId" = :id LIMIT 1'),
+            {"id": pvd.sizeId},
+        ).fetchone()
+        size_label = row[0] if row else None
+
+    # Resolve cup size label from MDM
+    cup_size_label = None
+    if pvd.cupSizeId:
+        row = db.execute(
+            text('SELECT "SizeLabel" FROM mdm."CupSize" WHERE "CupSizeId" = :id LIMIT 1'),
+            {"id": pvd.cupSizeId},
+        ).fetchone()
+        cup_size_label = row[0] if row else None
+
+    return {
+        "found":                  True,
+        "productId":              pvd.productId,
+        "productVariantId":       pvd.productVariantId,
+        "productVariantDetailId": pvd.productVariantDetailId,
+        "sizeId":                 pvd.sizeId,
+        "sizeLabel":              size_label,
+        "cupSizeId":              pvd.cupSizeId,
+        "cupSizeLabel":           cup_size_label,
+        "stockId":                pvd.stockId,
+        "stockQuantity":          pvd.stockQuantity,
+        "availableQuantity":      pvd.availableQuantity,
+    }
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
@@ -449,6 +562,7 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
             "productVariantId":       p.productVariantId,
             "sizeId":                 p.sizeId,
             "cupSizeId":              p.cupSizeId,
+            "stockId":                p.stockId,          # ← was missing
             "stockQuantity":          total,
             "processedQuantity":      processed,
             "returnedQuantity":       refunded,
@@ -482,8 +596,10 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
             base["processedQuantity"]= sum(p["processedQuantity"] for p in pvd_list)
             base["returnedQuantity"] = sum(p["returnedQuantity"]  for p in pvd_list)
             base["availableQuantity"]= sum(p["availableQuantity"] for p in pvd_list)
+            base["stockId"]          = None   # stockId is per cup-combination, not per band
             base["isAggregate"]      = True
             base["pvdCount"]         = len(pvd_list)
+            base["pvds"]             = pvd_list  # pass all individual pvds so cup tiles can read their own stockId
             pvd_by_size[size_id]     = base
 
     # ── Build response ────────────────────────────────────────────────────────

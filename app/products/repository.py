@@ -142,16 +142,14 @@ def _to_response(db: Session, product: Products) -> dict:
     # Resolve the first image for this product (variant image first, then product-level fallback)
     image_url = None
     try:
-        img_row = db.execute(text(
-            """
+        img_row = db.execute(text("""
             SELECT "FilePath" FROM twam."ProductImage"
             WHERE "ProductId" = :pid
               AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
               AND "FilePath" IS NOT NULL
             ORDER BY "ProductImageId" ASC
             LIMIT 1
-            """
-        ), {"pid": product.productId}).fetchone()
+            """), {"pid": product.productId}).fetchone()
         if img_row and img_row[0]:
             fp = img_row[0]
             if fp.startswith("http"):
@@ -161,33 +159,57 @@ def _to_response(db: Session, product: Products) -> dict:
     except Exception:
         pass
 
+    # Resolve Tax / HSN code details
+    tax_hsn_code        = None
+    tax_hsn_description = None
+    total_gst           = None
+    if product.taxHSNCodeId:
+        try:
+            hsn_row = db.execute(
+                text("""
+                    SELECT "HsnCode", "HsnDescription", "TotalGST"
+                    FROM mdm."TaxHSNCode"
+                    WHERE "TaxHSNCodeId" = :id LIMIT 1
+                """),
+                {"id": product.taxHSNCodeId},
+            ).fetchone()
+            if hsn_row:
+                tax_hsn_code        = hsn_row[0]
+                tax_hsn_description = hsn_row[1]
+                total_gst           = float(hsn_row[2]) if hsn_row[2] is not None else None
+        except Exception:
+            pass
+
     return {
-        "productId":        product.productId,
-        "productCode":      product.productCode,
-        "name":             product.name,
-        "description":      product.description,
-        "categoryId":       product.categoryId,
-        "childCategoryId":  product.childCategoryId,
+        "productId":           product.productId,
+        "productCode":         product.productCode,
+        "name":                product.name,
+        "description":         product.description,
+        "categoryId":          product.categoryId,
+        "childCategoryId":     product.childCategoryId,
         "categoryName":        category_name,
         "categoryIsActive":    category_is_active,
         "categoryDeletedInd":  category_deleted,
-        "brandId":          product.brandId,
-        "brandName":        brand_name,
-        # These two fields let the admin UI show warning badges
-        "brandIsActive":    brand_is_active,
-        "brandDeletedInd":  brand_deleted,
-        "personalId":       product.personalId,
-        "userProfileId":    product.userProfileId,
-        "tag":              product.tag,
-        "state":            product.state,
-        "isActive":         product.isActive if product.isActive is not None else True,
-        "deletedInd":       product.deletedInd if product.deletedInd is not None else False,
-        "createdBy":        product.createdBy,
-        "modifiedBy":       product.modifiedBy,
-        "createdDate":      product.createdDate,
-        "modifiedDate":     product.modifiedDate,
-        "imageUrl":         image_url,
-        "allVariants":     _get_product_variants(db, product.productId),
+        "brandId":             product.brandId,
+        "brandName":           brand_name,
+        "brandIsActive":       brand_is_active,
+        "brandDeletedInd":     brand_deleted,
+        "taxHSNCodeId":        product.taxHSNCodeId,
+        "taxHSNCode":          tax_hsn_code,
+        "taxHSNDescription":   tax_hsn_description,
+        "totalGST":            total_gst,
+        "personalId":          product.personalId,
+        "userProfileId":       product.userProfileId,
+        "tag":                 product.tag,
+        "state":               product.state,
+        "isActive":            product.isActive if product.isActive is not None else True,
+        "deletedInd":          product.deletedInd if product.deletedInd is not None else False,
+        "createdBy":           product.createdBy,
+        "modifiedBy":          product.modifiedBy,
+        "createdDate":         product.createdDate,
+        "modifiedDate":        product.modifiedDate,
+        "imageUrl":            image_url,
+        "allVariants":         _get_product_variants(db, product.productId),
     }
 
 
@@ -291,6 +313,7 @@ def create_product(db: Session, data) -> int:
         categoryId      = data.categoryId,
         childCategoryId = data.childCategoryId,
         brandId         = data.brandId,
+        taxHSNCodeId    = getattr(data, "taxHSNCodeId", None),
         personalId      = data.personalId,
         userProfileId   = data.userProfileId,
         state           = data.state,
@@ -325,7 +348,7 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
         return None
 
     for field in ("productCode", "name", "description", "categoryId",
-                  "childCategoryId", "brandId", "personalId",
+                  "childCategoryId", "brandId", "taxHSNCodeId", "personalId",
                   "userProfileId", "state", "tag", "modifiedBy"):
         val = getattr(data, field, None)
         if val is not None:
@@ -471,6 +494,67 @@ def delete_product(db: Session, product_id: int) -> bool:
         pass
 
     return True
+
+
+def search_products_by_name_or_code(
+    db: Session,
+    q: str,
+    page_index: int = 1,
+    page_size: int  = 20,
+) -> dict:
+    """
+    Case-insensitive search across Name OR ProductCode.
+    Returns the same ProductListResponse envelope as get_all_products.
+    """
+    term = f"%{q}%"
+    base = (
+        db.query(Products)
+        .filter(
+            Products.deletedInd == False,
+            (Products.name.ilike(term)) | (Products.productCode.ilike(term)),
+        )
+        .order_by(Products.name)
+    )
+    total = base.count()
+    rows  = base.offset((page_index - 1) * page_size).limit(page_size).all()
+    return {
+        "count": total,
+        "list":  [_to_response(db, p) for p in rows],
+        "parameters": None,
+    }
+
+
+def search_products_by_stock_id(db: Session, stock_id: str) -> dict:
+    """
+    Find the product(s) that own a ProductVariantDetail whose StockId matches
+    the given value (exact, case-insensitive).
+    Returns the same ProductListResponse envelope.
+    """
+    rows = db.execute(
+        text("""
+            SELECT DISTINCT p."ProductId"
+            FROM twam."Products" p
+            JOIN twam."ProductVariantDetail" pvd
+              ON pvd."ProductId" = p."ProductId"
+             AND pvd."DeletedInd" = false
+            WHERE p."DeletedInd" = false
+              AND LOWER(pvd."StockId") = LOWER(:sid)
+        """),
+        {"sid": stock_id},
+    ).fetchall()
+
+    product_ids = [r[0] for r in rows]
+    products    = []
+    for pid in product_ids:
+        p = db.query(Products).filter(Products.productId == pid).first()
+        if p:
+            products.append(_to_response(db, p))
+
+    return {
+        "count": len(products),
+        "list":  products,
+        "parameters": None,
+    }
 
 
 def check_product_validations(db: Session, product_id: int, state: Optional[str] = None) -> bool:

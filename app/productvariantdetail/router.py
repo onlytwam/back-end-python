@@ -101,10 +101,10 @@ def get_new_arrivals(
 @router.get("/GetProductColor")
 def get_product_colors(db: Session = Depends(get_db)):
     rows = db.execute(sqlalchemy.text(
-        'SELECT DISTINCT "Color" FROM twam."ProductVariants" '
+        'SELECT DISTINCT "Color", "ColorFamily" FROM twam."ProductVariants" '
         'WHERE "DeletedInd"=false AND "Color" IS NOT NULL ORDER BY "Color"'
     )).fetchall()
-    return [r[0] for r in rows]
+    return [{"color": r[0], "colorFamily": r[1]} for r in rows]
 
 
 @router.get("/ProductDetail/{pvd_id}", response_model=schemas.UserProductDetailResponse)
@@ -144,7 +144,27 @@ def get_variant_details(
 
 @router.post("", status_code=201, dependencies=[Depends(get_current_user)])
 def create_variant_detail(command: schemas.ProductVariantDetailCreate, db: Session = Depends(get_db)):
-    return {"productVariantDetailId": repository.create_variant_detail(db, command)}
+    new_id = repository.create_variant_detail(db, command)
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        add_event(
+            db,
+            product_id               = getattr(command, "productId", 0),
+            product_variant_id       = getattr(command, "productVariantId", None),
+            product_variant_detail_id = new_id,
+            event_type               = "SIZE_ADDED",
+            event_source             = "ProductDetail",
+            description              = f"Size added — stock: {getattr(command, 'stockQuantity', 0)}",
+            stock_before             = None,
+            stock_after              = getattr(command, "stockQuantity", None),
+            changed_by               = getattr(command, "createdBy", None) or "Admin",
+            product_code             = getattr(command, "productCode", None),
+            stock_id                 = getattr(command, "stockId", None),
+        )
+    except Exception:
+        pass
+    return {"productVariantDetailId": new_id}
 
 
 @router.post("/CheckValidations", response_model=schemas.CheckVariantDetailResponse,
@@ -184,8 +204,54 @@ def toggle_variant_detail_active(pvd_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/{pvd_id}", status_code=204, dependencies=[Depends(get_current_user)])
 def delete_variant_detail(pvd_id: int, db: Session = Depends(get_db)):
+    # Snapshot before deletion for audit log
+    pvd_snap = None
+    try:
+        pvd_snap = repository.get_variant_detail_by_id(db, pvd_id)
+    except Exception:
+        pass
     if not repository.delete_variant_detail(db, pvd_id):
         raise HTTPException(404, "ProductVariantDetail not found.")
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        add_event(
+            db,
+            product_id               = pvd_snap.get("productId", 0) if pvd_snap else 0,
+            product_variant_id       = pvd_snap.get("productVariantId") if pvd_snap else None,
+            product_variant_detail_id = pvd_id,
+            event_type               = "SIZE_DELETED",
+            event_source             = "ProductDetail",
+            description              = f"Size deleted [PVD {pvd_id}] — stock was: {pvd_snap.get('stockQuantity', 0) if pvd_snap else '?'}",
+            stock_before             = pvd_snap.get("stockQuantity") if pvd_snap else None,
+            stock_after              = None,
+            changed_by               = "Admin",
+            product_code             = pvd_snap.get("productCode") if pvd_snap else None,
+            stock_id                 = pvd_snap.get("stockId") if pvd_snap else None,
+        )
+    except Exception:
+        pass
+
+
+# ── Find by Stock ID (admin deep-link) ────────────────────────────────────────
+@router.get("/FindByStockId", dependencies=[Depends(get_current_user)])
+def find_by_stock_id(
+    stockId: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+):
+    """
+    Exact (case-insensitive) lookup of a ProductVariantDetail by StockId.
+    Returns productId + productVariantId + sizeId + cupSizeId so the
+    admin frontend can deep-link directly to the right variant tile.
+    Returns 404 when no match is found.
+    """
+    result = repository.find_by_stock_id(db, stockId.strip())
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No variant detail found with Stock ID '{stockId}'",
+        )
+    return result
 
 
 # /{pvd_id} MUST be last — it's a catch-all for any integer path segment

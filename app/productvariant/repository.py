@@ -9,23 +9,29 @@ from app.productvariantdetail.models import ProductVariantDetail
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import ProductVariant, ProductImage
-from app.shared.color_utils import get_matching_db_colors, is_color_query, get_color_hex, resolve_hex, _hex_to_rgb, _redmean_distance
+from app.shared.color_utils import COLOR_FAMILY_MAP
 
 
 
-def _upsert_product_color(db, color_name: str):
-    """Auto-register a color in ProductColor table when a variant is saved."""
-    if not color_name:
-        return
-    hex_val = resolve_hex(color_name) or '#808080'
-    try:
-        db.execute(text("""
-            INSERT INTO twam."ProductColor" ("ColorName", "HexValue")
-            VALUES (:name, :hex)
-            ON CONFLICT ("ColorName") DO UPDATE SET "HexValue" = EXCLUDED."HexValue"
-        """), {"name": color_name.lower().strip(), "hex": hex_val})
-    except Exception:
-        pass  # Table may not exist yet — ignore
+def _get_colors_by_family(db, query: str) -> list[str]:
+    """
+    Return Color values from ProductVariants whose ColorFamily matches the
+    queried name (e.g. "navy" -> "Blue"). Falls back to [query] for ILIKE.
+    """
+    family = COLOR_FAMILY_MAP.get(query.lower().strip())
+    if family:
+        try:
+            rows = db.execute(text(
+                'SELECT DISTINCT "Color" FROM twam."ProductVariants" '
+                'WHERE "ColorFamily" = :fam '
+                '  AND ("DeletedInd" = false OR "DeletedInd" IS NULL) '
+                '  AND "Color" IS NOT NULL'
+            ), {"fam": family}).fetchall()
+            if rows:
+                return [r[0] for r in rows if r[0]]
+        except Exception:
+            pass
+    return [query]
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
@@ -93,6 +99,7 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "productCode":        variant.productCode,
         "fabricId":           variant.fabricId,
         "color":              variant.color,
+        "colorFamily":        variant.colorFamily,
         "isBestSeller":       variant.isBestSeller,
         "isReturnAvailable":  variant.isReturnAvailable,
         "isCupSize":          variant.isCupSize,
@@ -183,6 +190,7 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
         productCode        = data.productCode,
         fabricId           = data.fabricId,
         color              = data.color,
+        colorFamily        = data.colorFamily,
         isBestSeller       = data.isBestSeller,
         isReturnAvailable  = data.isReturnAvailable,
         isCupSize          = data.isCupSize,
@@ -206,7 +214,6 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
                 deletedInd       = False,
             ))
 
-    _upsert_product_color(db, data.color)
     db.commit()
 
     try:
@@ -234,6 +241,7 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
     variant.variantDescription = data.variantDescription if data.variantDescription is not None else variant.variantDescription
     variant.productCode        = data.productCode        if data.productCode        is not None else variant.productCode
     variant.color              = data.color              if data.color              is not None else variant.color
+    variant.colorFamily        = data.colorFamily        if data.colorFamily        is not None else variant.colorFamily
     variant.fabricId           = data.fabricId           if data.fabricId           is not None else variant.fabricId
     variant.isBestSeller       = data.isBestSeller       if data.isBestSeller       is not None else variant.isBestSeller
     variant.isReturnAvailable  = data.isReturnAvailable  if data.isReturnAvailable  is not None else variant.isReturnAvailable
@@ -260,7 +268,6 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
                 deletedInd       = False,
             ))
 
-    _upsert_product_color(db, data.color)
     db.commit()
 
     try:
@@ -459,7 +466,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         """)).fetchall()
 
     color_rows = db.execute(text("""
-        SELECT pv2."ProductVariantId", pv2."Color",
+        SELECT pv2."ProductVariantId", pv2."Color", pv2."ColorFamily",
             (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
                       ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
              FROM twam."ProductImage" pi2
@@ -508,7 +515,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             "hasStock":  any(r[1] == c[0] and (r[3] or 0) > 0 for r in pvd_matrix_rows),
         } for c in all_cup_rows],
         "colors": [{
-            "productVariantId": cr[0], "color": cr[1], "image": cr[2]
+            "productVariantId": cr[0], "color": cr[1], "colorFamily": cr[2], "image": cr[3]
         } for cr in color_rows],
     }
 
@@ -558,11 +565,22 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
     conds = [
         "(pv.\"DeletedInd\" = false OR pv.\"DeletedInd\" IS NULL)",
         "(p.\"DeletedInd\"  = false OR p.\"DeletedInd\"  IS NULL)",
-        # Hide variants that have been hidden by admin (isActive = false).
-        # NULL isActive is treated as active (visible).
+        # Only show the currently selected variant if it is active.
+        # If a specific variant is hidden, skip it — but the product still
+        # appears in the listing if it has OTHER active variants (handled via
+        # the DISTINCT ON logic: only active variants drive the listing rows).
         "(pv.\"IsActive\" = true OR pv.\"IsActive\" IS NULL)",
-        # Hide products that have been deactivated (hidden) by admin.
+        # Hide products that have been deactivated at product level by admin.
         "(p.\"IsActive\" = true OR p.\"IsActive\" IS NULL)",
+        # Ensure the product has AT LEAST ONE active, non-deleted variant.
+        # This prevents a product with ALL hidden variants from disappearing
+        # due to a count-of-zero issue while still being correct.
+        """EXISTS (
+            SELECT 1 FROM twam.\"ProductVariants\" pv2
+            WHERE pv2.\"ProductId\" = p.\"ProductId\"
+              AND (pv2.\"DeletedInd\" = false OR pv2.\"DeletedInd\" IS NULL)
+              AND (pv2.\"IsActive\" = true OR pv2.\"IsActive\" IS NULL)
+        )""",
         # Hide products whose parent category has been deleted or made inactive.
         # pc is LEFT JOINed so if CategoryId is NULL we allow it through.
         "(p.\"CategoryId\" IS NULL OR (pc.\"DeletedInd\" = false AND pc.\"IsActive\" = true))",
@@ -665,25 +683,16 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             conds.append(f'pvd."CupSize"::TEXT IN ({in_ph})')
 
     col = _fv("color")
-    color_proximity_anchor = None
     if col and col not in ("0", ""):
-        if is_color_query(col):
-            col_vals = get_matching_db_colors(db, col)
-            color_proximity_anchor = resolve_hex(col)
+        if col.lower().strip() in COLOR_FAMILY_MAP:
+            # Known color name: expand to all variants in the same family
+            col_vals = _get_colors_by_family(db, col)
         elif "," in col:
+            # Comma-separated list of explicit color names
             col_vals = [v.strip() for v in col.split(",") if v.strip()]
-            try:
-                hexes = [resolve_hex(c) for c in col_vals if resolve_hex(c)]
-                if hexes:
-                    r_avg = sum(_hex_to_rgb(h)[0] for h in hexes) // len(hexes)
-                    g_avg = sum(_hex_to_rgb(h)[1] for h in hexes) // len(hexes)
-                    b_avg = sum(_hex_to_rgb(h)[2] for h in hexes) // len(hexes)
-                    color_proximity_anchor = f"#{r_avg:02x}{g_avg:02x}{b_avg:02x}"
-            except Exception:
-                color_proximity_anchor = None
         else:
+            # Fallback: direct ILIKE on whatever was passed
             col_vals = [col]
-            color_proximity_anchor = resolve_hex(col)
 
         if col_vals:
             color_conds = " OR ".join(
@@ -925,18 +934,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             "brandName":         m["brand_name"],
         })
 
-    # Proximity sort for colour results (closest colour match first)
-    if color_proximity_anchor:
-        def _color_key(item):
-            c = item.get("color", "") or ""
-            hex_val = resolve_hex(c)
-            if not hex_val:
-                return 9999.0
-            try:
-                return _redmean_distance(color_proximity_anchor, hex_val)
-            except Exception:
-                return 9999.0
-        items.sort(key=_color_key)
+    # Color results returned in DB order (ColorFamily-based grouping handles relevance)
 
     return {"count": total, "list": items}
 

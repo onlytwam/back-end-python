@@ -12,6 +12,7 @@ class ProductCreate(BaseModel):
     categoryId:      Optional[int]  = None
     childCategoryId: Optional[int]  = None
     brandId:         Optional[int]  = None
+    taxHSNCodeId:    Optional[int]  = None
     personalId:      Optional[int]  = None
     userProfileId:   Optional[str]  = None
     state:           Optional[str]  = None
@@ -29,6 +30,7 @@ class ProductUpdate(BaseModel):
     categoryId:      Optional[int]  = None
     childCategoryId: Optional[int]  = None
     brandId:         Optional[int]  = None
+    taxHSNCodeId:    Optional[int]  = None
     personalId:      Optional[int]  = None
     userProfileId:   Optional[str]  = None
     state:           Optional[str]  = None
@@ -79,6 +81,10 @@ class ProductResponse(BaseModel):
     categoryId:       Optional[int]  = None
     childCategoryId:  Optional[int]  = None
     brandId:          Optional[int]  = None
+    taxHSNCodeId:     Optional[int]  = None   # FK → mdm.TaxHSNCode
+    taxHSNCode:       Optional[str]  = None   # resolved HSN code string
+    taxHSNDescription: Optional[str] = None   # resolved HSN description
+    totalGST:         Optional[float]= None   # resolved GST %
     personalId:       Optional[int]  = None
     userProfileId:    Optional[str]  = None
     tag:              Optional[str]  = None
