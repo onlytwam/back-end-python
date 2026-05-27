@@ -33,6 +33,24 @@ from . import payg_client
 router = APIRouter(prefix="/api/Payment", tags=["Payment"])
 
 
+# ── Optional-auth dependency ───────────────────────────────────────────────
+# get_current_user raises HTTPException(401/403) when no token is present.
+# Simply typing a parameter as Optional[CurrentUser] does NOT suppress that
+# raise — FastAPI still propagates it.  This wrapper catches any auth
+# exception and returns None instead, which is what we need for the Status
+# endpoint so unauthenticated polls (session lost after PayG redirect) still
+# work.
+
+async def get_current_user_optional(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Optional[CurrentUser]:
+    try:
+        return await get_current_user(request, db)
+    except Exception:
+        return None
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _frontend_url() -> str:
@@ -842,6 +860,7 @@ async def payment_callback(
     # outcome without the user seeing a false "declined" screen.
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
+
     elif response_code == 2:
         # Definitive bank decline — safe to show failure page
         reason = params.get("PaymentReasonCode") or "declined"
@@ -1110,29 +1129,16 @@ def debug_payment(
 # ── Status poll ────────────────────────────────────────────────────────────
 
 @router.get("/Status/{order_id}")
-def get_payment_status(
+async def get_payment_status(
     order_id: int,
     db: Session = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
+    # FIX: use get_current_user_optional instead of get_current_user.
+    # get_current_user raises HTTPException when no token is present;
+    # Optional[CurrentUser] on its own does NOT suppress that raise.
+    # After a PayG redirect the browser session/cookie is typically lost,
+    # so every poll would return 403 without this wrapper.
+    current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
 ):
-    """
-    Frontend polls this endpoint every 3 seconds from the ?payment=pending screen.
-    Returns the order's current state from the DB.
-
-    IMPORTANT: This endpoint NO LONGER calls the PayG Detail API because the
-    Detail API requires an IP whitelist entry that is often missing in UAT/staging.
-    Instead it returns the state already stored in the DB.
-
-    How the state gets updated:
-    1. PayG posts a server-to-server callback to /api/Payment/Callback (if configured)
-       which sets state → Confirmed / Payment Failed in the DB.
-    2. If that callback arrives AFTER the frontend redirect, the next poll here
-       will return the updated state and the frontend resolves the spinner.
-    3. If the server callback never arrives (not configured), an admin can manually
-       update the order state from the dashboard.
-
-    The frontend stops polling when it sees 'Confirmed' or 'Payment Failed'.
-    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
@@ -1140,26 +1146,20 @@ def get_payment_status(
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if current_user.role_id not in Roles.STAFF and order.userProfileId != current_user.user_id:
-        raise HTTPException(403, "Not authorised")
+    # Only enforce ownership check if user is authenticated.
+    # Unauthenticated polls are allowed — PayG redirect may lose session.
+    if current_user and current_user.role_id not in Roles.STAFF:
+        if order.userProfileId != current_user.user_id:
+            raise HTTPException(403, "Not authorised")
 
     local_state = order.state or "AwaitingPayment"
 
-    # Send the deferred success notification the first time we see "Confirmed".
-    # (It was skipped at callback time because code was -1/0/4 at that point.)
-    # Guard: only send once — check paymentNotificationSent flag if available,
-    # otherwise the notification function must be idempotent.
     if local_state == "Confirmed":
         try:
             from app.ekart.notifications import send_order_placed_notification
             send_order_placed_notification(db, order_id)
         except Exception as exc:
-            print(f"[Payment/Status] Deferred success notification error for order {order_id}: {exc}")
-
-    print(
-        f"[Payment/Status] order={order_id} state={local_state!r} "
-        f"(DB-only — not calling Detail API)"
-    )
+            print(f"[Payment/Status] Deferred notification error: {exc}")
 
     return {
         "orderId":              order_id,
