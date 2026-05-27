@@ -3,7 +3,7 @@ trigger:
     include:
       - develop
       - backend-setup/Vishnu
-      - feature/*
+      - feature/*                  # ✅ covers ALL feature branches
       - backend/v2/Mamatha
       - feature/Eshwar
 
@@ -20,8 +20,8 @@ variables:
   containerRegistry: 'twamregistry.azurecr.io'
 
 steps:
-  - checkout: self        # ← REQUIRED when resources block exists
-    persistCredentials: true
+  # ❌ Removed checkout: self and resources block
+  # (same as frontend — uses implicit access)
 
   - task: Docker@2
     displayName: Build only (feature branch and PR validation)
