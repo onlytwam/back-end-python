@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy.orm import Session
-from sqlalchemy import asc, desc, text
+from sqlalchemy import asc, desc, text, func
+import sqlalchemy
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import ProductVariantDetail
@@ -404,35 +405,44 @@ def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None,
 def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
     """
     Exact case-insensitive lookup of a ProductVariantDetail by StockId.
-    Returns the minimal navigation payload needed to deep-link into
-    AdminProductDetail: productId, productVariantId, sizeId, cupSizeId.
+    Returns the minimal navigation payload for the admin deep-link.
     Returns None when no match is found.
     """
-    pvd = db.query(ProductVariantDetail).filter(
-        ProductVariantDetail.deletedInd == False,
-        ProductVariantDetail.stockId.ilike(stock_id),
-    ).first()
+    try:
+        pvd = db.query(ProductVariantDetail).filter(
+            ProductVariantDetail.deletedInd == False,
+            sqlalchemy.func.lower(ProductVariantDetail.stockId) == stock_id.lower(),
+        ).first()
+    except Exception:
+        pvd = db.query(ProductVariantDetail).filter(
+            ProductVariantDetail.deletedInd == False,
+            ProductVariantDetail.stockId == stock_id,
+        ).first()
 
     if not pvd:
         return None
 
-    # Resolve size label from MDM
     size_label = None
-    if pvd.sizeId:
-        row = db.execute(
-            text('SELECT "SizeLabel" FROM mdm."Size" WHERE "SizeId" = :id LIMIT 1'),
-            {"id": pvd.sizeId},
-        ).fetchone()
-        size_label = row[0] if row else None
+    try:
+        if pvd.sizeId:
+            row = db.execute(
+                text('SELECT "SizeLabel" FROM mdm."Size" WHERE "SizeId" = :id LIMIT 1'),
+                {"id": pvd.sizeId},
+            ).fetchone()
+            size_label = row[0] if row else None
+    except Exception:
+        pass
 
-    # Resolve cup size label from MDM
     cup_size_label = None
-    if pvd.cupSizeId:
-        row = db.execute(
-            text('SELECT "SizeLabel" FROM mdm."CupSize" WHERE "CupSizeId" = :id LIMIT 1'),
-            {"id": pvd.cupSizeId},
-        ).fetchone()
-        cup_size_label = row[0] if row else None
+    try:
+        if pvd.cupSizeId:
+            row = db.execute(
+                text('SELECT "SizeLabel" FROM mdm."CupSize" WHERE "CupSizeId" = :id LIMIT 1'),
+                {"id": pvd.cupSizeId},
+            ).fetchone()
+            cup_size_label = row[0] if row else None
+    except Exception:
+        pass
 
     return {
         "found":                  True,
