@@ -404,60 +404,81 @@ def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None,
 
 def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
     """
-    Exact case-insensitive lookup of a ProductVariantDetail by StockId.
-    Returns the minimal navigation payload for the admin deep-link.
+    Case-insensitive lookup of a ProductVariantDetail by StockId.
+    Uses CAST("StockId" AS TEXT) so it works whether the DB column is
+    stored as String or BigInteger (avoids lower(bigint) type error).
     Returns None when no match is found.
     """
     try:
-        pvd = db.query(ProductVariantDetail).filter(
-            ProductVariantDetail.deletedInd == False,
-            sqlalchemy.func.lower(ProductVariantDetail.stockId) == stock_id.lower(),
-        ).first()
+        row = db.execute(
+            text("""
+                SELECT
+                    "ProductVariantDetailId",
+                    "ProductId",
+                    "ProductVariantId",
+                    CAST("StockId" AS TEXT) AS "StockId",
+                    "Size",
+                    "CupSize",
+                    "StockQuantity",
+                    "AvailableQuantity"
+                FROM twam."ProductVariantDetail"
+                WHERE "DeletedInd" = false
+                  AND LOWER(CAST("StockId" AS TEXT)) = LOWER(:sid)
+                LIMIT 1
+            """),
+            {"sid": stock_id.strip()},
+        ).fetchone()
     except Exception:
-        pvd = db.query(ProductVariantDetail).filter(
-            ProductVariantDetail.deletedInd == False,
-            ProductVariantDetail.stockId == stock_id,
-        ).first()
-
-    if not pvd:
+        db.rollback()
         return None
+
+    if not row:
+        return None
+
+    pvd_detail_id = row[0]
+    product_id    = row[1]
+    variant_id    = row[2]
+    stock_id_val  = row[3]
+    size_id       = row[4]   # int FK stored in "Size" column
+    cup_size_id   = row[5]   # int FK stored in "CupSize" column
+    stock_qty     = row[6]
+    avail_qty     = row[7]
 
     size_label = None
     try:
-        if pvd.sizeId:
-            row = db.execute(
+        if size_id:
+            r = db.execute(
                 text('SELECT "SizeLabel" FROM mdm."Size" WHERE "SizeId" = :id LIMIT 1'),
-                {"id": pvd.sizeId},
+                {"id": size_id},
             ).fetchone()
-            size_label = row[0] if row else None
+            size_label = r[0] if r else None
     except Exception:
-        pass
+        db.rollback()
 
     cup_size_label = None
     try:
-        if pvd.cupSizeId:
-            row = db.execute(
+        if cup_size_id:
+            r = db.execute(
                 text('SELECT "SizeLabel" FROM mdm."CupSize" WHERE "CupSizeId" = :id LIMIT 1'),
-                {"id": pvd.cupSizeId},
+                {"id": cup_size_id},
             ).fetchone()
-            cup_size_label = row[0] if row else None
+            cup_size_label = r[0] if r else None
     except Exception:
-        pass
+        db.rollback()
 
     return {
         "found":                  True,
-        "productId":              pvd.productId,
-        "productVariantId":       pvd.productVariantId,
-        "productVariantDetailId": pvd.productVariantDetailId,
-        "sizeId":                 pvd.sizeId,
+        "productId":              product_id,
+        "productVariantId":       variant_id,
+        "productVariantDetailId": pvd_detail_id,
+        "sizeId":                 size_id,
         "sizeLabel":              size_label,
-        "cupSizeId":              pvd.cupSizeId,
+        "cupSizeId":              cup_size_id,
         "cupSizeLabel":           cup_size_label,
-        "stockId":                pvd.stockId,
-        "stockQuantity":          pvd.stockQuantity,
-        "availableQuantity":      pvd.availableQuantity,
+        "stockId":                stock_id_val,
+        "stockQuantity":          stock_qty,
+        "availableQuantity":      avail_qty,
     }
-
 
 # ── Delete ────────────────────────────────────────────────────────────────────
 
