@@ -120,7 +120,7 @@ def _get_product_variants(db: Session, product_id: int) -> list[dict]:
             """
             SELECT
                 "ProductVariantId", "ProductId", "VariantName",
-                "VariantDescription", "ProductCode", "Color",
+                "VariantDescription", "Color",
                 "IsBestSeller", "IsReturnAvailable", "IsCupSize",
                 "IsActive", "DeletedInd", "CreatedDate", "ModifiedDate"
             FROM twam."ProductVariants"
@@ -138,16 +138,16 @@ def _get_product_variants(db: Session, product_id: int) -> list[dict]:
             "productId": r[1],
             "variantName": r[2],
             "variantDescription": r[3],
-            "productCode": r[4],
-            "color": r[5],
-            "colorName": r[5],
-            "isBestSeller": r[6],
-            "isReturnAvailable": r[7],
-            "isCupSize": r[8],
-            "isActive": True if r[9] is None else bool(r[9]),
-            "deletedInd": False if r[10] is None else bool(r[10]),
-            "createdDate": r[11],
-            "modifiedDate": r[12],
+            # productCode removed from variant — lives on Products
+            "color": r[4],
+            "colorName": r[4],
+            "isBestSeller": r[5],
+            "isReturnAvailable": r[6],
+            "isCupSize": r[7],
+            "isActive": True if r[8] is None else bool(r[8]),
+            "deletedInd": False if r[9] is None else bool(r[9]),
+            "createdDate": r[10],
+            "modifiedDate": r[11],
             "images": _get_variant_images(db, r[0], product_id),
         }
         for r in rows
@@ -238,6 +238,19 @@ def _to_response(db: Session, product: Products) -> dict:
         except Exception:
             pass
 
+    # Resolve Fabric name from mdm.Fabric
+    fabric_name = None
+    if product.fabricId:
+        try:
+            fab_row = db.execute(
+                text('SELECT "FabricName" FROM mdm."Fabric" WHERE "FabricId" = :id LIMIT 1'),
+                {"id": product.fabricId},
+            ).fetchone()
+            if fab_row:
+                fabric_name = fab_row[0]
+        except Exception:
+            pass
+
     return {
         "productId":           product.productId,
         "productCode":         product.productCode,
@@ -252,6 +265,8 @@ def _to_response(db: Session, product: Products) -> dict:
         "brandName":           brand_name,
         "brandIsActive":       brand_is_active,
         "brandDeletedInd":     brand_deleted,
+        "fabricId":            product.fabricId,
+        "fabricName":          fabric_name,
         "taxHSNCodeId":        product.taxHSNCodeId,
         "taxHSNCode":          tax_hsn_code,
         "taxHSNDescription":   tax_hsn_description,
@@ -371,6 +386,7 @@ def create_product(db: Session, data) -> int:
         categoryId      = data.categoryId,
         childCategoryId = data.childCategoryId,
         brandId         = data.brandId,
+        fabricId        = data.fabricId,
         taxHSNCodeId    = getattr(data, "taxHSNCodeId", None),
         personalId      = data.personalId,
         userProfileId   = data.userProfileId,
@@ -416,6 +432,9 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
         val = getattr(data, field, None)
         if val is not None:
             setattr(product, field, val)
+
+    if data.fabricId is not None:
+        product.fabricId = data.fabricId
 
     product.modifiedDate = datetime.now(timezone.utc)
     db.commit()

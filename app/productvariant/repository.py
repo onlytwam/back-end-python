@@ -96,14 +96,12 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "variantDescription": variant.variantDescription,
         "userProfileId":      variant.userProfileId,
         "state":              variant.state,
-        "productCode":        variant.productCode,
-        "fabricId":           variant.fabricId,
+        # productCode, fabricId, taxHSNCodeId removed from variant level
         "color":              variant.color,
         "colorFamily":        variant.colorFamily,
         "isBestSeller":       variant.isBestSeller,
         "isReturnAvailable":  variant.isReturnAvailable,
         "isCupSize":          variant.isCupSize,
-        "taxHSNCodeId":       getattr(variant, "taxHSNCodeId", None),
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
         "images":             _get_images(db, variant.productVariantId, variant.productId),
@@ -187,8 +185,8 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
         variantDescription = data.variantDescription,
         userProfileId      = data.userProfileId,
         state              = data.state,
-        productCode        = data.productCode,
-        fabricId           = data.fabricId,
+        # productCode removed — lives on Products
+        # fabricId    removed — lives on Products
         color              = data.color,
         colorFamily        = data.colorFamily,
         isBestSeller       = data.isBestSeller,
@@ -239,15 +237,12 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
 
     variant.variantName        = data.variantName        if data.variantName        is not None else variant.variantName
     variant.variantDescription = data.variantDescription if data.variantDescription is not None else variant.variantDescription
-    variant.productCode        = data.productCode        if data.productCode        is not None else variant.productCode
+    # productCode, fabricId, taxHSNCodeId removed from variant — live on Products
     variant.color              = data.color              if data.color              is not None else variant.color
     variant.colorFamily        = data.colorFamily        if data.colorFamily        is not None else variant.colorFamily
-    variant.fabricId           = data.fabricId           if data.fabricId           is not None else variant.fabricId
     variant.isBestSeller       = data.isBestSeller       if data.isBestSeller       is not None else variant.isBestSeller
     variant.isReturnAvailable  = data.isReturnAvailable  if data.isReturnAvailable  is not None else variant.isReturnAvailable
     variant.isCupSize          = data.isCupSize          if data.isCupSize          is not None else variant.isCupSize
-    if hasattr(variant, "taxHSNCodeId") and data.taxHSNCodeId is not None:
-        variant.taxHSNCodeId = data.taxHSNCodeId
     variant.modifiedBy         = data.modifiedBy         if data.modifiedBy         is not None else variant.modifiedBy
     variant.modifiedDate       = datetime.now(timezone.utc)
 
@@ -854,7 +849,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 pvd."ProductVariantDetailId"                            AS pvd_id,
                 p."ProductId"                                           AS product_id,
                 p."ProductCode"                                         AS product_code,
-                pv."FabricId"                                           AS fabric_id,
+                p."FabricId"                                            AS fabric_id,
                 pvd."Size"                                              AS size_id,
                 pvd."CupSize"                                           AS cup_size_id,
                 COALESCE(pv."IsCupSize", false)                         AS is_cup_size,
@@ -888,7 +883,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                    AND (pi3."DeletedInd" = false OR pi3."DeletedInd" IS NULL)
                    AND pi3."FilePath" IS NOT NULL)                       AS images_arr,
                 COALESCE(p."Name", '')                                  AS name,
-                COALESCE(p."Description", '')                           AS description,
+                COALESCE(NULLIF(pv."VariantDescription", ''), p."Description", '') AS description,
                 COALESCE(
                     (SELECT ROUND(AVG(pr."Rating"::NUMERIC), 1)
                      FROM twam."ProductReview" pr
@@ -1038,7 +1033,7 @@ def get_new_arrivals(
                 pv."ProductVariantId"                                   AS pv_id,
                 p."ProductId"                                           AS product_id,
                 p."ProductCode"                                         AS product_code,
-                pv."FabricId"                                           AS fabric_id,
+                p."FabricId"                                            AS fabric_id,
                 COALESCE(s."SizeLabel", '')                             AS size_label,
                 COALESCE(pv."Color", '')                                AS color,
                 COALESCE(pvd."StockQuantity", 0)::INTEGER               AS stock_qty,
@@ -1069,7 +1064,7 @@ def get_new_arrivals(
                    AND (pi3."DeletedInd" = false OR pi3."DeletedInd" IS NULL)
                    AND pi3."FilePath" IS NOT NULL)                       AS images_arr,
                 COALESCE(p."Name", '')                                  AS name,
-                COALESCE(p."Description", '')                           AS description,
+                COALESCE(NULLIF(pv."VariantDescription", ''), p."Description", '') AS description,
                 COALESCE(
                     (SELECT ROUND(AVG(pr."Rating"::NUMERIC), 1)
                      FROM twam."ProductReview" pr

@@ -22,6 +22,9 @@ class Products(Base):
     # across all colour/size variants of the same product.
     # FK → mdm.TaxHSNCode.TaxHSNCodeId
     taxHSNCodeId    = Column("TaxHSNCodeId",     BigInteger, nullable=True)
+    # Fabric belongs at product level — all colour/size variants share the
+    # same fabric composition.  FK → mdm.Fabric.FabricId
+    fabricId        = Column("FabricId",         BigInteger, nullable=True)
     createdBy       = Column("CreatedBy",        String,     nullable=True)
     modifiedBy      = Column("ModifiedBy",       String,     nullable=True)
     createdDate     = Column("CreatedDate",      DateTime(timezone=True), server_default=func.now())

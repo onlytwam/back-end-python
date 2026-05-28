@@ -14,8 +14,9 @@ class ProductVariant(Base):
     variantDescription  = Column("VariantDescription",  String,     nullable=True)
     userProfileId       = Column("UserProfileId",       String,     nullable=True)
     state               = Column("State",               String,     nullable=True)
-    productCode         = Column("ProductCode",         String,     nullable=True)
-    fabricId            = Column("FabricId",            BigInteger, nullable=True)
+    # productCode removed — ProductCode lives on twam.Products
+    # fabricId    removed — FabricId now lives on twam.Products (product-level)
+    # taxHSNCodeId removed — TaxHSNCodeId lives on twam.Products (product-level)
     color               = Column("Color",               String,     nullable=True)
     colorFamily         = Column("ColorFamily",         String,     nullable=True)
     isBestSeller        = Column("IsBestSeller",        Boolean,    nullable=True)

@@ -8,7 +8,7 @@ from datetime import datetime
 class ProductVariantDetailCreate(BaseModel):
     productId:          int
     productVariantId:   int
-    productCode:        Optional[str]   = None
+    # productCode removed — lives on twam.Products
     sizeId:             Optional[int]   = None   # stored in DB column "Size"
     stockQuantity:      Optional[int]   = None
     processedQuantity:  Optional[int]   = None
@@ -34,7 +34,7 @@ class ProductVariantDetailCreate(BaseModel):
 # ── Update ────────────────────────────────────────────────────────────────────
 
 class ProductVariantDetailUpdate(BaseModel):
-    productCode:        Optional[str]   = None
+    # productCode removed — lives on twam.Products
     sizeId:             Optional[int]   = None
     stockQuantity:      Optional[int]   = None
     processedQuantity:  Optional[int]   = None
@@ -63,7 +63,7 @@ class ProductVariantDetailResponse(BaseModel):
     productVariantDetailId: int
     productId:              int
     productVariantId:       int
-    productCode:            Optional[str]   = None
+    # productCode removed — lives on twam.Products
     sizeId:                 Optional[int]   = None
     sizeLabel:              Optional[str]   = None   # joined from mdm.Size
     stockQuantity:          Optional[int]   = None
@@ -128,35 +128,37 @@ class UserProductDetailResponse(BaseModel):
 # ── User-facing product list (from SP) ───────────────────────────────────────
 
 class UserProductListItem(BaseModel):
-    productVariantId:   Optional[int]   = None
-    productVariantDetailId: Optional[int] = None
-    productId:          Optional[int]   = None
-    productCode:        Optional[str]   = None
-    fabricId:           Optional[int]   = None
-    sizeId:             Optional[int]   = None
-    size:               Optional[Any]   = None
-    color:              Optional[str]   = None
-    stockQuantity:      Optional[int]   = None
-    processedQuantity:  Optional[int]   = None
-    discountPercent:    Optional[int]   = None
-    mrpPrice:           Optional[float] = None
-    finalPrice:         Optional[float] = None
-    userProfileId:      Optional[str]   = None
-    state:              Optional[str]   = None
-    cupSizeId:          Optional[int]   = None
-    cupSize:            Optional[Any]   = None
-    isCupSize:          Optional[bool]  = None
-    isBestSeller:       Optional[bool]  = None
-    totalCount:         Optional[int]   = None
-    price:              Optional[float] = None
-    oldPrice:           Optional[float] = None
-    image:              Optional[str]   = None
-    images:             Optional[List[str]] = None   # all variant images for hover crossfade
-    name:               Optional[str]   = None
-    description:        Optional[str]   = None
-    rating:             Optional[float] = None
-    reviewCount:        Optional[int]   = None       # review count for rating pill
-    brandName:          Optional[str]   = None       # brand display on card
+    productVariantId:       Optional[int]   = None
+    productVariantDetailId: Optional[int]   = None
+    productId:              Optional[int]   = None
+    # productCode removed — lives on twam.Products; not duplicated at detail level
+    fabricId:               Optional[int]   = None   # now joined from Products
+    sizeId:                 Optional[int]   = None
+    size:                   Optional[Any]   = None
+    color:                  Optional[str]   = None
+    stockQuantity:          Optional[int]   = None
+    processedQuantity:      Optional[int]   = None
+    discountPercent:        Optional[int]   = None
+    mrpPrice:               Optional[float] = None
+    finalPrice:             Optional[float] = None
+    userProfileId:          Optional[str]   = None
+    state:                  Optional[str]   = None
+    cupSizeId:              Optional[int]   = None
+    cupSize:                Optional[Any]   = None
+    isCupSize:              Optional[bool]  = None
+    isBestSeller:           Optional[bool]  = None
+    totalCount:             Optional[int]   = None
+    price:                  Optional[float] = None
+    oldPrice:               Optional[float] = None
+    image:                  Optional[str]   = None
+    images:                 Optional[List[str]] = None
+    name:                   Optional[str]   = None
+    # description: variantDescription when present, falls back to product description.
+    # Populated in SQL as: COALESCE(NULLIF(pv."VariantDescription", ''), p."Description", '')
+    description:            Optional[str]   = None
+    rating:                 Optional[float] = None
+    reviewCount:            Optional[int]   = None
+    brandName:              Optional[str]   = None
 
 
 class UserProductListResponse(BaseModel):
@@ -164,13 +166,13 @@ class UserProductListResponse(BaseModel):
     list:  List[UserProductListItem]
 
 
-class ProductVariantDetailResponse(BaseModel):
-    stockId: str
+class ProductVariantDetailStockResponse(BaseModel):
+    stockId:    str
     productName: str
-    size: str
-    color: str
-    price: float
-    hsnCode: str
+    size:       str
+    color:      str
+    price:      float
+    hsnCode:    str
     gstPercent: float
 
     class Config:
