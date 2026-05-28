@@ -71,7 +71,6 @@ def _enrich(db: Session, pvd: ProductVariantDetail) -> dict:
         "productVariantDetailId": pvd.productVariantDetailId,
         "productId":              pvd.productId,
         "productVariantId":       pvd.productVariantId,
-        "productCode":            pvd.productCode,
         "sizeId":                 pvd.sizeId,
         "sizeLabel":              size_label,
         "stockQuantity":          pvd.stockQuantity,
@@ -163,7 +162,6 @@ def create_variant_detail(db: Session, data) -> int:
     pvd = ProductVariantDetail(
         productId         = data.productId,
         productVariantId  = data.productVariantId,
-        productCode       = data.productCode,
         sizeId            = data.sizeId,
         stockQuantity     = total_qty,
         processedQuantity = 0,
@@ -256,7 +254,6 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
 
     # Price / meta fields — apply only when provided
     simple_fields = {
-        "productCode":     data.productCode,
         "sizeId":          data.sizeId,
         "discountPercent": data.discountPercent,
         "mrpPrice":        data.mrpPrice,

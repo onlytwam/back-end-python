@@ -13,6 +13,8 @@ class ProductCreate(BaseModel):
     childCategoryId: Optional[int]  = None
     brandId:         Optional[int]  = None
     taxHSNCodeId:    Optional[int]  = None
+    # Fabric is now a product-level field — FK → mdm.Fabric.FabricId
+    fabricId:        Optional[int]  = None
     personalId:      Optional[int]  = None
     userProfileId:   Optional[str]  = None
     state:           Optional[str]  = None
@@ -31,6 +33,7 @@ class ProductUpdate(BaseModel):
     childCategoryId: Optional[int]  = None
     brandId:         Optional[int]  = None
     taxHSNCodeId:    Optional[int]  = None
+    fabricId:        Optional[int]  = None
     personalId:      Optional[int]  = None
     userProfileId:   Optional[str]  = None
     state:           Optional[str]  = None
@@ -57,7 +60,7 @@ class ProductVariantSummary(BaseModel):
     productId:          int
     variantName:        Optional[str] = None
     variantDescription: Optional[str] = None
-    productCode:        Optional[str] = None
+    # productCode removed — it belongs to the Product, not the Variant
     color:              Optional[str] = None
     colorName:          Optional[str] = None
     isBestSeller:       Optional[bool] = None
@@ -85,6 +88,9 @@ class ProductResponse(BaseModel):
     taxHSNCode:       Optional[str]  = None   # resolved HSN code string
     taxHSNDescription: Optional[str] = None   # resolved HSN description
     totalGST:         Optional[float]= None   # resolved GST %
+    # Fabric — product-level, FK → mdm.Fabric
+    fabricId:         Optional[int]  = None
+    fabricName:       Optional[str]  = None   # resolved fabric name (joined)
     personalId:       Optional[int]  = None
     userProfileId:    Optional[str]  = None
     tag:              Optional[str]  = None
@@ -102,8 +108,8 @@ class ProductResponse(BaseModel):
     brandDeletedInd:  Optional[bool] = None   # True  = brand has been soft-deleted
     # Joined fields from Category
     categoryName:        Optional[str]  = None
-    categoryIsActive:    Optional[bool] = None   # False = category is inactive or deleted
-    categoryDeletedInd:  Optional[bool] = None   # True  = category has been soft-deleted
+    categoryIsActive:    Optional[bool] = None
+    categoryDeletedInd:  Optional[bool] = None
     # First image URL (variant-level, falls back to product-level)
     imageUrl:            Optional[str]  = None
     # Variant collection for admin cards/user-style swatches

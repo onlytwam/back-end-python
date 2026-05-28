@@ -11,7 +11,7 @@ class ProductVariantDetail(Base):
     productVariantDetailId = Column("ProductVariantDetailId", BigInteger, primary_key=True, index=True, autoincrement=True)
     productId              = Column("ProductId",              BigInteger, nullable=False)
     productVariantId       = Column("ProductVariantId",       BigInteger, nullable=False)
-    productCode            = Column("ProductCode",            String,     nullable=True)
+    # productCode removed — ProductCode lives on twam.Products, not on the detail row
     # FK to mdm.Size.SizeId — stored as "Size" column (matches .NET entity)
     sizeId                 = Column("Size",                   BigInteger, nullable=True)
     stockQuantity          = Column("StockQuantity",          Integer,    nullable=True)

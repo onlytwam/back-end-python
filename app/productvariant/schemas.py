@@ -19,14 +19,14 @@ class ProductVariantCreate(BaseModel):
     variantDescription: Optional[str]  = None
     userProfileId:      Optional[str]  = None
     state:              Optional[str]  = None
-    productCode:        Optional[str]  = None
-    fabricId:           Optional[int]  = None
+    # productCode removed — lives on Products
+    # fabricId    removed — lives on Products
+    # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
     colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
-    taxHSNCodeId:       Optional[int]  = None
     createdBy:          Optional[str]  = None
     modifiedBy:         Optional[str]  = None
 
@@ -37,14 +37,14 @@ class ProductVariantUpdate(BaseModel):
     variantDescription: Optional[str]  = None
     userProfileId:      Optional[str]  = None
     state:              Optional[str]  = None
-    productCode:        Optional[str]  = None
-    fabricId:           Optional[int]  = None
+    # productCode removed — lives on Products
+    # fabricId    removed — lives on Products
+    # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
     colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
-    taxHSNCodeId:       Optional[int]  = None
     modifiedBy:         Optional[str]  = None
 
 
@@ -55,14 +55,14 @@ class ProductVariantResponse(BaseModel):
     variantDescription: Optional[str]  = None
     userProfileId:      Optional[str]  = None
     state:              Optional[str]  = None
-    productCode:        Optional[str]  = None
-    fabricId:           Optional[int]  = None
+    # productCode removed — lives on Products
+    # fabricId    removed — lives on Products
+    # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
     colorFamily:        Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
-    taxHSNCodeId:       Optional[int]  = None
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
     images:             Optional[List[ImageResponse]] = []
@@ -109,8 +109,11 @@ class UserProductVariantResponse(BaseModel):
     productVariantId:   Optional[int]   = None
     name:               Optional[str]   = None
     brandName:          Optional[str]   = None
+    # description: shows variantDescription if set, else falls back to product description.
+    # The repository populates this field using:
+    #   COALESCE(NULLIF(pv."VariantDescription", ''), p."Description")
     description:        Optional[str]   = None
-    productCode:        Optional[str]   = None
+    # productCode removed — lives on Products (use product.productCode instead)
     tag:                Optional[str]   = None
     categoryId:         Optional[int]   = None
     isCupSize:          Optional[bool]  = None
