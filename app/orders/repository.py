@@ -148,7 +148,7 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
             pv."Color" AS color,
             pv."IsReturnAvailable" AS is_return_available,
 
-            pvd."ProductCode" AS sku,
+            p."ProductCode" AS sku,
                 (
                     SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
                       ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
