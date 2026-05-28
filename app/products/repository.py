@@ -115,9 +115,10 @@ def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -
 
 
 def _get_product_variants(db: Session, product_id: int) -> list[dict]:
-    rows = db.execute(
-        text(
-            """
+    try:
+        rows = db.execute(
+            text(
+                """
             SELECT
                 "ProductVariantId", "ProductId", "VariantName",
                 "VariantDescription", "Color",
@@ -128,9 +129,12 @@ def _get_product_variants(db: Session, product_id: int) -> list[dict]:
               AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
             ORDER BY "ProductVariantId" ASC
             """
-        ),
-        {"pid": product_id},
-    ).fetchall()
+            ),
+            {"pid": product_id},
+        ).fetchall()
+    except Exception:
+        db.rollback()
+        return []
 
     return [
         {
@@ -161,17 +165,20 @@ def _to_response(db: Session, product: Products) -> dict:
     brand_deleted    = None
 
     if product.brandId:
-        row = db.execute(
-            text(
-                'SELECT "brandName", "isActive", "deletedInd" '
-                'FROM mdm."Brand" WHERE "brandId" = :id LIMIT 1'
-            ),
-            {"id": product.brandId},
-        ).fetchone()
-        if row:
-            brand_name      = row[0]
-            brand_is_active = bool(row[1]) if row[1] is not None else True
-            brand_deleted   = bool(row[2]) if row[2] is not None else False
+        try:
+            row = db.execute(
+                text(
+                    'SELECT "brandName", "isActive", "deletedInd" '
+                    'FROM mdm."Brand" WHERE "brandId" = :id LIMIT 1'
+                ),
+                {"id": product.brandId},
+            ).fetchone()
+            if row:
+                brand_name      = row[0]
+                brand_is_active = bool(row[1]) if row[1] is not None else True
+                brand_deleted   = bool(row[2]) if row[2] is not None else False
+        except Exception:
+            db.rollback()
 
     # Resolve category name, active status, and deleted status.
     # NOTE: Do NOT filter by DeletedInd here — we need to detect deleted
@@ -181,20 +188,23 @@ def _to_response(db: Session, product: Products) -> dict:
     category_deleted    = None
     cat_id = product.childCategoryId or product.categoryId
     if cat_id:
-        row = db.execute(
-            text(
-                'SELECT "Name", "IsActive", "DeletedInd" FROM twam."Category" '
-                'WHERE "CategoryId" = :id LIMIT 1'
-            ),
-            {"id": cat_id},
-        ).fetchone()
-        if row:
-            category_name      = row[0]
-            category_is_active = bool(row[1]) if row[1] is not None else True
-            category_deleted   = bool(row[2]) if row[2] is not None else False
-            # A deleted category always counts as inactive for product status
-            if category_deleted:
-                category_is_active = False
+        try:
+            row = db.execute(
+                text(
+                    'SELECT "Name", "IsActive", "DeletedInd" FROM twam."Category" '
+                    'WHERE "CategoryId" = :id LIMIT 1'
+                ),
+                {"id": cat_id},
+            ).fetchone()
+            if row:
+                category_name      = row[0]
+                category_is_active = bool(row[1]) if row[1] is not None else True
+                category_deleted   = bool(row[2]) if row[2] is not None else False
+                # A deleted category always counts as inactive for product status
+                if category_deleted:
+                    category_is_active = False
+        except Exception:
+            db.rollback()
 
     # Resolve the first image for this product (variant image first, then product-level fallback)
     image_url = None
