@@ -61,25 +61,39 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
                     'netAmount',   sub."netAmount",
                     'taxRate',     sub."taxRate",
                     'taxType',     sub."taxType",
+                    'hsnCode',     sub."hsnCode",
+                    'cgstRate',    sub."cgstRate",
+                    'sgstRate',    sub."sgstRate",
+                    'cgstAmount',  sub."cgstAmount",
+                    'sgstAmount',  sub."sgstAmount",
                     'taxAmount',   sub."taxAmount",
                     'totalAmount', sub."totalAmount"
                 ))
                 FROM (
                     SELECT
-                        ROW_NUMBER() OVER (ORDER BY oi."OrderItemId") AS "sNo",
-                        oi."OrderItemId"                              AS "orderItemId",
-                        CONCAT(pv."VariantName", ' - ', pvd_s."SizeLabel") AS "description",
-                        oi."UnitPrice"                                AS "unitPrice",
-                        oi."Quantity"                                 AS "quantity",
-                        oi."Price"                                    AS "netAmount",
-                        0                                             AS "taxRate",
-                        NULL                                          AS "taxType",
-                        0                                             AS "taxAmount",
-                        oi."Price"                                    AS "totalAmount"
+                        ROW_NUMBER() OVER (ORDER BY oi."OrderItemId")              AS "sNo",
+                        oi."OrderItemId"                                            AS "orderItemId",
+                        CONCAT(pv."VariantName", ' - ', pvd_s."SizeLabel")         AS "description",
+                        COALESCE(pvd."FinalPrice", oi."UnitPrice", 0)              AS "unitPrice",
+                        oi."Quantity"                                               AS "quantity",
+                        oi."Price"                                                  AS "netAmount",
+                        COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)            AS "taxRate",
+                        hsn."HSNCode"                                               AS "taxType",
+                        hsn."HSNCode"                                               AS "hsnCode",
+                        COALESCE(pvd."CGST", 0)                                    AS "cgstRate",
+                        COALESCE(pvd."SGST", 0)                                    AS "sgstRate",
+                        ROUND(COALESCE(pvd."CGST", 0) / 100 * COALESCE(pvd."FinalPrice",oi."UnitPrice",0), 2) * oi."Quantity"  AS "cgstAmount",
+                        ROUND(COALESCE(pvd."SGST", 0) / 100 * COALESCE(pvd."FinalPrice",oi."UnitPrice",0), 2) * oi."Quantity"  AS "sgstAmount",
+                        (ROUND(COALESCE(pvd."CGST", 0) / 100 * COALESCE(pvd."FinalPrice",oi."UnitPrice",0), 2) +
+                         ROUND(COALESCE(pvd."SGST", 0) / 100 * COALESCE(pvd."FinalPrice",oi."UnitPrice",0), 2)) * oi."Quantity" AS "taxAmount",
+                        oi."Price"                                                  AS "totalAmount"
                     FROM twam."OrderItems" oi
-                    LEFT JOIN twam."ProductVariants"      pv  ON pv."ProductVariantId"        = oi."ProductVariantId"
-                    LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                    LEFT JOIN mdm."Size"                pvd_s ON pvd_s."SizeId"               = pvd."Size"
+                    LEFT JOIN twam."ProductVariants"      pv   ON pv."ProductVariantId"        = oi."ProductVariantId"
+                    LEFT JOIN twam."ProductVariantDetail" pvd  ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    LEFT JOIN mdm."Size"               pvd_s   ON pvd_s."SizeId"               = pvd."Size"
+                    LEFT JOIN twam."Products"             p     ON p."ProductId"                = oi."ProductId"
+                    LEFT JOIN mdm."TaxHSNCode"            hsn   ON hsn."TaxHSNCodeId"           = p."TaxHSNCodeId"
+                                                                AND hsn."DeletedInd" = false
                     WHERE oi."OrderId" = o."OrderId" AND oi."DeletedInd" = false
                 ) sub
             ) AS items_json
@@ -107,16 +121,28 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
     if items_json:
         raw = items_json if isinstance(items_json, list) else json.loads(items_json)
         for i, item in enumerate(raw, 1):
+            unit_price  = float(item["unitPrice"])   if item.get("unitPrice")   else 0.0
+            quantity    = int(item["quantity"])      if item.get("quantity")    else 1
+            cgst_rate   = float(item.get("cgstRate",  0) or 0)
+            sgst_rate   = float(item.get("sgstRate",  0) or 0)
+            cgst_amount = float(item.get("cgstAmount",0) or 0)
+            sgst_amount = float(item.get("sgstAmount",0) or 0)
+            tax_amount  = float(item.get("taxAmount", 0) or 0)
             items.append({
                 "sNo":         i,
                 "orderItemId": item.get("orderItemId"),
                 "description": item.get("description"),
-                "unitPrice":   float(item["unitPrice"])   if item.get("unitPrice")   else None,
-                "quantity":    item.get("quantity"),
-                "netAmount":   float(item["netAmount"])   if item.get("netAmount")   else None,
-                "taxRate":     0.0,  # tax inclusive in MRP
-                "taxType":     None,
-                "taxAmount":   0.0,  # tax inclusive in MRP
+                "unitPrice":   unit_price,
+                "quantity":    quantity,
+                "netAmount":   float(item["netAmount"]) if item.get("netAmount") else None,
+                "hsnCode":     item.get("hsnCode"),
+                "cgstRate":    cgst_rate,
+                "sgstRate":    sgst_rate,
+                "cgstAmount":  cgst_amount,
+                "sgstAmount":  sgst_amount,
+                "taxRate":     cgst_rate + sgst_rate,
+                "taxType":     item.get("taxType"),
+                "taxAmount":   tax_amount,
                 "totalAmount": float(item["totalAmount"]) if item.get("totalAmount") else None,
             })
 
@@ -149,7 +175,9 @@ def get_invoice_by_order_id(db: Session, order_id: int) -> Optional[dict]:
         "billingStateName":        row[25],
         "billingPinCode":          row[26],
         "billingPhone":            row[27],
-        "taxAmount":               0.0,  # tax inclusive in MRP, not charged separately
+        "taxAmount":               sum(i.get("taxAmount", 0) or 0 for i in items),
+        "cgstTotal":               round(sum(i.get("cgstAmount", 0) or 0 for i in items), 2),
+        "sgstTotal":               round(sum(i.get("sgstAmount", 0) or 0 for i in items), 2),
         "totalAmount":             float(row[29]) if row[29] else None,
         "subTotal":                float(row[30]) if row[30] else None,
         "paymentTransactionRefNo": row[31],

@@ -7,6 +7,63 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import Products
 
 
+# ── Tax cascade helpers ───────────────────────────────────────────────────────
+
+def recalculate_pvd_taxes_for_product(db: Session, product_id: int) -> dict:
+    """
+    Re-compute CGST / SGST / TaxAmount for every active PVD that belongs to
+    this product.  Called whenever a product's TaxHSNCodeId is set or changed,
+    and also exposed as a stand-alone admin endpoint for retroactive fixes.
+
+    Returns a summary: {"updated": N, "skipped": M, "errors": [...]}.
+    Skipped rows are those with no finalPrice (nothing to compute against).
+    This function never raises — errors are collected and returned so the
+    caller can surface them to the admin without rolling back the parent save.
+    """
+    try:
+        from app.taxhsncode.repository import compute_tax_for_product
+    except ImportError:
+        return {"updated": 0, "skipped": 0, "errors": ["taxhsncode module not available"]}
+
+    from app.productvariantdetail.models import ProductVariantDetail
+
+    updated = skipped = 0
+    errors: list = []
+
+    try:
+        pvds = db.query(ProductVariantDetail).filter(
+            ProductVariantDetail.productId  == product_id,
+            ProductVariantDetail.deletedInd == False,
+        ).all()
+    except Exception as exc:
+        return {"updated": 0, "skipped": 0, "errors": [str(exc)]}
+
+    for pvd in pvds:
+        final_price = float(pvd.finalPrice or 0)
+        if final_price <= 0:
+            skipped += 1
+            continue
+        try:
+            tax = compute_tax_for_product(db, product_id, final_price)
+            pvd.cgst        = tax["cgstRate"]
+            pvd.sgst        = tax["sgstRate"]
+            pvd.taxAmount   = tax["taxAmount"]
+            pvd.modifiedDate = datetime.now(timezone.utc)
+            updated += 1
+        except Exception as exc:
+            errors.append(f"pvd {pvd.productVariantDetailId}: {exc}")
+            skipped += 1
+
+    if updated:
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            return {"updated": 0, "skipped": skipped, "errors": [f"commit failed: {exc}"]}
+
+    return {"updated": updated, "skipped": skipped, "errors": errors}
+
+
 def _image_path_to_url(path: str | None) -> str | None:
     if not path:
         return None
@@ -167,7 +224,8 @@ def _to_response(db: Session, product: Products) -> dict:
         try:
             hsn_row = db.execute(
                 text("""
-                    SELECT "HsnCode", "HsnDescription", "TotalGST"
+                    SELECT "HSNCode", "HSNDescription",
+                           COALESCE("Slab1TotalGST", "Slab1CGST" + "Slab1SGST")
                     FROM mdm."TaxHSNCode"
                     WHERE "TaxHSNCodeId" = :id LIMIT 1
                 """),
@@ -347,6 +405,11 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
     if not product:
         return None
 
+    # Track whether TaxHSNCodeId is changing so we can cascade to PVDs below.
+    prev_hsn_id = product.taxHSNCodeId
+    new_hsn_id  = getattr(data, "taxHSNCodeId", None)
+    hsn_changed = (new_hsn_id is not None) and (new_hsn_id != prev_hsn_id)
+
     for field in ("productCode", "name", "description", "categoryId",
                   "childCategoryId", "brandId", "taxHSNCodeId", "personalId",
                   "userProfileId", "state", "tag", "modifiedBy"):
@@ -365,6 +428,17 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
         db.commit()
     except Exception:
         pass
+
+    # ── Cascade: recalculate CGST/SGST on all PVDs when HSN is set/changed ──
+    # Covers both first-time assignment (prev was None) and HSN reassignment.
+    # Also covers re-saving the same HSN so existing PVDs get corrected.
+    # The product save is already committed; PVD tax errors are non-fatal.
+    effective_hsn = new_hsn_id or product.taxHSNCodeId
+    if hsn_changed or (new_hsn_id and not prev_hsn_id) or effective_hsn:
+        try:
+            recalculate_pvd_taxes_for_product(db, product_id)
+        except Exception:
+            pass  # never block the product update
 
     return product_id
 

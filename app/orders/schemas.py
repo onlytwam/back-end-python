@@ -40,7 +40,7 @@ class CheckoutSummaryRequest(BaseModel):
 
 
 class CheckoutSummaryItem(BaseModel):
-    cartId: Optional[int] = None  # None for Buy Now items (no cart record)
+    cartId: Optional[int] = None
     productId: Optional[int] = None
     productVariantId: Optional[int] = None
     productVariantDetailId: Optional[int] = None
@@ -48,6 +48,10 @@ class CheckoutSummaryItem(BaseModel):
     productImage: Optional[str] = None
     quantity: int
     unitPrice: Optional[float] = None
+    cgstRate: Optional[float] = 0
+    sgstRate: Optional[float] = 0
+    cgstAmount: Optional[float] = 0
+    sgstAmount: Optional[float] = 0
     taxAmount: Optional[float] = None
     lineTotal: Optional[float] = None
 
@@ -62,6 +66,8 @@ class CheckoutSummaryResponse(BaseModel):
     totalQuantity: int
     subTotal: float
     taxAmount: float
+    cgstTotal: Optional[float] = 0
+    sgstTotal: Optional[float] = 0
     deliveryCharge: float
     couponAmount: float
     totalAmount: float

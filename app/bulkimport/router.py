@@ -304,7 +304,7 @@ async def _fetch_hsn_rates(db: Session, hsn_ids: list[int]) -> dict[int, dict]:
         return {}
     result = db.execute(
         text("""
-            SELECT "TaxHSNCodeId", "CGST", "SGST"
+            SELECT "TaxHSNCodeId", "Slab1CGST", "Slab1SGST"
             FROM   mdm."TaxHSNCode"
             WHERE  "TaxHSNCodeId" = ANY(:ids)
               AND  "IsActive" = true
@@ -313,7 +313,7 @@ async def _fetch_hsn_rates(db: Session, hsn_ids: list[int]) -> dict[int, dict]:
         {"ids": hsn_ids},
     )
     return {
-        row.TaxHSNCodeId: {"cgst": float(row.CGST or 0), "sgst": float(row.SGST or 0)}
+        row.TaxHSNCodeId: {"cgst": float(row.Slab1CGST or 0), "sgst": float(row.Slab1SGST or 0)}
         for row in result
     }
 
@@ -368,12 +368,12 @@ def _fetch_ref_data(db: Session) -> dict:
     fabric_rows = [{"id": r.FabricId, "name": r.Name} for r in fabrics]
 
     hsn = db.execute(text("""
-        SELECT "TaxHSNCodeId", "HSNCode", "HSNDescription", "CGST", "SGST"
+        SELECT "TaxHSNCodeId", "HSNCode", "HSNDescription", "Slab1CGST", "Slab1SGST"
         FROM   mdm."TaxHSNCode"
         WHERE  "IsActive" = true AND "DeletedInd" = false ORDER BY "HSNCode"
     """))
     hsn_rows = [{"id": r.TaxHSNCodeId, "code": r.HSNCode, "desc": r.HSNDescription,
-                 "cgst": float(r.CGST or 0), "sgst": float(r.SGST or 0)} for r in hsn]
+                 "cgst": float(r.Slab1CGST or 0), "sgst": float(r.Slab1SGST or 0)} for r in hsn]
 
     sizes = db.execute(text("""
         SELECT "SizeId", "SizeLabel", "SizeCode" FROM mdm."Size"
@@ -1372,6 +1372,10 @@ def _build_hierarchical_chains(size_records: list[dict]) -> dict[str, dict]:
                     "childCategoryId": rec.get("childCategoryId"),
                     "brandId":         rec.get("brandId"),
                     "tag":             rec.get("tag"),
+                    # FIX: Propagate HSN code to product level so it is stored in
+                    # twam.Products.TaxHSNCodeId — compute_tax_for_product reads from
+                    # Products, not ProductVariants, so this is the authoritative source.
+                    "taxHSNCodeId":    rec.get("variantTaxHSNCodeId"),
                 },
                 "variants": {},
             }
@@ -1434,29 +1438,47 @@ def _collect_hsn_ids(chains: dict) -> list[int]:
     return list(ids)
 
 
-def _apply_hsn_rates(chains: dict, hsn_map: dict[int, dict]) -> list[dict]:
+def _apply_hsn_rates(chains: dict, hsn_map: dict[int, dict], db=None) -> list[dict]:
+    """
+    Compute CGST/SGST for every slot using the parent product's TaxHSNCode
+    and the slot's finalPrice.  When a price-slab DB lookup is available
+    (db is passed) we use it; otherwise we fall back to the flat hsn_map rates.
+    """
     warnings: list[dict] = []
     seen_missing: set[int] = set()
     for chain in chains.values():
+        product_id = chain.get("productId")
         for var in chain["variants"]:
             hsn_id = var["rec"].get("variantTaxHSNCodeId")
             if not hsn_id:
                 continue
             hsn_id = int(hsn_id)
-            rates  = hsn_map.get(hsn_id)
-            if rates:
-                for slot in var["slots"]:
-                    if slot.get("cgst") is None:
-                        slot["cgst"] = rates["cgst"]
-                    if slot.get("sgst") is None:
-                        slot["sgst"] = rates["sgst"]
-            elif hsn_id not in seen_missing:
-                seen_missing.add(hsn_id)
-                warnings.append({
-                    "hsnCodeId":   hsn_id,
-                    "variantCode": var["rec"].get("variantCode"),
-                    "message":     f"TaxHSNCodeId {hsn_id} not found in DB — CGST/SGST will be NULL.",
-                })
+            for slot in var["slots"]:
+                final_price = float(slot.get("finalPrice") or 0)
+                # Prefer live price-slab lookup when DB session available
+                if db is not None and product_id:
+                    try:
+                        from app.taxhsncode.repository import compute_tax_for_product
+                        tax = compute_tax_for_product(db, product_id, final_price)
+                        slot["cgst"]      = tax["cgstRate"]
+                        slot["sgst"]      = tax["sgstRate"]
+                        slot["taxAmount"] = tax["taxAmount"]
+                        continue
+                    except Exception:
+                        pass  # fall through to flat rate
+                # Flat-rate fallback from hsn_map
+                rates = hsn_map.get(hsn_id)
+                if rates:
+                    slot["cgst"]      = round(final_price * rates["cgst"] / 100, 2) if final_price else rates["cgst"]
+                    slot["sgst"]      = round(final_price * rates["sgst"] / 100, 2) if final_price else rates["sgst"]
+                    slot["taxAmount"] = round((slot["cgst"] + slot["sgst"]), 2)
+                elif hsn_id not in seen_missing:
+                    seen_missing.add(hsn_id)
+                    warnings.append({
+                        "hsnCodeId":   hsn_id,
+                        "variantCode": var["rec"].get("variantCode"),
+                        "message":     f"TaxHSNCodeId {hsn_id} not found in DB — CGST/SGST will be NULL.",
+                    })
     return warnings
 
 
@@ -1601,14 +1623,18 @@ def _check_duplicate_stock_ids(
 # ==============================================================================
 
 def _pb_insert_product(db: Session, rec: dict) -> int:
+    # FIX: Include TaxHSNCodeId in Products INSERT so that compute_tax_for_product
+    # (which reads from twam.Products.TaxHSNCodeId) works for this product's PVDs.
     r = db.execute(text("""
         INSERT INTO twam."Products" (
             "ProductCode","Name","Description",
             "CategoryId","ChildCategoryId","BrandId","Tag",
+            "TaxHSNCodeId",
             "State","CreatedDate","DeletedInd"
         ) VALUES (
             :productCode,:name,:description,
             :categoryId,:childCategoryId,:brandId,:tag,
+            :taxHSNCodeId,
             'Created',:now,false
         ) RETURNING "ProductId"
     """), {
@@ -1619,6 +1645,7 @@ def _pb_insert_product(db: Session, rec: dict) -> int:
         "childCategoryId": rec.get("childCategoryId"),
         "brandId":         rec.get("brandId"),
         "tag":             rec.get("tag"),
+        "taxHSNCodeId":    rec.get("taxHSNCodeId"),
         "now":             NOW(),
     })
     return r.scalar_one()
@@ -2009,6 +2036,24 @@ async def import_product_bulk(
         for pcode, chain in chains.items():
             product_id = _pb_insert_product(db, chain["rec"])
             inserted_products += 1
+
+            # FIX: Recompute CGST/SGST for every slot using the REAL product_id
+            # now that the product row exists. _apply_hsn_rates() called earlier
+            # had product_id=None so it fell back to flat Slab1 rates only.
+            # We now call compute_tax_for_product() per slot for correct slab matching.
+            _hsn_id = chain["rec"].get("taxHSNCodeId")
+            if _hsn_id and product_id:
+                try:
+                    from app.taxhsncode.repository import compute_tax_for_product
+                    for _var in chain["variants"]:
+                        for _slot in _var["slots"]:
+                            _fp = float(_slot.get("finalPrice") or 0)
+                            _tax = compute_tax_for_product(db, product_id, _fp)
+                            _slot["cgst"]      = _tax["cgstRate"]
+                            _slot["sgst"]      = _tax["sgstRate"]
+                            _slot["taxAmount"] = _tax["taxAmount"]
+                except Exception as _tex:
+                    logger.warning(f"Post-insert tax recompute failed for product {product_id}: {_tex}")
 
             # Audit: product created via bulk upload
             if _add_audit:

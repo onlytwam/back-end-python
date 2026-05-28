@@ -223,7 +223,7 @@ def get_product_by_stock(
         price             = float(pvd.finalPrice or 0),
         mrpPrice          = float(pvd.mrpPrice or 0),
         hsnCode           = (hsn.hsnCode if hsn else "") or "",
-        gstPercent        = float(hsn.totalGST if hsn and hasattr(hsn, "totalGST") and hsn.totalGST else 0),
+        gstPercent        = float((pvd.cgst or 0) + (pvd.sgst or 0)),
         availableQuantity = available,
     )
 

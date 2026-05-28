@@ -175,3 +175,63 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
 def check_product_validations(command: schemas.ProductValidationRequest, db: Session = Depends(get_db)):
     is_valid = repository.check_product_validations(db, command.productId, command.state)
     return {"isValid": is_valid}
+
+# ── ADMIN: retroactively recalculate CGST/SGST for one product's PVDs ────────
+@router.post(
+    "/{product_id}/recalculate-taxes",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+    summary="Recalculate CGST/SGST on all PVDs for a product",
+)
+def recalculate_product_taxes(product_id: int, db: Session = Depends(get_db)):
+    """
+    Re-computes CGST, SGST, and TaxAmount for every active PVD of this product
+    using the product's current TaxHSNCode and each PVD's FinalPrice.
+
+    Use this when:
+    - A TaxHSNCode was attached to an existing product that already had PVDs.
+    - The product's HSN code was changed and you want to force a re-sync.
+    - You need to confirm existing PVD tax values are up to date.
+    """
+    result = repository.recalculate_pvd_taxes_for_product(db, product_id)
+    return {
+        "productId": product_id,
+        **result,
+    }
+
+
+# ── ADMIN: retroactively recalculate ALL products that have a TaxHSNCode ─────
+@router.post(
+    "/bulk-recalculate-taxes",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN))],
+    summary="Recalculate CGST/SGST across all products that have an HSN code",
+)
+def bulk_recalculate_all_taxes(db: Session = Depends(get_db)):
+    """
+    Sweeps every product that has a TaxHSNCodeId set and re-computes CGST/SGST
+    on all its PVDs.  Useful for one-time data fixes or after a GST rate change.
+
+    This operation can be slow on large catalogs — it processes every PVD row.
+    Errors on individual PVDs are collected but do not abort the sweep.
+    """
+    rows = db.execute(
+        __import__("sqlalchemy").text(
+            'SELECT DISTINCT "ProductId" FROM twam."Products" '            'WHERE "TaxHSNCodeId" IS NOT NULL AND "DeletedInd" = false'
+        )
+    ).fetchall()
+
+    product_ids = [r[0] for r in rows]
+    total_updated = total_skipped = 0
+    all_errors: list = []
+
+    for pid in product_ids:
+        result = repository.recalculate_pvd_taxes_for_product(db, pid)
+        total_updated += result.get("updated", 0)
+        total_skipped += result.get("skipped", 0)
+        all_errors.extend(result.get("errors", []))
+
+    return {
+        "productsProcessed": len(product_ids),
+        "pvdsUpdated":       total_updated,
+        "pvdsSkipped":       total_skipped,
+        "errors":            all_errors,
+    }
