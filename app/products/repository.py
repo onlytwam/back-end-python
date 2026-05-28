@@ -427,11 +427,17 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
     hsn_changed = (new_hsn_id is not None) and (new_hsn_id != prev_hsn_id)
 
     for field in ("productCode", "name", "description", "categoryId",
-                  "childCategoryId", "brandId", "taxHSNCodeId", "personalId",
+                  "brandId", "taxHSNCodeId", "personalId",
                   "userProfileId", "state", "tag", "modifiedBy"):
         val = getattr(data, field, None)
         if val is not None:
             setattr(product, field, val)
+
+    # childCategoryId is special: it can be explicitly set to null (to clear
+    # the child link when parent category changes). Use model_fields_set to
+    # distinguish "explicitly passed null" from "field was not sent at all".
+    if "childCategoryId" in data.model_fields_set:
+        product.childCategoryId = data.childCategoryId  # accepts None to clear
 
     if data.fabricId is not None:
         product.fabricId = data.fabricId
@@ -446,13 +452,22 @@ def update_product(db: Session, product_id: int, data) -> Optional[int]:
         )
         db.commit()
     except Exception:
-        pass
+        # The stored procedure failed (missing, or PL/pgSQL error).
+        # PostgreSQL marks the whole connection transaction as aborted —
+        # any subsequent query on this session raises InFailedSqlTransaction.
+        # Roll back so the rest of the function can continue safely.
+        # The product update itself was already committed before this block.
+        db.rollback()
 
     # ── Cascade: recalculate CGST/SGST on all PVDs when HSN is set/changed ──
     # Covers both first-time assignment (prev was None) and HSN reassignment.
     # Also covers re-saving the same HSN so existing PVDs get corrected.
     # The product save is already committed; PVD tax errors are non-fatal.
-    effective_hsn = new_hsn_id or product.taxHSNCodeId
+    #
+    # Use prev_hsn_id captured before commit — do NOT lazy-load product.taxHSNCodeId
+    # here because after a rollback() the ORM object is expired and re-fetching
+    # on a fresh transaction could still race. Pre-captured values are safe.
+    effective_hsn = new_hsn_id or prev_hsn_id
     if hsn_changed or (new_hsn_id and not prev_hsn_id) or effective_hsn:
         try:
             recalculate_pvd_taxes_for_product(db, product_id)
