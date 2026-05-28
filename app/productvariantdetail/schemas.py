@@ -129,6 +129,7 @@ class UserProductDetailResponse(BaseModel):
 
 class UserProductListItem(BaseModel):
     productVariantId:   Optional[int]   = None
+    productVariantDetailId: Optional[int] = None
     productId:          Optional[int]   = None
     productCode:        Optional[str]   = None
     fabricId:           Optional[int]   = None
@@ -173,4 +174,4 @@ class ProductVariantDetailResponse(BaseModel):
     gstPercent: float
 
     class Config:
-        from_attributes = True 
+        from_attributes = True

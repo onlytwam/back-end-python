@@ -10,6 +10,11 @@ class ItemsModel(BaseModel):
     unitPrice: Optional[float] = None
     quantity: Optional[int] = None
     netAmount: Optional[float] = None
+    hsnCode: Optional[str] = None
+    cgstRate: Optional[float] = 0
+    sgstRate: Optional[float] = 0
+    cgstAmount: Optional[float] = 0
+    sgstAmount: Optional[float] = 0
     taxRate: Optional[float] = None
     taxType: Optional[str] = None
     taxAmount: Optional[float] = None
@@ -46,6 +51,8 @@ class InvoiceResponse(BaseModel):
     billingPinCode: Optional[str] = None
     billingPhone: Optional[str] = None
     taxAmount: Optional[float] = None
+    cgstTotal: Optional[float] = 0
+    sgstTotal: Optional[float] = 0
     totalAmount: Optional[float] = None
     subTotal: Optional[float] = None
     paymentTransactionRefNo: Optional[str] = None

@@ -543,9 +543,10 @@ def get_gst_report(db: Session, filters, page_index, page_size):
         SELECT o."OrderId", o."CreatedDate" AS "OrderDate",
                p."Name" AS "ProductName", oi."Quantity",
                pvd."FinalPrice" AS "UnitPrice",
-               t."GSTRate", t."HSNCode",
-               (pvd."FinalPrice" * t."GSTRate" / 100) AS "GSTAmount",
-               (pvd."FinalPrice" + pvd."FinalPrice" * t."GSTRate" / 100) AS "PriceWithGST"
+               (COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)) AS "GSTRate",
+               t."HSNCode",
+               (pvd."FinalPrice" * (COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)) / 100) AS "GSTAmount",
+               (pvd."FinalPrice" + pvd."FinalPrice" * (COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)) / 100) AS "PriceWithGST"
         FROM twam."Orders" o
         LEFT JOIN twam."OrderItems" oi ON oi."OrderId" = o."OrderId" AND oi."DeletedInd"=false
         LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"

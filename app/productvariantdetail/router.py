@@ -148,6 +148,8 @@ def get_admin_size_palette(variant_id: int, db: Session = Depends(get_db)):
     return repository.get_admin_size_palette(db, variant_id)
 
 
+@router.get("/", response_model=schemas.ProductVariantDetailListResponse,
+            dependencies=[Depends(get_current_user)], include_in_schema=False)
 @router.get("", response_model=schemas.ProductVariantDetailListResponse,
             dependencies=[Depends(get_current_user)])
 def get_variant_details(
@@ -163,6 +165,7 @@ def get_variant_details(
     )
 
 
+@router.post("/", status_code=201, dependencies=[Depends(get_current_user)], include_in_schema=False)
 @router.post("", status_code=201, dependencies=[Depends(get_current_user)])
 def create_variant_detail(command: schemas.ProductVariantDetailCreate, db: Session = Depends(get_db)):
     new_id = repository.create_variant_detail(db, command)

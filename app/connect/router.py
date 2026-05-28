@@ -51,6 +51,7 @@ from app.auth.schemas import (
 )
 from app.auth.dependencies import _bearer_scheme, get_current_user, CurrentUser
 from app.sendemail.repository import send_email
+from app.shared.email_template import twam_email, greeting, cta_button
 from app.sendemail.schemas import EmailCreate
 
 router = APIRouter(tags=["OAuth2 Compatibility"])
@@ -87,84 +88,30 @@ def _generate_otp(length: int = 6) -> str:
 
 
 def _otp_email_html(full_name: str, otp: str) -> str:
-    """Return a branded HTML email body for the OTP."""
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-</head>
-<body style="margin:0;padding:0;background:#f5f6fa;font-family:'Segoe UI',Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f6fa;padding:40px 16px;">
-    <tr><td align="center">
-      <table width="480" cellpadding="0" cellspacing="0"
-             style="background:#fff;border-radius:16px;overflow:hidden;
-                    box-shadow:0 4px 24px rgba(0,0,0,.08);">
-
-        <!-- Header -->
-        <tr>
-          <td style="background:linear-gradient(135deg,#6A012A,#a0023f);
-                     padding:32px 40px;text-align:center;">
-            <h1 style="margin:0;color:#fff;font-size:22px;font-weight:800;
-                       letter-spacing:2px;">ONLY TWAM</h1>
-            <p style="margin:6px 0 0;color:rgba(255,255,255,.75);font-size:13px;">
-              Password Reset Request
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:40px 40px 32px;">
-            <p style="margin:0 0 16px;font-size:15px;color:#333;">
-              Hi <strong>{full_name}</strong>,
-            </p>
-            <p style="margin:0 0 24px;font-size:14px;color:#555;line-height:1.6;">
-              We received a request to reset your password. Use the verification
-              code below to continue. This code is valid for
-              <strong>{OTP_TTL_MINUTES} minutes</strong>.
-            </p>
-
-            <!-- OTP Box -->
-            <table width="100%" cellpadding="0" cellspacing="0">
-              <tr>
-                <td align="center" style="padding:8px 0 28px;">
-                  <div style="display:inline-block;background:#fdf3f6;
-                               border:2px dashed #d4789a;border-radius:12px;
-                               padding:20px 40px;">
-                    <p style="margin:0 0 6px;font-size:11px;color:#888;
-                               letter-spacing:2px;text-transform:uppercase;">
-                      Your OTP Code
-                    </p>
-                    <p style="margin:0;font-size:40px;font-weight:800;
-                               letter-spacing:12px;color:#6A012A;">
-                      {otp}
-                    </p>
-                  </div>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0 0 24px;font-size:13px;color:#888;line-height:1.6;">
-              Enter this code on the verification page. Do not share this code
-              with anyone. If you did not request a password reset, please
-              ignore this email — your account is safe.
-            </p>
-
-            <!-- Divider -->
-            <hr style="border:none;border-top:1px solid #f0e0e6;margin:0 0 24px;"/>
-
-            <p style="margin:0;font-size:12px;color:#bbb;text-align:center;">
-              &copy; {datetime.now().year} Only TWAM. All rights reserved.
-            </p>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    """Return a branded TWAM HTML email body for OTP / password reset."""
+    content = (
+        greeting(full_name)
+        + f'''<p style="margin:0 0 20px;">We received a request to reset your password.
+          Use the code below to continue. Valid for
+          <strong>{OTP_TTL_MINUTES} minutes</strong>.</p>
+          <table width="100%" cellpadding="0" cellspacing="0"><tr>
+            <td align="center" style="padding:8px 0 28px;">
+              <div style="display:inline-block;background:#F6EEE1;
+                           border:2px dashed #9B7080;border-radius:4px;
+                           padding:20px 40px;text-align:center;">
+                <p style="margin:0 0 6px;font-size:9pt;color:#9B7080;
+                           letter-spacing:0.20em;text-transform:uppercase;">
+                  Your OTP Code</p>
+                <p style="margin:0;font-size:36px;font-weight:700;
+                           letter-spacing:0.20em;color:#6A012A;">{otp}</p>
+              </div>
+            </td>
+          </tr></table>
+          <p style="margin:0;font-size:12px;color:#9B7080;">
+            Do not share this code with anyone.
+            If you did not request this, your account is safe — ignore this email.</p>'''
+    )
+    return twam_email(title="Password Reset OTP — TWAM", content=content)
 
 
 def _otp_email_plain(full_name: str, otp: str) -> str:
@@ -317,17 +264,20 @@ async def register_reset_password(request: ResetPasswordRequest, db: Session = D
     reset_link = f"{FRONTEND_URL}/reset-password?token={reset_token}"
 
     full_name = f"{user.FirstName} {user.LastName}".strip() or user.Email
+    _reset_content = (
+        greeting(full_name)
+        + '''<p style="margin:0 0 20px;">We received a request to reset your password.
+          Click the button below to choose a new one.
+          This link is valid for <strong>15 minutes</strong>.</p>'''
+        + cta_button("Reset My Password", reset_link)
+        + '''<p style="margin:16px 0 0;font-size:12px;color:#9B7080;text-align:center;">
+          If you did not request this, you can safely ignore this email.</p>'''
+    )
     sent = send_email(db, EmailCreate(
         name    = full_name,
         email   = user.Email,
         subject = "Reset Your Password — Only TWAM",
-        message = (
-            f"Hello {full_name},\n\n"
-            f"Click the link below to reset your password (valid for 15 minutes):\n"
-            f"{reset_link}\n\n"
-            f"If you did not request this, please ignore this email.\n\n"
-            f"Regards,\nTWAM Team"
-        ),
+        message = twam_email(title="Reset Your Password — TWAM", content=_reset_content),
         filename=None, isFile=False, data=None,
     ))
     if not sent:

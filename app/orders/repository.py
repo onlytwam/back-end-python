@@ -319,6 +319,8 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
             p."Name",
             pvd."FinalPrice",
             pvd."TaxAmount",
+            pvd."CGST",
+            pvd."SGST",
             (
                 SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
                 ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
@@ -340,20 +342,39 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
 
     items = []
     for row in rows:
-        quantity = int(row[4] or 0)
+        quantity   = int(row[4] or 0)
         unit_price = float(row[6]) if row[6] is not None else 0.0
-        unit_tax = float(row[7]) if row[7] is not None else 0.0
+        unit_tax   = float(row[7]) if row[7] is not None else 0.0
+        # FIX: Read stored CGST/SGST rates directly from ProductVariantDetail
+        # instead of recomputing via TaxHSNCode. This ensures the cart checkout
+        # summary always reflects the values that were stored at PVD creation time.
+        stored_cgst_rate = float(row[8]) if row[8] is not None else 0.0
+        stored_sgst_rate = float(row[9]) if row[9] is not None else 0.0
+        product_id = row[1]
+
+        # Compute per-unit tax amounts from stored rates
+        cgst_unit = round(unit_price * stored_cgst_rate / 100, 2)
+        sgst_unit = round(unit_price * stored_sgst_rate / 100, 2)
+        # Fallback: if rates are 0 but taxAmount is stored, split 50/50
+        if cgst_unit == 0 and sgst_unit == 0 and unit_tax > 0:
+            cgst_unit = round(unit_tax / 2, 2)
+            sgst_unit = round(unit_tax - cgst_unit, 2)
+
         items.append({
-            "cartId": row[0],
-            "productId": row[1],
-            "productVariantId": row[2],
+            "cartId":                 row[0],
+            "productId":              product_id,
+            "productVariantId":       row[2],
             "productVariantDetailId": row[3],
-            "quantity": quantity,
-            "productName": row[5],
-            "unitPrice": unit_price,
-            "taxAmount": round(unit_tax * quantity, 2),
-            "lineTotal": round(unit_price * quantity, 2),
-            "productImage": row[8] or "",
+            "quantity":               quantity,
+            "productName":            row[5],
+            "unitPrice":              unit_price,
+            "cgstRate":               stored_cgst_rate,
+            "sgstRate":               stored_sgst_rate,
+            "cgstAmount":             round(cgst_unit * quantity, 2),
+            "sgstAmount":             round(sgst_unit * quantity, 2),
+            "taxAmount":              round((cgst_unit + sgst_unit) * quantity, 2),
+            "lineTotal":              round(unit_price * quantity, 2),
+            "productImage":           row[10] or "",
         })
     return items
 
@@ -406,21 +427,32 @@ def _get_buynow_checkout_items(db: Session, order_items: list) -> List[dict]:
         pvd_id = item.productVariantDetailId
         if pvd_id not in db_map:
             raise ValueError(f"Product variant detail {pvd_id} not found or unavailable.")
-        row = db_map[pvd_id]
-        quantity = int(item.quantity or 1)
+        row        = db_map[pvd_id]
+        quantity   = int(item.quantity or 1)
         unit_price = float(row[4]) if row[4] is not None else 0.0
-        unit_tax = float(row[5]) if row[5] is not None else 0.0
+        product_id = row[1]
+
+        try:
+            from app.taxhsncode.repository import compute_tax_for_product
+            tax = compute_tax_for_product(db, product_id, unit_price)
+        except Exception:
+            tax = {"cgstRate": 0.0, "sgstRate": 0.0, "cgstAmount": 0.0, "sgstAmount": 0.0}
+
         items.append({
-            "cartId": None,          # No cart record for Buy Now
-            "productId": row[1],
-            "productVariantId": row[2],
+            "cartId":                 None,
+            "productId":              product_id,
+            "productVariantId":       row[2],
             "productVariantDetailId": pvd_id,
-            "quantity": quantity,
-            "productName": row[3],
-            "unitPrice": unit_price,
-            "taxAmount": round(unit_tax * quantity, 2),
-            "lineTotal": round(unit_price * quantity, 2),
-            "productImage": row[6] or "",
+            "quantity":               quantity,
+            "productName":            row[3],
+            "unitPrice":              unit_price,
+            "cgstRate":               tax["cgstRate"],
+            "sgstRate":               tax["sgstRate"],
+            "cgstAmount":             round(tax["cgstAmount"] * quantity, 2),
+            "sgstAmount":             round(tax["sgstAmount"] * quantity, 2),
+            "taxAmount":              round((tax["cgstAmount"] + tax["sgstAmount"]) * quantity, 2),
+            "lineTotal":              round(unit_price * quantity, 2),
+            "productImage":           row[6] or "",
         })
     return items
 
@@ -455,8 +487,10 @@ def get_checkout_summary(db: Session, user_profile_id: str, data) -> dict:
         if len(cart_items) != len(cart_ids):
             raise ValueError("Some cart items were not found for this user.")
 
-    sub_total = round(sum(item["lineTotal"] for item in cart_items), 2)
-    tax_amount = round(sum(item["taxAmount"] for item in cart_items), 2)
+    sub_total   = round(sum(item["lineTotal"]   for item in cart_items), 2)
+    tax_amount  = round(sum(item["taxAmount"]   for item in cart_items), 2)
+    cgst_total  = round(sum(item.get("cgstAmount", 0) for item in cart_items), 2)
+    sgst_total  = round(sum(item.get("sgstAmount", 0) for item in cart_items), 2)
     delivery_info = _get_delivery_info(db, data.shippingTypeId, sub_total)
     if delivery_info and delivery_info.get("isEligible") is False:
         min_value = delivery_info.get("minOrderValue")
@@ -467,18 +501,20 @@ def get_checkout_summary(db: Session, user_profile_id: str, data) -> dict:
 
     return {
         "shippingAddress": _build_address_response(shipping_address),
-        "billingAddress": _build_address_response(billing_address),
-        "deliveryInfo": delivery_info,
-        "shippingTypeId": data.shippingTypeId,
-        "cartItems": cart_items,
-        "itemCount": len(cart_items),
-        "totalQuantity": sum(item["quantity"] for item in cart_items),
-        "subTotal": sub_total,
-        "taxAmount": tax_amount,
-        "deliveryCharge": delivery_charge,
-        "couponAmount": coupon_amount,
-        "totalAmount": total_amount,
-        "isBuyNow": is_buy_now,
+        "billingAddress":  _build_address_response(billing_address),
+        "deliveryInfo":    delivery_info,
+        "shippingTypeId":  data.shippingTypeId,
+        "cartItems":       cart_items,
+        "itemCount":       len(cart_items),
+        "totalQuantity":   sum(item["quantity"] for item in cart_items),
+        "subTotal":        sub_total,
+        "taxAmount":       tax_amount,
+        "cgstTotal":       cgst_total,
+        "sgstTotal":       sgst_total,
+        "deliveryCharge":  delivery_charge,
+        "couponAmount":    coupon_amount,
+        "totalAmount":     total_amount,
+        "isBuyNow":        is_buy_now,
     }
 
 

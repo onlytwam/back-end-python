@@ -59,6 +59,10 @@ from sqlalchemy import Enum, text
 
 from app.sendemail.repository import send_email
 from app.sendemail.schemas import EmailCreate
+from app.shared.email_template import (
+    twam_email, greeting, info_box, items_table,
+    totals_block, cta_button, section_divider,
+)
 
 
 # ── AppSettings cache (5-minute TTL) ─────────────────────────────────────────
@@ -328,30 +332,13 @@ def _fmt_items_sms(items: list) -> str:
 # ── Email HTML helpers ────────────────────────────────────────────────────────
 
 def _header(company_name: str) -> str:
-    """Legacy helper kept for other notification types."""
-    return f"""
-    <div style="background:#6A012A;padding:10px 24px;display:flex;align-items:center;
-                justify-content:space-between;">
-      <img src="https://onlytwam.com/assets/Twam-Logo_White.png" height="32" alt="{company_name}"
-           style="display:block;" />
-    </div>"""
+    """Kept for backward-compat; new code uses twam_email() directly."""
+    return ""
 
 
 def _footer(company_name: str, support_email: str) -> str:
-    return f"""
-    <div style="background:#F0E6D0;padding:20px 24px;margin-top:0;
-                border-top:1.5px solid #EDE0CC;display:flex;
-                justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;">
-      <p style="margin:0;color:#9B7080;font-family:Georgia,serif;font-size:11px;
-                letter-spacing:0.08em;max-width:360px;line-height:1.6;">
-        We are Only TWAM, a multibrand platform where women have a wide variety of lingerie
-        brands, that can help them pick their most comfortable fit based on their daily needs.
-      </p>
-      <div style="font-size:10px;color:#9B7080;font-family:Georgia,serif;
-                  letter-spacing:0.1em;text-align:right;line-height:1.8;">
-        <div>onlytwam.com/contact-us</div>
-      </div>
-    </div>"""
+    """Kept for backward-compat; new code uses twam_email() directly."""
+    return ""
 
 
 def _items_table(items: list) -> str:
@@ -816,10 +803,40 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
     items   = _get_order_items(db, order_id)
 
     if order["customer_email"]:
-        body = _build_invoice_email(order, items, company, support)
+        subtotal = sum(i["price"] * i["quantity"] for i in items)
+        it = [{"name": i["name"], "quantity": i["quantity"], "price": i["price"],
+               "size": i.get("size"), "color": i.get("color")} for i in items]
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">Your order has been confirmed.
+              We'll get it packed and shipped as soon as possible!</p>'''
+            + info_box([
+                ("Order Number", f"#{order['order_number']}"),
+                ("Order Date",   datetime.now().strftime("%d %b %Y")),
+                ("Status",       "Confirmed ✓"),
+            ], accent="#2E8B57")
+            + items_table(it)
+            + totals_block(subtotal,
+                           order.get("delivery_charge") or 0,
+                           order.get("total_amount") or 0,
+                           order.get("coupon_amount") or 0)
+            + section_divider()
+            + info_box([
+                ("Ship To", order.get("customer_name", "")),
+                ("Address", ", ".join(filter(None, [
+                    order.get("address_line"), order.get("locality"),
+                    order.get("city"), order.get("pincode"),
+                ]))),
+                ("Phone",   order.get("customer_phone", "")),
+            ])
+        )
+        body = twam_email(
+            title   = f"Order Confirmed! #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Order Confirmed! #{order['order_number']} - {company}", message=body,
+            subject=f"Order Confirmed! #{order['order_number']} — {company}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -864,25 +881,25 @@ def send_order_pending_notification(db: Session, order_id: int) -> bool:
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
 
     if order["customer_email"]:
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#f5a623;">Payment Pending</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">Order <strong>#{order['order_number']}</strong> received but payment confirmation is pending.</p>
-            <div style="background:#fff8e7;padding:15px;border-radius:8px;border-left:4px solid #f5a623;margin:20px 0;">
-              <p style="margin:0;"><strong>Order:</strong> #{order['order_number']}</p>
-              <p style="margin:5px 0 0;"><strong>Amount:</strong> {_fmt(order['total_amount'])}</p>
-            </div>
-            <p style="color:#666;">We'll notify you once payment is confirmed.
-              Questions? <a href="mailto:{support}" style="color:#8b7355;">{support}</a></p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        content = (
+            greeting(order["customer_name"])
+            + '''<p style="margin:0 0 16px;">Your order has been received but
+              payment confirmation is still pending. We'll notify you once confirmed.</p>'''
+            + info_box([
+                ("Order Number", f"#{order['order_number']}"),
+                ("Amount",       _fmt(order["total_amount"])),
+                ("Status",       "Payment Pending"),
+            ], accent="#f5a623")
+            + f'''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">
+              Questions? <a href="mailto:{support}">{support}</a></p>'''
+        )
+        body = twam_email(
+            title   = f"Payment Pending — Order #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Order Payment Pending - #{order['order_number']}", message=body,
+            subject=f"Order Payment Pending — #{order['order_number']}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -919,26 +936,27 @@ def send_payment_failure_notification(
     amount  = total_amount or order["total_amount"]
 
     if order["customer_email"]:
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#c0392b;">Payment Failed</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">Payment for order <strong>#{order['order_number']}</strong> could not be processed.</p>
-            <div style="background:#fdf2f2;padding:15px;border-radius:8px;border-left:4px solid #c0392b;margin:20px 0;">
-              <p style="margin:0;"><strong>Order:</strong> #{order['order_number']}</p>
-              <p style="margin:5px 0 0;"><strong>Amount:</strong> {_fmt(amount)}</p>
-            </div>
-            <p style="color:#666;">Please retry with a different payment method.
-              If the amount was deducted it will be refunded within 3-7 business days.</p>
-            <p style="color:#666;">Need help? <a href="mailto:{support}" style="color:#8b7355;">{support}</a></p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        content = (
+            greeting(order["customer_name"])
+            + '''<p style="margin:0 0 16px;">Unfortunately, payment for your order
+              could not be processed. Please retry with a different payment method.</p>'''
+            + info_box([
+                ("Order Number", f"#{order['order_number']}"),
+                ("Amount",       _fmt(amount)),
+                ("Status",       "Payment Failed"),
+            ], accent="#c0392b")
+            + '''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">
+              If your account was debited, the amount will be refunded within 3–7 business days.</p>'''
+            + f'''<p style="margin:8px 0 0;font-size:13px;color:#9B7080;">
+              Need help? <a href="mailto:{support}">{support}</a></p>'''
+        )
+        body = twam_email(
+            title   = f"Payment Failed — Order #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Payment Failed - Order #{order['order_number']}", message=body,
+            subject=f"Payment Failed — Order #{order['order_number']}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -1006,27 +1024,26 @@ def send_refund_success_notification(
     fmt_date   = refund_date or datetime.now().strftime("%d %b %Y")
 
     if order["customer_email"]:
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#2e7d32;">Refund Processed Successfully</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">Your refund for order <strong>#{order['order_number']}</strong>
-              has been successfully processed.</p>
-            <div style="background:#e8f5e9;padding:15px;border-radius:8px;border-left:4px solid #2e7d32;margin:20px 0;">
-              <p style="margin:0;"><strong>Refund Amount:</strong> {fmt_amount}</p>
-              <p style="margin:5px 0 0;"><strong>Payment Method:</strong> {payment_method}</p>
-              <p style="margin:5px 0 0;"><strong>Date:</strong> {fmt_date}</p>
-            </div>
-            <p style="color:#666;">Please allow 3-7 business days for the amount to reflect in your account.</p>
-            <p style="color:#666;">Questions? <a href="mailto:{support}" style="color:#8b7355;">{support}</a></p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">Your refund for order
+              <strong>#{order['order_number']}</strong> has been successfully processed.</p>'''
+            + info_box([
+                ("Refund Amount",  fmt_amount),
+                ("Payment Method", payment_method),
+                ("Refund Date",    fmt_date),
+                ("Order Number",   f"#{order['order_number']}"),
+            ], accent="#2E8B57")
+            + '''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">
+              Please allow 3–7 business days for the amount to reflect in your account.</p>'''
+        )
+        body = twam_email(
+            title   = f"Refund Processed — Order #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Refund Processed - Order #{order['order_number']}", message=body,
+            subject=f"Refund Processed — Order #{order['order_number']}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -1069,27 +1086,20 @@ def send_order_shipped_notification(db: Session, order_id: int) -> bool:
     tracking_url  = (f"{tracking_base}/{order['tracking_id']}" if order["tracking_id"] else "")
 
     if order["customer_email"]:
-        track_btn = (
-            f'<a href="{tracking_url}" style="display:inline-block;margin-top:15px;'
-            f'background:#8b7355;color:#fff;padding:12px 30px;text-decoration:none;'
-            f'border-radius:5px;">Track Your Package</a>' if tracking_url else ""
+        rows = [
+            ("Order Number", f"#{order['order_number']}"),
+            ("Tracking ID",  order["tracking_id"] or "Processing…"),
+        ]
+        content = (
+            greeting(order["customer_name"])
+            + '''<p style="margin:0 0 16px;">Great news — your order is on its way!</p>'''
+            + info_box(rows)
+            + (cta_button("Track Your Package", tracking_url) if tracking_url else "")
         )
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#333;margin:10px 0;">Your order is on its way!</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">Your order <strong>#{order['order_number']}</strong> has been shipped!</p>
-            <div style="background:#f8f5f0;padding:20px;border-radius:8px;margin:25px 0;text-align:center;">
-              <p style="margin:0 0 10px;color:#666;">Tracking ID</p>
-              <p style="margin:0;font-size:24px;font-weight:bold;color:#8b7355;letter-spacing:2px;">
-                {order['tracking_id'] or 'Processing...'}</p>
-              {track_btn}
-            </div>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        body = twam_email(
+            title   = f"Your Order is On Its Way! #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
             subject=f"Your Order is On Its Way! #{order['order_number']}", message=body,
@@ -1128,24 +1138,23 @@ def send_out_for_delivery_notification(db: Session, order_id: int) -> bool:
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
 
     if order["customer_email"]:
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;text-align:center;">
-            <h2 style="color:#333;margin:10px 0;">Your order is arriving today!</h2>
-            <p style="color:#666;font-size:16px;">Hi {order['customer_name']}, order
-              <strong>#{order['order_number']}</strong> is out for delivery!</p>
-            <div style="background:#e8f5e9;padding:20px;border-radius:8px;margin:25px 0;">
-              <p style="margin:0;color:#2e7d32;font-size:16px;">
-                Please ensure someone is available to receive the package.</p>
-            </div>
-            <p style="color:#666;"><strong>Tracking ID:</strong> {order['tracking_id'] or 'N/A'}</p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">Your order <strong>#{order['order_number']}</strong>
+              is out for delivery today! Please ensure someone is available to receive the package.</p>'''
+            + info_box([
+                ("Order Number", f"#{order['order_number']}"),
+                ("Tracking ID",  order["tracking_id"] or "N/A"),
+                ("Status",       "Out for Delivery 🚚"),
+            ], accent="#2E8B57")
+        )
+        body = twam_email(
+            title   = f"Arriving Today! Order #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Arriving Today! Order #{order['order_number']}", message=body,
+            subject=f"Arriving Today! — Order #{order['order_number']}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -1181,26 +1190,26 @@ def send_delivery_confirmation(
     website = _cfg(db, "WEBSITE_URL", "https://onlytwam.com")
 
     if order["customer_email"]:
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;text-align:center;">
-            <h2 style="color:#2e7d32;margin:10px 0;">Your order has been delivered!</h2>
-            <p style="color:#666;font-size:16px;">Hi {order['customer_name']}, order
-              <strong>#{order['order_number']}</strong> has been successfully delivered.</p>
-            <div style="background:#f8f5f0;padding:20px;border-radius:8px;margin:25px 0;">
-              <p style="margin:0 0 15px;color:#333;">We hope you love your purchase!</p>
-              <a href="{website}/account/orders-list"
-                style="display:inline-block;background:#8b7355;color:#fff;
-                       padding:12px 30px;text-decoration:none;border-radius:5px;">Leave a Review</a>
-            </div>
-            <p style="color:#999;font-size:14px;">Need to return? Visit "My Orders" within 7 days.</p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">Your order
+              <strong>#{order['order_number']}</strong> has been delivered!
+              We hope you love your new purchase. 🎉</p>'''
+            + info_box([
+                ("Order Number", f"#{order['order_number']}"),
+                ("Status",       "Delivered ✓"),
+            ], accent="#2E8B57")
+            + cta_button("Leave a Review", f"{website}/account/orders-list")
+            + '''<p style="margin:16px 0 0;font-size:12px;color:#9B7080;text-align:center;">
+              Need to return? Visit "My Orders" within 7 days.</p>'''
+        )
+        body = twam_email(
+            title   = f"Delivered! Order #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Delivered! Order #{order['order_number']} - {company}", message=body,
+            subject=f"Delivered! Order #{order['order_number']} — {company}", message=body,
         ))
 
     if order["customer_phone"]:
@@ -1288,30 +1297,27 @@ def send_order_cancelled_notification(
         refund_note    = "If you paid online, your refund will be processed within 5-7 business days."
 
     if order["customer_email"]:
-        reason_line = (
-            f'<p style="color:#666;"><strong>Reason:</strong> {reason}</p>'
-            if reason else ""
+        rows = [
+            ("Order Number", f"#{order['order_number']}"),
+            ("Amount",       _fmt(order["total_amount"])),
+            ("Status",       "Cancelled"),
+        ]
+        if reason:
+            rows.append(("Reason", reason))
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">{email_intro}</p>'''
+            + info_box(rows, accent="#c0392b")
+            + f'''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">{refund_note}</p>'''
         )
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#333;">{email_heading}</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">{email_intro}</p>
-            {reason_line}
-            <div style="background:#f8f5f0;padding:15px;border-radius:8px;margin:20px 0;">
-              <p style="margin:0;"><strong>Order Number:</strong> #{order['order_number']}</p>
-              <p style="margin:5px 0 0;"><strong>Amount:</strong> {_fmt(order['total_amount'])}</p>
-            </div>
-            <p style="color:#666;">{refund_note}</p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+        body = twam_email(
+            title   = f"{email_heading} — #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"],
             email=order["customer_email"],
-            subject=f"{email_heading} - #{order['order_number']}",
+            subject=f"{email_heading} — #{order['order_number']}",
             message=body,
         ))
 
@@ -1356,34 +1362,30 @@ def send_return_initiated_notification(
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
 
     if order["customer_email"]:
-        reason_line = (
-            f'<p style="color:#666;"><strong>Reason:</strong> {return_reason}</p>'
-            if return_reason else ""
-        )
-        body = f"""
-        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;">
-          {_header(company)}
-          <div style="padding:30px;">
-            <h2 style="color:#333;">Return Request Received</h2>
-            <p style="color:#666;">Hi {order['customer_name']},</p>
-            <p style="color:#666;">We've received your return request for order
-              <strong>#{order['order_number']}</strong>.</p>
-            {reason_line}
-            <div style="background:#fff8e7;padding:15px;border-radius:8px;border-left:4px solid #f5a623;margin:20px 0;">
-              <h4 style="margin:0 0 10px;color:#333;">What happens next?</h4>
-              <ol style="margin:0;padding-left:20px;color:#666;">
+        rows = [("Order Number", f"#{order['order_number']}")]
+        if return_reason:
+            rows.append(("Reason", return_reason))
+        content = (
+            greeting(order["customer_name"])
+            + f'''<p style="margin:0 0 16px;">We've received your return request for
+              order <strong>#{order['order_number']}</strong>.</p>'''
+            + info_box(rows, accent="#f5a623")
+            + '''<p style="margin:16px 0 4px;font-size:13px;"><strong>What happens next?</strong></p>
+              <ol style="margin:0;padding-left:20px;font-size:13px;color:#6B5060;line-height:1.8;">
                 <li>Our team will review your request</li>
-                <li>You'll receive pickup details within 24-48 hours</li>
+                <li>You'll receive pickup details within 24–48 hours</li>
                 <li>Refund will be processed after we receive the item</li>
-              </ol>
-            </div>
-            <p style="color:#666;">Questions? <a href="mailto:{support}" style="color:#8b7355;">{support}</a></p>
-          </div>
-          {_footer(company, support)}
-        </div>"""
+              </ol>'''
+            + f'''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">
+              Questions? <a href="mailto:{support}">{support}</a></p>'''
+        )
+        body = twam_email(
+            title   = f"Return Request Received — #{order['order_number']}",
+            content = content,
+        )
         send_email(db, EmailCreate(
             name=order["customer_name"], email=order["customer_email"],
-            subject=f"Return Request Received - #{order['order_number']}", message=body,
+            subject=f"Return Request Received — #{order['order_number']}", message=body,
         ))
 
     if order["customer_phone"]:

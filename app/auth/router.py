@@ -234,19 +234,34 @@ def _send_phone_otp(db: Session, phone: str, otp: str, channel: str) -> bool:
 
 def _send_email_otp(db: Session, email: str, otp: str, *, full_name: str = "") -> bool:
     try:
-        from app.sendemail.repository import send_email
+        from app.sendemail.repository import send_email  # noqa: F401 (also imported inline)
         from app.sendemail.schemas import EmailCreate
         name = full_name.strip() or email
+        from app.shared.email_template import twam_email, greeting
+        content = (
+            greeting(name)
+            + f'''<p style="margin:0 0 24px;">Your one-time login code is:</p>
+              <table width="100%" cellpadding="0" cellspacing="0"><tr>
+                <td align="center" style="padding:8px 0 28px;">
+                  <div style="display:inline-block;background:#F6EEE1;
+                               border:2px dashed #9B7080;border-radius:4px;
+                               padding:20px 40px;text-align:center;">
+                    <p style="margin:0 0 6px;font-size:9pt;color:#9B7080;
+                               letter-spacing:0.20em;text-transform:uppercase;">
+                      Your OTP Code</p>
+                    <p style="margin:0;font-size:36px;font-weight:700;
+                               letter-spacing:0.20em;color:#6A012A;">{otp}</p>
+                  </div>
+                </td>
+              </tr></table>
+              <p style="margin:0;font-size:12px;color:#9B7080;">
+                Valid for {_OTP_TTL_MINUTES} minutes. Do not share this code with anyone.</p>'''
+        )
         return send_email(db, EmailCreate(
             name    = name,
             email   = email,
             subject = "Your Login OTP — TWAM",
-            message = (
-                f"<p>Hi {name},</p>"
-                f"<p>Your one-time login code is: "
-                f"<strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
-                f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
-            ),
+            message = twam_email(title="Your Login OTP — TWAM", content=content),
             filename=None, isFile=False, data=None,
         ))
     except Exception as e:
@@ -456,16 +471,31 @@ def _send_otp_to_channels(db: Session, user, *, purpose: str) -> dict:
             from app.sendemail.repository import send_email
             from app.sendemail.schemas import EmailCreate
             name = user.full_name or user.Email
+            from app.shared.email_template import twam_email, greeting
+            _otp_content = (
+                greeting(name)
+                + f'''<p style="margin:0 0 24px;">Your one-time login code is:</p>
+                  <table width="100%" cellpadding="0" cellspacing="0"><tr>
+                    <td align="center" style="padding:8px 0 28px;">
+                      <div style="display:inline-block;background:#F6EEE1;
+                                   border:2px dashed #9B7080;border-radius:4px;
+                                   padding:20px 40px;text-align:center;">
+                        <p style="margin:0 0 6px;font-size:9pt;color:#9B7080;
+                                   letter-spacing:0.20em;text-transform:uppercase;">
+                          Your OTP Code</p>
+                        <p style="margin:0;font-size:36px;font-weight:700;
+                                   letter-spacing:0.20em;color:#6A012A;">{otp}</p>
+                      </div>
+                    </td>
+                  </tr></table>
+                  <p style="margin:0;font-size:12px;color:#9B7080;">
+                    Valid for {_OTP_TTL_MINUTES} minutes. Do not share this code with anyone.</p>'''
+            )
             send_email(db, EmailCreate(
                 name    = name,
                 email   = user.Email,
                 subject = "Your Login OTP — TWAM",
-                message = (
-                    f"<p>Hi {name},</p>"
-                    f"<p>Your one-time login code is: "
-                    f"<strong style='font-size:24px;letter-spacing:4px;'>{otp}</strong></p>"
-                    f"<p>Valid for {_OTP_TTL_MINUTES} minutes. Do not share with anyone.</p>"
-                ),
+                message = twam_email(title="Your Login OTP — TWAM", content=_otp_content),
                 filename=None, isFile=False, data=None,
             ))
         except Exception as e:
@@ -808,16 +838,21 @@ async def send_reset_password(request: ResetPasswordRequest, db: Session = Depen
         from app.sendemail.repository import send_email
         from app.sendemail.schemas import EmailCreate
         full_name = user.full_name or user.Email
+        from app.shared.email_template import twam_email, greeting, cta_button
+        _reset_content = (
+            greeting(full_name)
+            + '''<p style="margin:0 0 20px;">We received a request to reset your password.
+              Click the button below to choose a new one. This link is valid for
+              <strong>15 minutes</strong>.</p>'''
+            + cta_button("Reset My Password", reset_link)
+            + '''<p style="margin:16px 0 0;font-size:12px;color:#9B7080;text-align:center;">
+              If you did not request this, you can safely ignore this email.</p>'''
+        )
         sent = send_email(db, EmailCreate(
             name    = full_name,
             email   = user.Email,
             subject = request.Subject or "Reset Your Password — Only TWAM",
-            message = (
-                f"Hello {full_name},\n\n"
-                f"Click the link below to reset your password (valid 15 minutes):\n"
-                f"{reset_link}\n\n"
-                f"If you did not request this, ignore this email.\n\nTWAM Team"
-            ),
+            message = twam_email(title="Reset Your Password — TWAM", content=_reset_content),
             filename=None, isFile=False, data=None,
         ))
         if not sent:

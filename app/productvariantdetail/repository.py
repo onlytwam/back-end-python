@@ -8,6 +8,26 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import ProductVariantDetail
 from app.stocklog.models import StockLog
 
+
+def _auto_compute_tax(db: Session, product_id: int, final_price: float) -> dict:
+    """
+    Resolve CGST/SGST for a variant detail by looking up the parent product's
+    TaxHSNCode and matching the correct price slab.
+
+    Returns {"cgst": rate%, "sgst": rate%, "taxAmount": Rupees} or zeros if
+    the product has no HSN code assigned.
+    """
+    try:
+        from app.taxhsncode.repository import compute_tax_for_product
+        result = compute_tax_for_product(db, product_id, final_price)
+        return {
+            "cgst":      result["cgstRate"],
+            "sgst":      result["sgstRate"],
+            "taxAmount": result["taxAmount"],
+        }
+    except Exception:
+        return {"cgst": 0.0, "sgst": 0.0, "taxAmount": 0.0}
+
 # ── Stock formula helper ──────────────────────────────────────────────────────
 
 def _apply_stock_formula(pvd: ProductVariantDetail) -> None:
@@ -134,7 +154,11 @@ def create_variant_detail(db: Session, data) -> int:
     the total quantity.  processedQuantity and returnedQuantity start at 0.
     availableQuantity is derived: total - processed + refunded.
     """
-    total_qty = data.stockQuantity or 0
+    total_qty   = data.stockQuantity or 0
+    final_price = float(data.finalPrice or 0)
+
+    # Auto-compute CGST/SGST/TaxAmount from the parent product's TaxHSNCode + price slab.
+    tax_info = _auto_compute_tax(db, data.productId, final_price)
 
     pvd = ProductVariantDetail(
         productId         = data.productId,
@@ -142,15 +166,15 @@ def create_variant_detail(db: Session, data) -> int:
         productCode       = data.productCode,
         sizeId            = data.sizeId,
         stockQuantity     = total_qty,
-        processedQuantity = 0,       # always starts at 0
-        returnedQuantity  = 0,       # always starts at 0
-        availableQuantity = total_qty,  # available = total at creation
+        processedQuantity = 0,
+        returnedQuantity  = 0,
+        availableQuantity = total_qty,
         discountPercent   = data.discountPercent,
         mrpPrice          = data.mrpPrice,
-        finalPrice        = data.finalPrice,
-        taxAmount         = data.taxAmount,
-        cgst              = data.cgst,
-        sgst              = data.sgst,
+        finalPrice        = final_price,
+        taxAmount         = tax_info["taxAmount"],
+        cgst              = tax_info["cgst"],
+        sgst              = tax_info["sgst"],
         userProfileId     = data.userProfileId,
         state             = data.state,
         cupSizeId         = data.cupSizeId,
@@ -226,16 +250,20 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
     prev_processed = pvd.processedQuantity or 0
     prev_returned  = pvd.returnedQuantity  or 0
 
+    # Auto-compute CGST/SGST from TaxHSNCode + new price
+    new_final_price = float(data.finalPrice if data.finalPrice is not None else pvd.finalPrice or 0)
+    tax_info = _auto_compute_tax(db, pvd.productId, new_final_price)
+
     # Price / meta fields — apply only when provided
     simple_fields = {
         "productCode":     data.productCode,
         "sizeId":          data.sizeId,
         "discountPercent": data.discountPercent,
         "mrpPrice":        data.mrpPrice,
-        "finalPrice":      data.finalPrice,
-        "taxAmount":       data.taxAmount,
-        "cgst":            data.cgst,
-        "sgst":            data.sgst,
+        "finalPrice":      new_final_price,
+        "taxAmount":       tax_info["taxAmount"],
+        "cgst":            tax_info["cgst"],
+        "sgst":            tax_info["sgst"],
         "state":           data.state,
         "cupSizeId":       data.cupSizeId,
         "isAlphabetSize":  data.isAlphabetSize,

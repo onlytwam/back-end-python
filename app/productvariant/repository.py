@@ -374,9 +374,17 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         for r in img_rows if r[0]
     ]
 
-    pvd_row = db.execute(text(
-        'SELECT "FinalPrice","MRPPrice","AvailableQuantity","DiscountPercent","Size" FROM twam."ProductVariantDetail" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) LIMIT 1'
-    ), {"pvid": pv_id}).fetchone()
+    pvd_row = db.execute(text("""
+        SELECT "FinalPrice","MRPPrice","AvailableQuantity","DiscountPercent","Size"
+        FROM twam."ProductVariantDetail"
+        WHERE "ProductVariantId" = :pvid
+          AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+        ORDER BY
+          CASE WHEN COALESCE("AvailableQuantity", "StockQuantity", 0) > 0 THEN 0 ELSE 1 END,
+          COALESCE("FinalPrice", "MRPPrice") ASC NULLS LAST,
+          "ProductVariantDetailId" ASC
+        LIMIT 1
+    """), {"pvid": pv_id}).fetchone()
 
     rating_row = db.execute(text("""
         SELECT
@@ -472,11 +480,32 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = pv2."ProductVariantId"
                AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
-             LIMIT 1) AS image
+             LIMIT 1) AS image,
+            best_pvd."FinalPrice" AS min_final_price,
+            best_pvd."MRPPrice" AS min_mrp_price,
+            best_pvd."ProductVariantDetailId" AS min_pvd_id,
+            best_pvd."Size" AS min_size_id,
+            best_pvd."CupSize" AS min_cup_size_id,
+            COALESCE(best_pvd."AvailableQuantity", best_pvd."StockQuantity", 0) AS min_stock
         FROM twam."ProductVariants" pv2
+        LEFT JOIN LATERAL (
+            SELECT pvd2."ProductVariantDetailId", pvd2."FinalPrice", pvd2."MRPPrice",
+                   pvd2."Size", pvd2."CupSize", pvd2."AvailableQuantity", pvd2."StockQuantity"
+            FROM twam."ProductVariantDetail" pvd2
+            WHERE pvd2."ProductVariantId" = pv2."ProductVariantId"
+              AND (pvd2."DeletedInd" = false OR pvd2."DeletedInd" IS NULL)
+            ORDER BY
+              CASE WHEN COALESCE(pvd2."AvailableQuantity", pvd2."StockQuantity", 0) > 0 THEN 0 ELSE 1 END,
+              COALESCE(pvd2."FinalPrice", pvd2."MRPPrice") ASC NULLS LAST,
+              pvd2."ProductVariantDetailId" ASC
+            LIMIT 1
+        ) best_pvd ON true
         WHERE pv2."ProductId" = :pid
           AND (pv2."DeletedInd" = false OR pv2."DeletedInd" IS NULL)
           AND (pv2."IsActive" = true OR pv2."IsActive" IS NULL)
+        ORDER BY
+          COALESCE(best_pvd."FinalPrice", best_pvd."MRPPrice") ASC NULLS LAST,
+          pv2."ProductVariantId" ASC
     """), {"pid": prod_id, "base": BASE_URL}).fetchall()
 
     return {
@@ -515,7 +544,16 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             "hasStock":  any(r[1] == c[0] and (r[3] or 0) > 0 for r in pvd_matrix_rows),
         } for c in all_cup_rows],
         "colors": [{
-            "productVariantId": cr[0], "color": cr[1], "colorFamily": cr[2], "image": cr[3]
+            "productVariantId": cr[0],
+            "color": cr[1],
+            "colorFamily": cr[2],
+            "image": cr[3],
+            "minFinalPrice": float(cr[4]) if cr[4] is not None else None,
+            "minMrpPrice": float(cr[5]) if cr[5] is not None else None,
+            "minProductVariantDetailId": cr[6],
+            "minSizeId": cr[7],
+            "minCupSizeId": cr[8],
+            "minStock": int(cr[9]) if cr[9] is not None else 0,
         } for cr in color_rows],
     }
 
@@ -813,6 +851,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         SELECT * FROM (
             SELECT DISTINCT ON (pv."ProductVariantId")
                 pv."ProductVariantId"                                   AS pv_id,
+                pvd."ProductVariantDetailId"                            AS pvd_id,
                 p."ProductId"                                           AS product_id,
                 p."ProductCode"                                         AS product_code,
                 pv."FabricId"                                           AS fabric_id,
@@ -880,7 +919,11 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             LEFT JOIN twam."Category" pc   ON pc."CategoryId"  = p."CategoryId"
             LEFT JOIN twam."Category" cc   ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
-            ORDER BY pv."ProductVariantId", pvd."ProductVariantDetailId" ASC NULLS LAST
+            ORDER BY
+                pv."ProductVariantId",
+                CASE WHEN COALESCE(pvd."AvailableQuantity", pvd."StockQuantity", 0) > 0 THEN 0 ELSE 1 END,
+                COALESCE(pvd."FinalPrice", pvd."MRPPrice") ASC NULLS LAST,
+                pvd."ProductVariantDetailId" ASC NULLS LAST
         ) deduped
         ORDER BY {order_col}
         LIMIT :lim OFFSET :off
@@ -905,6 +948,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         m = r._mapping
         items.append({
             "productVariantId":  m["pv_id"],
+            "productVariantDetailId": m["pvd_id"],
             "productId":         m["product_id"],
             "productCode":       m["product_code"],
             "fabricId":          m["fabric_id"],
@@ -1043,7 +1087,8 @@ def get_new_arrivals(
                 pv."CreatedDate"                                        AS created_date,
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS sort_price,
                 p."Name"                                                AS sort_name,
-                b."brandName"                                           AS brand_name
+                b."brandName"                                           AS brand_name,
+                pvd."ProductVariantDetailId"                            AS pvd_id
             FROM twam."ProductVariants" pv
             JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
             LEFT JOIN twam."ProductVariantDetail" pvd
@@ -1055,7 +1100,11 @@ def get_new_arrivals(
             LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
             LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
-            ORDER BY pv."ProductVariantId", pvd."ProductVariantDetailId" ASC NULLS LAST
+            ORDER BY
+                pv."ProductVariantId",
+                CASE WHEN COALESCE(pvd."AvailableQuantity", pvd."StockQuantity", 0) > 0 THEN 0 ELSE 1 END,
+                COALESCE(pvd."FinalPrice", pvd."MRPPrice") ASC NULLS LAST,
+                pvd."ProductVariantDetailId" ASC NULLS LAST
         ) deduped
         ORDER BY created_date DESC NULLS LAST
         LIMIT :lim OFFSET :off
@@ -1079,6 +1128,7 @@ def get_new_arrivals(
     for r in rows:
         items.append({
             "productVariantId":  r[0],
+            "productVariantDetailId": r[28],
             "productId":         r[1],
             "productCode":       r[2],
             "fabricId":          r[3],
