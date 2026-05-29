@@ -54,6 +54,11 @@ class CartListItem(BaseModel):
     size: Optional[str] = None
     cupSize: Optional[str] = None
     color: Optional[str] = None
+    colorName: Optional[str] = None
+    colorFamilyId: Optional[int] = None
+    colorFamily: Optional[str] = None
+    colorFamilyHex: Optional[str] = None
+    colorHex: Optional[str] = None
     stockQuantity: Optional[int] = None
     processedQuantity: Optional[int] = None
     returnedQuantity: Optional[int] = None
@@ -72,8 +77,6 @@ class CartListItem(BaseModel):
     # from the response. Without this field the repository value is silently
     # dropped, which is why the unavailable-category UI never triggered.
     categoryIsActive: Optional[bool] = True
-    colorName: Optional[str] = None
-
     class Config:
         from_attributes = True
 

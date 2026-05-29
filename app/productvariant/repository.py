@@ -9,29 +9,6 @@ from app.productvariantdetail.models import ProductVariantDetail
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import ProductVariant, ProductImage
-from app.shared.color_utils import COLOR_FAMILY_MAP
-
-
-
-def _get_colors_by_family(db, query: str) -> list[str]:
-    """
-    Return Color values from ProductVariants whose ColorFamily matches the
-    queried name (e.g. "navy" -> "Blue"). Falls back to [query] for ILIKE.
-    """
-    family = COLOR_FAMILY_MAP.get(query.lower().strip())
-    if family:
-        try:
-            rows = db.execute(text(
-                'SELECT DISTINCT "Color" FROM twam."ProductVariants" '
-                'WHERE "ColorFamily" = :fam '
-                '  AND ("DeletedInd" = false OR "DeletedInd" IS NULL) '
-                '  AND "Color" IS NOT NULL'
-            ), {"fam": family}).fetchall()
-            if rows:
-                return [r[0] for r in rows if r[0]]
-        except Exception:
-            pass
-    return [query]
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
@@ -88,7 +65,26 @@ def _get_images(db: Session, product_variant_id: int, product_id: int) -> list:
     ]
 
 
+def _get_color_family(db: Session, color_family_id: Optional[int]) -> dict:
+    if not color_family_id:
+        return {"name": None, "hex": None}
+    try:
+        row = db.execute(text("""
+            SELECT "ColorFamilyName", "HexCode"
+            FROM mdm."ProductColor"
+            WHERE "ProductColorId" = :id
+              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+            LIMIT 1
+        """), {"id": color_family_id}).fetchone()
+        if row:
+            return {"name": row[0], "hex": row[1]}
+    except Exception:
+        db.rollback()
+    return {"name": None, "hex": None}
+
+
 def _to_response(db: Session, variant: ProductVariant) -> dict:
+    family = _get_color_family(db, variant.colorFamilyId)
     return {
         "productVariantId":   variant.productVariantId,
         "productId":          variant.productId,
@@ -98,10 +94,14 @@ def _to_response(db: Session, variant: ProductVariant) -> dict:
         "state":              variant.state,
         # productCode, fabricId, taxHSNCodeId removed from variant level
         "color":              variant.color,
-        "colorFamily":        variant.colorFamily,
+        "colorFamilyId":      variant.colorFamilyId,
+        "colorFamily":        family["name"],
+        "colorFamilyHex":     family["hex"],
+        "colorHex":           family["hex"],
         "isBestSeller":       variant.isBestSeller,
         "isReturnAvailable":  variant.isReturnAvailable,
         "isCupSize":          variant.isCupSize,
+        "isAlphaSize":        variant.isAlphaSize,
         "createdDate":        variant.createdDate,
         "modifiedDate":       variant.modifiedDate,
         "images":             _get_images(db, variant.productVariantId, variant.productId),
@@ -188,10 +188,11 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
         # productCode removed — lives on Products
         # fabricId    removed — lives on Products
         color              = data.color,
-        colorFamily        = data.colorFamily,
+        colorFamilyId      = data.colorFamilyId,
         isBestSeller       = data.isBestSeller,
         isReturnAvailable  = data.isReturnAvailable,
         isCupSize          = data.isCupSize,
+        isAlphaSize        = data.isAlphaSize,
         createdBy          = data.createdBy,
         createdDate        = datetime.now(timezone.utc),
         deletedInd         = False,
@@ -239,10 +240,13 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
     variant.variantDescription = data.variantDescription if data.variantDescription is not None else variant.variantDescription
     # productCode, fabricId, taxHSNCodeId removed from variant — live on Products
     variant.color              = data.color              if data.color              is not None else variant.color
-    variant.colorFamily        = data.colorFamily        if data.colorFamily        is not None else variant.colorFamily
+    if "colorFamilyId" in data.model_fields_set:
+        variant.colorFamilyId = data.colorFamilyId
     variant.isBestSeller       = data.isBestSeller       if data.isBestSeller       is not None else variant.isBestSeller
     variant.isReturnAvailable  = data.isReturnAvailable  if data.isReturnAvailable  is not None else variant.isReturnAvailable
     variant.isCupSize          = data.isCupSize          if data.isCupSize          is not None else variant.isCupSize
+    if "isAlphaSize" in data.model_fields_set:
+        variant.isAlphaSize = data.isAlphaSize
     variant.modifiedBy         = data.modifiedBy         if data.modifiedBy         is not None else variant.modifiedBy
     variant.modifiedDate       = datetime.now(timezone.utc)
 
@@ -327,7 +331,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         SELECT
             pv."ProductVariantId", pv."ProductId",
             p."Name", p."Description", p."ProductCode", p."Tag", p."CategoryId",
-            pv."IsCupSize", pv."IsReturnAvailable",
+            pv."IsCupSize", pv."IsAlphaSize", pv."IsReturnAvailable",
             b."brandName",
             p."ChildCategoryId",
             COALESCE(cc."IsActive", pc."IsActive", true) AS categoryIsActive
@@ -349,9 +353,8 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     prod_id   = row[1]
     prod_name = row[2] or ""
 
-    # isCupSize on the variant is kept for reference but display is driven purely
-    # isCupSize on the variant is kept for reference; display is driven by PVD cup data below.
-    is_cup_size = bool(row[7])
+    is_cup_size  = bool(row[7])
+    is_alpha_size = bool(row[8])   # IsAlphaSize — drives which mdm.Size SizeType to load
 
     # Step 1: try variant-level images
     img_rows = db.execute(text(
@@ -422,45 +425,44 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     for r in pvd_matrix_rows:
         if r[0] and r[0] not in pvd_by_size: pvd_by_size[r[0]] = r[2]
 
-    # ── Detect size type from the product's own PVD data (product-level) ──────
-    # Step 1: look up SizeType of the sizes this product variant actually uses.
-    # Use IN (...) with literal integer IDs (safe — all are integers from the DB).
-    detected_size_type = None
-    if variant_size_ids:
-        ids_csv = ",".join(str(int(i)) for i in variant_size_ids)
-        stype_rows = db.execute(text(f"""
-            SELECT DISTINCT "SizeType" FROM mdm."Size"
-            WHERE "SizeId" IN ({ids_csv})
-              AND "SizeType" IS NOT NULL
-        """)).fetchall()
-        stypes = [r[0] for r in stype_rows if r[0]]
-        if stypes:
-            # A product should only ever be one type;
-            # if mixed (data error) prefer alphabetical
-            detected_size_type = "alphabetical" if "alphabetical" in stypes else stypes[0]
+    # ── Auto-detect cup-size presence from actual PVD data ───────────────────
+    # If ANY PVD row has a non-null CupSize FK, treat this as a cup-size product
+    # regardless of the IsCupSize flag on the variant (which may be NULL/False
+    # if set via bulk import or not updated after cup-size PVDs were added).
+    if variant_cup_ids:
+        is_cup_size = True
 
-    # Step 2: load ALL sizes of the detected type from mdm.Size.
-    # inVariant (set below) = True for sizes the product carries (shown dark/solid).
-    # inVariant = False = shown dull + dashed outline in the UI.
-    if detected_size_type in ("alphabetical", "numerical"):
-        _size_clause = f"AND \"SizeType\" = '{detected_size_type}'"
-    else:
-        _size_clause = ""   # no PVD sizes: return all (graceful fallback)
+    # ── Auto-detect alpha size from actual PVD size IDs ──────────────────────
+    # If IsAlphaSize flag is False/NULL but the sizes linked in PVDs belong to
+    # the 'alphabetical' SizeType in mdm.Size, override so labels render correctly.
+    if not is_alpha_size and variant_size_ids:
+        try:
+            alpha_check = db.execute(text("""
+                SELECT COUNT(*) FROM mdm."Size"
+                WHERE "SizeId" = ANY(:ids)
+                  AND "SizeType" = 'alphabetical'
+                  AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+            """), {"ids": list(variant_size_ids)}).scalar()
+            if alpha_check and alpha_check > 0:
+                is_alpha_size = True
+        except Exception:
+            pass
 
+    # ── Load sizes: driven by variant.isAlphaSize flag ──────────────────────
+    # True  → alphabetical (XS/S/M/L/XL…); False/None → numerical (28/30/32…)
+    _stype = "alphabetical" if is_alpha_size else "numerical"
     all_sizes_rows = db.execute(text(f"""
         SELECT "SizeId", "SizeLabel", "SizeCode" FROM mdm."Size"
         WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
           AND ("IsActive" = true OR "IsActive" IS NULL)
-          {_size_clause}
+          AND ("IsCupSize" IS NULL OR "IsCupSize" = false)
+          AND "SizeType" = '{_stype}'
         ORDER BY "OrderNo" NULLS LAST, "SizeId"
     """)).fetchall()
 
-    # ── Cup sizes: driven entirely by PVD data ────────────────────────────────
-    # If ANY PVD row for this variant has a CupSizeId → fetch all from mdm.CupSize.
-    # inVariant marks which cup sizes the product actually carries (shown dark).
-    has_cup_size = bool(variant_cup_ids)
+    # ── Cup sizes: driven by is_cup_size (flag or auto-detected from PVD data) ─
     all_cup_rows = []
-    if has_cup_size:
+    if is_cup_size:
         all_cup_rows = db.execute(text("""
             SELECT "CupSizeId", "SizeLabel" FROM mdm."CupSize"
             WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
@@ -469,7 +471,8 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         """)).fetchall()
 
     color_rows = db.execute(text("""
-        SELECT pv2."ProductVariantId", pv2."Color", pv2."ColorFamily",
+        SELECT pv2."ProductVariantId", pv2."Color", pv2."ColorFamilyId",
+            pc."ColorFamilyName", pc."HexCode",
             (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
                       ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
              FROM twam."ProductImage" pi2
@@ -483,6 +486,9 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             best_pvd."CupSize" AS min_cup_size_id,
             COALESCE(best_pvd."AvailableQuantity", best_pvd."StockQuantity", 0) AS min_stock
         FROM twam."ProductVariants" pv2
+        LEFT JOIN mdm."ProductColor" pc
+          ON pc."ProductColorId" = pv2."ColorFamilyId"
+         AND (pc."DeletedInd" = false OR pc."DeletedInd" IS NULL)
         LEFT JOIN LATERAL (
             SELECT pvd2."ProductVariantDetailId", pvd2."FinalPrice", pvd2."MRPPrice",
                    pvd2."Size", pvd2."CupSize", pvd2."AvailableQuantity", pvd2."StockQuantity"
@@ -512,10 +518,11 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         "tag":                row[5],
         "categoryId":         row[6],
         "isCupSize":          is_cup_size,
-        "hasCupSize":         has_cup_size,         # True when product has cup-size PVD rows
-        "isReturnAvailable":  row[8],
-        "categoryIsActive":   bool(row[11]) if row[11] is not None else True,
-        "brandName":          row[9],
+        "hasCupSize":         is_cup_size,   # alias — frontend reads hasCupSize
+        "isAlphaSize":        is_alpha_size,
+        "isReturnAvailable":  row[9],
+        "categoryIsActive":   bool(row[12]) if row[12] is not None else True,
+        "brandName":          row[10],
         "price":              float(pvd_row[0]) if pvd_row and pvd_row[0] is not None else None,
         "originalPrice":      float(pvd_row[1]) if pvd_row and pvd_row[1] is not None else None,
         "stockQuantity":      pvd_row[2]         if pvd_row else None,
@@ -540,15 +547,19 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         } for c in all_cup_rows],
         "colors": [{
             "productVariantId": cr[0],
-            "color": cr[1],
-            "colorFamily": cr[2],
-            "image": cr[3],
-            "minFinalPrice": float(cr[4]) if cr[4] is not None else None,
-            "minMrpPrice": float(cr[5]) if cr[5] is not None else None,
-            "minProductVariantDetailId": cr[6],
-            "minSizeId": cr[7],
-            "minCupSizeId": cr[8],
-            "minStock": int(cr[9]) if cr[9] is not None else 0,
+            "color":      cr[1],
+            "colorName":  cr[1],   # alias — frontend reads colorName first
+            "colorFamilyId": cr[2],
+            "colorFamily": cr[3],
+            "colorFamilyHex": cr[4],
+            "colorHex": cr[4],
+            "image": cr[5],
+            "minFinalPrice": float(cr[6]) if cr[6] is not None else None,
+            "minMrpPrice": float(cr[7]) if cr[7] is not None else None,
+            "minProductVariantDetailId": cr[8],
+            "minSizeId": cr[9],
+            "minCupSizeId": cr[10],
+            "minStock": int(cr[11]) if cr[11] is not None else 0,
         } for cr in color_rows],
     }
 
@@ -715,25 +726,17 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 params[f"cup_sz_{i}"] = cid
             conds.append(f'pvd."CupSize"::TEXT IN ({in_ph})')
 
-    col = _fv("color")
-    if col and col not in ("0", ""):
-        if col.lower().strip() in COLOR_FAMILY_MAP:
-            # Known color name: expand to all variants in the same family
-            col_vals = _get_colors_by_family(db, col)
-        elif "," in col:
-            # Comma-separated list of explicit color names
-            col_vals = [v.strip() for v in col.split(",") if v.strip()]
-        else:
-            # Fallback: direct ILIKE on whatever was passed
-            col_vals = [col]
-
-        if col_vals:
-            color_conds = " OR ".join(
-                f'pv."Color" ILIKE :col_{i}' for i in range(len(col_vals))
-            )
-            conds.append(f"({color_conds})")
-            for i, cv in enumerate(col_vals):
-                params[f"col_{i}"] = cv
+    color_family = _fv("ColorFamilyId") or _fv("colorFamilyId")
+    color_family_ids = [
+        value.strip()
+        for value in color_family.split(",")
+        if value.strip() and value.strip() != "0"
+    ] if color_family and color_family != "0" else []
+    if color_family_ids:
+        in_ph = ", ".join(f":color_family_{i}" for i in range(len(color_family_ids)))
+        for i, value in enumerate(color_family_ids):
+            params[f"color_family_{i}"] = value
+        conds.append(f'pv."ColorFamilyId"::TEXT IN ({in_ph})')
 
     # ── Quick search (multi-term AND logic) ───────────────────────────────────
     qs = _fv("QuickSearch")
@@ -755,6 +758,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 OR p."Description"                                          ILIKE :{pkey}
                 OR p."Tag"                                                  ILIKE :{pkey}
                 OR b."brandName"                                            ILIKE :{pkey}
+                OR cf."ColorFamilyName"                                     ILIKE :{pkey}
                 OR pc."Name"                                                ILIKE :{pkey}
                 OR cc."Name"                                                ILIKE :{pkey}
                 OR pv."VariantName"                                         ILIKE :{pkey}
@@ -772,6 +776,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 p."Name"            ILIKE :qs_start
                 OR pv."VariantName" ILIKE :qs_start
                 OR pv."Color"       ILIKE :qs_start
+                OR cf."ColorFamilyName" ILIKE :qs_start
                 OR s."SizeLabel"    ILIKE :qs_start
                 OR cs."SizeLabel"   ILIKE :qs_start
             )""")
@@ -828,6 +833,8 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         LEFT JOIN mdm."Size" s         ON s."SizeId"      = pvd."Size"
         LEFT JOIN mdm."CupSize" cs     ON cs."CupSizeId"  = pvd."CupSize"
         LEFT JOIN mdm."Brand" b         ON b."brandId"     = p."BrandId"
+        LEFT JOIN mdm."ProductColor" cf ON cf."ProductColorId" = pv."ColorFamilyId"
+         AND (cf."DeletedInd" = false OR cf."DeletedInd" IS NULL)
         LEFT JOIN twam."Category" pc   ON pc."CategoryId"  = p."CategoryId"
         LEFT JOIN twam."Category" cc   ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE {where}
@@ -855,6 +862,9 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 COALESCE(pv."IsCupSize", false)                         AS is_cup_size,
                 COALESCE(s."SizeLabel", '')                             AS size_label,
                 COALESCE(pv."Color", '')                                AS color,
+                pv."ColorFamilyId"                                      AS color_family_id,
+                COALESCE(cf."ColorFamilyName", '')                      AS color_family,
+                COALESCE(cf."HexCode", '')                              AS color_family_hex,
                 COALESCE(pvd."StockQuantity", 0)::INTEGER               AS stock_qty,
                 COALESCE(pvd."ProcessedQuantity", 0)::INTEGER           AS processed_qty,
                 COALESCE(pvd."DiscountPercent", 0)::INTEGER             AS discount_pct,
@@ -902,6 +912,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS _sort_price,
                 p."Name"                                                AS _sort_name,
                 b."brandName"                                           AS brand_name,
+                p."BrandId"                                             AS brand_id,
                 pv."CreatedDate"                                        AS _sort_created
             FROM twam."ProductVariants" pv
             JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
@@ -911,6 +922,8 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             LEFT JOIN mdm."Size" s         ON s."SizeId"     = pvd."Size"
             LEFT JOIN mdm."CupSize" cs     ON cs."CupSizeId" = pvd."CupSize"
             LEFT JOIN mdm."Brand" b         ON b."brandId"    = p."BrandId"
+            LEFT JOIN mdm."ProductColor" cf ON cf."ProductColorId" = pv."ColorFamilyId"
+             AND (cf."DeletedInd" = false OR cf."DeletedInd" IS NULL)
             LEFT JOIN twam."Category" pc   ON pc."CategoryId"  = p."CategoryId"
             LEFT JOIN twam."Category" cc   ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
@@ -950,6 +963,11 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             "sizeId":            m["size_id"],
             "size":              m["size_label"],
             "color":             m["color"],
+            "colorName":         m["color"],
+            "colorFamilyId":     m["color_family_id"],
+            "colorFamily":       m["color_family"],
+            "colorFamilyHex":    m["color_family_hex"],
+            "colorHex":          m["color_family_hex"],
             "stockQuantity":     m["stock_qty"],
             "processedQuantity": m["processed_qty"],
             "discountPercent":   m["discount_pct"],
@@ -971,6 +989,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             "rating":            _f(m["_sort_rating"]),
             "reviewCount":       int(m["review_count"]) if m["review_count"] is not None else 0,
             "brandName":         m["brand_name"],
+            "brandId":           m["brand_id"],
         })
 
     # Color results returned in DB order (ColorFamily-based grouping handles relevance)
@@ -1015,6 +1034,8 @@ def get_new_arrivals(
           ON pvd."ProductVariantId" = pv."ProductVariantId"
          AND (pvd."DeletedInd" = false OR pvd."DeletedInd" IS NULL)
         LEFT JOIN mdm."Brand" b ON b."brandId" = p."BrandId"
+        LEFT JOIN mdm."ProductColor" cf ON cf."ProductColorId" = pv."ColorFamilyId"
+         AND (cf."DeletedInd" = false OR cf."DeletedInd" IS NULL)
         LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
         LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
         WHERE {where}
@@ -1036,6 +1057,9 @@ def get_new_arrivals(
                 p."FabricId"                                            AS fabric_id,
                 COALESCE(s."SizeLabel", '')                             AS size_label,
                 COALESCE(pv."Color", '')                                AS color,
+                pv."ColorFamilyId"                                      AS color_family_id,
+                COALESCE(cf."ColorFamilyName", '')                      AS color_family,
+                COALESCE(cf."HexCode", '')                              AS color_family_hex,
                 COALESCE(pvd."StockQuantity", 0)::INTEGER               AS stock_qty,
                 COALESCE(pvd."ProcessedQuantity", 0)::INTEGER           AS processed_qty,
                 COALESCE(pvd."DiscountPercent", 0)::INTEGER             AS discount_pct,
@@ -1083,6 +1107,7 @@ def get_new_arrivals(
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS sort_price,
                 p."Name"                                                AS sort_name,
                 b."brandName"                                           AS brand_name,
+                p."BrandId"                                             AS brand_id,
                 pvd."ProductVariantDetailId"                            AS pvd_id
             FROM twam."ProductVariants" pv
             JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
@@ -1092,6 +1117,8 @@ def get_new_arrivals(
             LEFT JOIN mdm."Size" s     ON s."SizeId"     = pvd."Size"
             LEFT JOIN mdm."CupSize" cs ON cs."CupSizeId" = pvd."CupSize"
             LEFT JOIN mdm."Brand" b     ON b."brandId"    = p."BrandId"
+            LEFT JOIN mdm."ProductColor" cf ON cf."ProductColorId" = pv."ColorFamilyId"
+             AND (cf."DeletedInd" = false OR cf."DeletedInd" IS NULL)
             LEFT JOIN twam."Category" pc ON pc."CategoryId"  = p."CategoryId"
             LEFT JOIN twam."Category" cc ON cc."CategoryId"  = p."ChildCategoryId"
             WHERE {where}
@@ -1121,33 +1148,40 @@ def get_new_arrivals(
 
     items = []
     for r in rows:
+        m = r._mapping
         items.append({
-            "productVariantId":  r[0],
-            "productVariantDetailId": r[28],
-            "productId":         r[1],
-            "productCode":       r[2],
-            "fabricId":          r[3],
-            "size":              r[4],
-            "color":             r[5],
-            "stockQuantity":     r[6],
-            "processedQuantity": r[7],
-            "discountPercent":   r[8],
-            "mrpPrice":          _f(r[9]),
-            "finalPrice":        _f(r[10]),
-            "userProfileId":     r[11],
-            "state":             r[12],
-            "cupSize":           r[13],
-            "isBestSeller":      r[14],
+            "productVariantId":  m["pv_id"],
+            "productVariantDetailId": m["pvd_id"],
+            "productId":         m["product_id"],
+            "productCode":       m["product_code"],
+            "fabricId":          m["fabric_id"],
+            "size":              m["size_label"],
+            "color":             m["color"],
+            "colorName":         m["color"],
+            "colorFamilyId":     m["color_family_id"],
+            "colorFamily":       m["color_family"],
+            "colorFamilyHex":    m["color_family_hex"],
+            "colorHex":          m["color_family_hex"],
+            "stockQuantity":     m["stock_qty"],
+            "processedQuantity": m["processed_qty"],
+            "discountPercent":   m["discount_pct"],
+            "mrpPrice":          _f(m["mrp_price"]),
+            "finalPrice":        _f(m["final_price"]),
+            "userProfileId":     m["user_profile_id"],
+            "state":             m["state"],
+            "cupSize":           m["cup_size_label"],
+            "isBestSeller":      m["is_best_seller"],
             "totalCount":        total,
-            "price":             _f(r[16]),
-            "oldPrice":          _f(r[17]),
-            "image":             r[18],
-            "images":            list(r[19]) if r[19] else ([r[18]] if r[18] else []),
-            "name":              r[20],
-            "description":       r[21],
-            "rating":            _f(r[22]),
-            "reviewCount":       int(r[23]) if r[23] is not None else 0,
-            "brandName":         r[27],
+            "price":             _f(m["price"]),
+            "oldPrice":          _f(m["old_price"]),
+            "image":             m["image"],
+            "images":            list(m["images_arr"]) if m["images_arr"] else ([m["image"]] if m["image"] else []),
+            "name":              m["name"],
+            "description":       m["description"],
+            "rating":            _f(m["rating"]),
+            "reviewCount":       int(m["review_count"]) if m["review_count"] is not None else 0,
+            "brandName":         m["brand_name"],
+            "brandId":           m["brand_id"],
         })
 
     return {"count": total, "list": items}

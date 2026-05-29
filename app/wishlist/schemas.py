@@ -36,6 +36,9 @@ class WishlistResponse(BaseModel):
     mrpPrice: Optional[float] = None
     color: Optional[str] = None
     colorName: Optional[str] = None
+    colorFamilyId: Optional[int] = None
+    colorFamily: Optional[str] = None
+    colorFamilyHex: Optional[str] = None
     colorHex: Optional[str] = None
     brandName: Optional[str] = None
     rating: Optional[float] = None

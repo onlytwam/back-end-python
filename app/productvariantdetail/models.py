@@ -32,7 +32,6 @@ class ProductVariantDetail(Base):
     cupSizeId              = Column("CupSize",                BigInteger, nullable=True)
     isLowStock             = Column("IsLowStock",             Boolean,    nullable=True)
     isOutOfStock           = Column("IsOutOfStock",           Boolean,    nullable=True)
-    isAlphabetSize         = Column("IsAlphabetSize",         Boolean,    nullable=True)
     createdBy              = Column("CreatedBy",              String,     nullable=True)
     modifiedBy             = Column("ModifiedBy",             String,     nullable=True)
     createdDate            = Column("CreatedDate",            DateTime(timezone=True), server_default=func.now())

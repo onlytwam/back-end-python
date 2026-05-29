@@ -31,6 +31,9 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             s."SizeLabel"       AS size,
             cs."SizeLabel"      AS cup_size,
             pv."Color",
+            pv."ColorFamilyId",
+            pc."ColorFamilyName",
+            pc."HexCode",
             pvd."AvailableQuantity"  AS stock_quantity,
             c."Quantity"        AS processed_quantity,
             pvd."ReturnedQuantity",
@@ -69,6 +72,8 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
         LEFT JOIN twam."Products"             p   ON p."ProductId"               = c."ProductId"
         LEFT JOIN mdm."Brand"                 b   ON b."brandId"                 = p."BrandId"
         LEFT JOIN twam."ProductVariants"      pv  ON pv."ProductVariantId"       = c."ProductVariantId"
+        LEFT JOIN mdm."ProductColor"          pc  ON pc."ProductColorId"         = pv."ColorFamilyId"
+                                                   AND (pc."DeletedInd" = false OR pc."DeletedInd" IS NULL)
         LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = c."ProductVariantDetailId"
         LEFT JOIN mdm."Size"                  s   ON s."SizeId"                  = pvd."Size"
         LEFT JOIN mdm."CupSize"               cs  ON cs."CupSizeId"              = pvd."CupSize"
@@ -149,23 +154,27 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             "cupSize":               r[13],
             "color":                 r[14],
             "colorName":             r[14],  # alias so frontend colorName check works
-            "stockQuantity":         r[15],
-            "processedQuantity":     r[16],
-            "returnedQuantity":      r[17],
-            "discountPercent":       r[18],
-            "mrpPrice":              float(r[19]) if r[19] else None,
-            "finalPrice":            float(r[20]) if r[20] else None,
-            "taxAmount":             float(r[21]) if r[21] else None,
-            "cgst":                  float(r[22]) if r[22] else None,
-            "sgst":                  float(r[23]) if r[23] else None,
-            "personalId":            r[24],
-            "userProfileId":         r[25],
-            "state":                 r[26],
-            "createdDate":           r[27],
-            "modifiedDate":          r[28],
-            "image":                 r[29] or "",
-            "categoryIsActive":      bool(r[30]) if r[30] is not None else True,
-            "quantity":              r[16],  # processedQuantity = cart quantity
+            "colorFamilyId":         r[15],
+            "colorFamily":           r[16],
+            "colorFamilyHex":        r[17],
+            "colorHex":              r[17],
+            "stockQuantity":         r[18],
+            "processedQuantity":     r[19],
+            "returnedQuantity":      r[20],
+            "discountPercent":       r[21],
+            "mrpPrice":              float(r[22]) if r[22] else None,
+            "finalPrice":            float(r[23]) if r[23] else None,
+            "taxAmount":             float(r[24]) if r[24] else None,
+            "cgst":                  float(r[25]) if r[25] else None,
+            "sgst":                  float(r[26]) if r[26] else None,
+            "personalId":            r[27],
+            "userProfileId":         r[28],
+            "state":                 r[29],
+            "createdDate":           r[30],
+            "modifiedDate":          r[31],
+            "image":                 r[32] or "",
+            "categoryIsActive":      bool(r[33]) if r[33] is not None else True,
+            "quantity":              r[19],  # processedQuantity = cart quantity
         })
 
     return build_paged_response(total, result)

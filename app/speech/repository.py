@@ -274,7 +274,7 @@ _STATIC_PHRASES: list[str] = [
     "soft bra", "non padded soft bra",
 
     # ══════════════════════════════════════════════════════════════════════════
-    # COLORS  (from ProductColor.csv — with phonetic variants)
+    # COLORS  (spoken color names and phonetic variants)
     # ══════════════════════════════════════════════════════════════════════════
 
     "Aqua", "aqua blue", "aqua color",

@@ -24,7 +24,6 @@ class ProductVariantDetailCreate(BaseModel):
     state:              Optional[str]   = None
     cupSizeId:          Optional[int]   = None   # stored in DB column "CupSize"
     stockId:            Optional[str]   = None
-    isAlphabetSize:     Optional[bool]  = None
     isLowStock:         Optional[bool]  = None
     isOutOfStock:       Optional[bool]  = None
     createdBy:          Optional[str]   = None
@@ -49,7 +48,6 @@ class ProductVariantDetailUpdate(BaseModel):
     sgst:               Optional[float] = None
     state:              Optional[str]   = None
     cupSizeId:          Optional[int]   = None
-    isAlphabetSize:     Optional[bool]  = None
     isLowStock:         Optional[bool]  = None
     isOutOfStock:       Optional[bool]  = None
     # isAmendment controls whether UpdateProductQuantity SP is called in amendment mode
@@ -84,7 +82,6 @@ class ProductVariantDetailResponse(BaseModel):
     cupSizeLabel:           Optional[str]   = None   # joined from mdm.CupSize
     isLowStock:             Optional[bool]  = None
     isOutOfStock:           Optional[bool]  = None
-    isAlphabetSize:         Optional[bool]  = None
     createdDate:            Optional[datetime] = None
     modifiedDate:           Optional[datetime] = None
 
@@ -136,6 +133,11 @@ class UserProductListItem(BaseModel):
     sizeId:                 Optional[int]   = None
     size:                   Optional[Any]   = None
     color:                  Optional[str]   = None
+    colorName:              Optional[str]   = None
+    colorFamilyId:          Optional[int]   = None
+    colorFamily:            Optional[str]   = None
+    colorFamilyHex:         Optional[str]   = None
+    colorHex:               Optional[str]   = None
     stockQuantity:          Optional[int]   = None
     processedQuantity:      Optional[int]   = None
     discountPercent:        Optional[int]   = None
@@ -159,6 +161,7 @@ class UserProductListItem(BaseModel):
     rating:                 Optional[float] = None
     reviewCount:            Optional[int]   = None
     brandName:              Optional[str]   = None
+    brandId:                Optional[int]   = None
 
 
 class UserProductListResponse(BaseModel):

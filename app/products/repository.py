@@ -120,14 +120,18 @@ def _get_product_variants(db: Session, product_id: int) -> list[dict]:
             text(
                 """
             SELECT
-                "ProductVariantId", "ProductId", "VariantName",
-                "VariantDescription", "Color",
-                "IsBestSeller", "IsReturnAvailable", "IsCupSize",
-                "IsActive", "DeletedInd", "CreatedDate", "ModifiedDate"
-            FROM twam."ProductVariants"
-            WHERE "ProductId" = :pid
-              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
-            ORDER BY "ProductVariantId" ASC
+                pv."ProductVariantId", pv."ProductId", pv."VariantName",
+                pv."VariantDescription", pv."Color", pv."ColorFamilyId",
+                pc."ColorFamilyName", pc."HexCode",
+                pv."IsBestSeller", pv."IsReturnAvailable", pv."IsCupSize",
+                pv."IsActive", pv."DeletedInd", pv."CreatedDate", pv."ModifiedDate"
+            FROM twam."ProductVariants" pv
+            LEFT JOIN mdm."ProductColor" pc
+              ON pc."ProductColorId" = pv."ColorFamilyId"
+             AND (pc."DeletedInd" = false OR pc."DeletedInd" IS NULL)
+            WHERE pv."ProductId" = :pid
+              AND (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
+            ORDER BY pv."ProductVariantId" ASC
             """
             ),
             {"pid": product_id},
@@ -142,16 +146,19 @@ def _get_product_variants(db: Session, product_id: int) -> list[dict]:
             "productId": r[1],
             "variantName": r[2],
             "variantDescription": r[3],
-            # productCode removed from variant — lives on Products
             "color": r[4],
             "colorName": r[4],
-            "isBestSeller": r[5],
-            "isReturnAvailable": r[6],
-            "isCupSize": r[7],
-            "isActive": True if r[8] is None else bool(r[8]),
-            "deletedInd": False if r[9] is None else bool(r[9]),
-            "createdDate": r[10],
-            "modifiedDate": r[11],
+            "colorFamilyId": r[5],
+            "colorFamily": r[6],
+            "colorFamilyHex": r[7],
+            "colorHex": r[7],
+            "isBestSeller": r[8],
+            "isReturnAvailable": r[9],
+            "isCupSize": r[10],
+            "isActive": True if r[11] is None else bool(r[11]),
+            "deletedInd": False if r[12] is None else bool(r[12]),
+            "createdDate": r[13],
+            "modifiedDate": r[14],
             "images": _get_variant_images(db, r[0], product_id),
         }
         for r in rows
