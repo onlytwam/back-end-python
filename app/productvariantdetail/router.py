@@ -7,7 +7,6 @@ from database import get_db
 from app.auth.dependencies import get_current_user, Roles
 from . import schemas, repository
 from app.productvariant import repository as variant_repo
-import sqlalchemy
 
 router = APIRouter(prefix="/api/ProductVariantDetail", tags=["ProductVariantDetail"])
 
@@ -119,15 +118,6 @@ def get_new_arrivals(
     )
 
 
-@router.get("/GetProductColor")
-def get_product_colors(db: Session = Depends(get_db)):
-    rows = db.execute(sqlalchemy.text(
-        'SELECT DISTINCT "Color", "ColorFamily" FROM twam."ProductVariants" '
-        'WHERE "DeletedInd"=false AND "Color" IS NOT NULL ORDER BY "Color"'
-    )).fetchall()
-    return [{"color": r[0], "colorFamily": r[1]} for r in rows]
-
-
 @router.get("/ProductDetail/{pvd_id}", response_model=schemas.UserProductDetailResponse)
 def get_user_product_detail(pvd_id: int, db: Session = Depends(get_db)):
     result = repository.get_user_product_detail(db, pvd_id)
@@ -140,12 +130,25 @@ def get_user_product_detail(pvd_id: int, db: Session = Depends(get_db)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/AdminSizePalette/{variant_id}", dependencies=[Depends(get_current_user)])
-def get_admin_size_palette(variant_id: int, db: Session = Depends(get_db)):
+def get_admin_size_palette(
+    variant_id: int,
+    isAlphaSize: Optional[bool] = Query(None, alias="isAlphaSize"),
+    isCupSize:   Optional[bool] = Query(None, alias="isCupSize"),
+    db: Session = Depends(get_db),
+):
     """
     Returns all MDM band sizes and cup sizes with embedded PVD data for the
     given variant. Used by the admin product detail size palette component.
+
+    isAlphaSize / isCupSize query params let the frontend pass the live
+    (unsaved) toggle state so sizes refresh instantly on checkbox change
+    without requiring a save first.
     """
-    return repository.get_admin_size_palette(db, variant_id)
+    return repository.get_admin_size_palette(
+        db, variant_id,
+        is_alpha_override=isAlphaSize,
+        is_cup_override=isCupSize,
+    )
 
 
 @router.get("/", response_model=schemas.ProductVariantDetailListResponse,

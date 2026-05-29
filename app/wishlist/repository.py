@@ -58,7 +58,10 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
             pvd."MRPPrice"    AS mrpPrice,
             pv."Color"        AS color,
             pv."Color"        AS colorName,
-            NULL              AS colorHex,
+            pv."ColorFamilyId" AS colorFamilyId,
+            pc."ColorFamilyName" AS colorFamily,
+            pc."HexCode"      AS colorFamilyHex,
+            pc."HexCode"      AS colorHex,
             COALESCE(prs.avg_rating, 0)    AS rating,
             COALESCE(prs.review_count, 0)  AS reviewCount,
 
@@ -93,6 +96,9 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
         FROM twam."Wishlist" w
         LEFT JOIN twam."ProductVariants" pv
                ON pv."ProductVariantId" = w."ProductVariantId"
+        LEFT JOIN mdm."ProductColor" pc
+               ON pc."ProductColorId" = pv."ColorFamilyId"
+              AND (pc."DeletedInd" = false OR pc."DeletedInd" IS NULL)
         LEFT JOIN twam."ProductVariantDetail" pvd
                ON pvd."ProductVariantDetailId" = COALESCE(
                    w."ProductVariantDetailId",
@@ -162,6 +168,9 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
             'hoverImage':             hover_img,
             'color':                  g('color'),
             'colorName':              g('colorName') or g('color'),
+            'colorFamilyId':          g('colorFamilyId'),
+            'colorFamily':            g('colorFamily'),
+            'colorFamilyHex':         g('colorFamilyHex'),
             'colorHex':               g('colorHex'),
             'brandName':              g('brandName'),
             'rating':                 float(g('rating')) if g('rating') is not None else 0,
@@ -378,7 +387,10 @@ def get_user_wishlist(db: Session, user_id: str):
             sz."SizeLabel",
             pv."Color",
             pv."Color" AS colorName,
-            NULL AS colorHex,
+            pv."ColorFamilyId" AS colorFamilyId,
+            pc."ColorFamilyName" AS colorFamily,
+            pc."HexCode" AS colorFamilyHex,
+            pc."HexCode" AS colorHex,
             COALESCE(prs.avg_rating, 0) AS rating,
             COALESCE(prs.review_count, 0) AS reviewCount,
 
@@ -417,6 +429,9 @@ def get_user_wishlist(db: Session, user_id: str):
                ON p."ProductId" = w."ProductId"
         LEFT JOIN twam."ProductVariants" pv 
                ON pv."ProductVariantId" = w."ProductVariantId"
+        LEFT JOIN mdm."ProductColor" pc
+               ON pc."ProductColorId" = pv."ColorFamilyId"
+              AND (pc."DeletedInd" = false OR pc."DeletedInd" IS NULL)
         LEFT JOIN twam."ProductVariantDetail" pvd 
                ON pvd."ProductVariantDetailId" = w."ProductVariantDetailId"
         LEFT JOIN mdm."Size" sz

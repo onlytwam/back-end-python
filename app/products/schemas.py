@@ -63,6 +63,10 @@ class ProductVariantSummary(BaseModel):
     # productCode removed — it belongs to the Product, not the Variant
     color:              Optional[str] = None
     colorName:          Optional[str] = None
+    colorFamilyId:      Optional[int] = None
+    colorFamily:        Optional[str] = None
+    colorFamilyHex:     Optional[str] = None
+    colorHex:           Optional[str] = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None

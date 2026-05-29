@@ -91,7 +91,6 @@ def _enrich(db: Session, pvd: ProductVariantDetail) -> dict:
         "cupSizeLabel":           cup_size_label,
         "isLowStock":             pvd.isLowStock,
         "isOutOfStock":           pvd.isOutOfStock,
-        "isAlphabetSize":         pvd.isAlphabetSize,
         "createdDate":            pvd.createdDate,
         "modifiedDate":           pvd.modifiedDate,
         "deletedInd":             pvd.deletedInd,
@@ -154,7 +153,9 @@ def create_variant_detail(db: Session, data) -> int:
     availableQuantity is derived: total - processed + refunded.
     """
     total_qty   = data.stockQuantity or 0
-    final_price = float(data.finalPrice or 0)
+    # Default finalPrice (selling price) to mrpPrice when not provided
+    mrp_price   = float(data.mrpPrice or 0)
+    final_price = float(data.finalPrice) if data.finalPrice else mrp_price
 
     # Auto-compute CGST/SGST/TaxAmount from the parent product's TaxHSNCode + price slab.
     tax_info = _auto_compute_tax(db, data.productId, final_price)
@@ -168,7 +169,7 @@ def create_variant_detail(db: Session, data) -> int:
         returnedQuantity  = 0,
         availableQuantity = total_qty,
         discountPercent   = data.discountPercent,
-        mrpPrice          = data.mrpPrice,
+        mrpPrice          = mrp_price or None,
         finalPrice        = final_price,
         taxAmount         = tax_info["taxAmount"],
         cgst              = tax_info["cgst"],
@@ -177,7 +178,6 @@ def create_variant_detail(db: Session, data) -> int:
         state             = data.state,
         cupSizeId         = data.cupSizeId,
         stockId           = data.stockId,
-        isAlphabetSize    = data.isAlphabetSize,
         isLowStock        = 0 < total_qty <= 3,
         isOutOfStock      = total_qty <= 0,
         createdBy         = data.createdBy,
@@ -197,10 +197,13 @@ def create_variant_detail(db: Session, data) -> int:
     except Exception:
         pass
 
+    # Snapshot the ID now while pvd is in a valid session state
+    pvd_id_to_return = pvd.productVariantDetailId
+
     # ── Auto-create initial StockLog entry (system-only, not shown in history UI) ──
     try:
         log_entry = StockLog(
-            productVariantDetailId = pvd.productVariantDetailId,
+            productVariantDetailId = pvd_id_to_return,
             productId              = pvd.productId,
             productVariantId       = pvd.productVariantId,
             stockId                = pvd.stockId,
@@ -217,9 +220,9 @@ def create_variant_detail(db: Session, data) -> int:
         db.add(log_entry)
         db.commit()
     except Exception:
-        pass  # Never block product creation if stock log fails
+        db.rollback()  # Clean up failed transaction — session must be valid before we return
 
-    return pvd.productVariantDetailId
+    return pvd_id_to_return
 
 
 # ── Update ────────────────────────────────────────────────────────────────────
@@ -263,7 +266,6 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         "sgst":            tax_info["sgst"],
         "state":           data.state,
         "cupSizeId":       data.cupSizeId,
-        "isAlphabetSize":  data.isAlphabetSize,
         "amendmentQuantity": data.amendmentQuantity,
         "modifiedBy":      data.modifiedBy,
     }
@@ -430,8 +432,7 @@ def increment_returned_quantity(db: Session, pvd_id: int, qty: int, now=None,
 def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
     """
     Case-insensitive lookup of a ProductVariantDetail by StockId.
-    Uses CAST("StockId" AS TEXT) so it works whether the DB column is
-    stored as String or BigInteger (avoids lower(bigint) type error).
+    StockId is stored as TEXT — no CAST needed.
     Returns None when no match is found.
     """
     try:
@@ -441,14 +442,14 @@ def find_by_stock_id(db: Session, stock_id: str) -> Optional[dict]:
                     "ProductVariantDetailId",
                     "ProductId",
                     "ProductVariantId",
-                    CAST("StockId" AS TEXT) AS "StockId",
+                    "StockId",
                     "Size",
                     "CupSize",
                     "StockQuantity",
                     "AvailableQuantity"
                 FROM twam."ProductVariantDetail"
                 WHERE "DeletedInd" = false
-                  AND LOWER(CAST("StockId" AS TEXT)) = LOWER(:sid)
+                  AND LOWER("StockId") = LOWER(:sid)
                 LIMIT 1
             """),
             {"sid": stock_id.strip()},
@@ -562,17 +563,38 @@ def get_user_product_detail(db: Session, pvd_id: int) -> Optional[dict]:
 
 # ── Admin: full size palette for a variant ────────────────────────────────────
 
-def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
+def get_admin_size_palette(
+    db: Session,
+    product_variant_id: int,
+    is_alpha_override: Optional[bool] = None,
+    is_cup_override:   Optional[bool] = None,
+) -> dict:
     """
     Returns every MDM band size and cup size together with their PVD data
     for the given variant. Used by the admin product detail size palette.
 
-    Band sizes:  all rows from mdm.Size WHERE isCupSize IS NOT TRUE,
-                 filtered to the SizeType the variant actually uses
-                 (alphabetical | numerical). Falls back to all sizes.
-    Cup sizes:   all rows from mdm.CupSize (always shown when isCupSize=true).
-    For each MDM size, pvd data is embedded when a matching PVD row exists.
+    is_alpha_override / is_cup_override: when provided (from the live UI
+    checkbox state), these take priority over the saved DB value so sizes
+    update immediately on toggle without requiring a Save first.
     """
+    from app.productvariant.models import ProductVariant  # local import to avoid circular
+
+    # ── Fetch variant to get isAlphaSize / isCupSize flags ───────────────────
+    variant_row = db.query(ProductVariant).filter(
+        ProductVariant.productVariantId == product_variant_id
+    ).first()
+
+    # Live override from the UI checkbox takes priority over the saved DB value.
+    # isAlphaSize: None/False → numerical (default); True → alphabetical.
+    if is_alpha_override is not None:
+        is_alpha_size = is_alpha_override
+    else:
+        is_alpha_size = variant_row.isAlphaSize is True if variant_row else False
+
+    if is_cup_override is not None:
+        isCupSize = is_cup_override
+    else:
+        isCupSize = bool(variant_row.isCupSize) if variant_row else False
 
     # ── Fetch all PVDs for this variant ──────────────────────────────────────
     pvds = db.query(ProductVariantDetail).filter(
@@ -582,28 +604,30 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
 
     variant_size_ids = {p.sizeId for p in pvds if p.sizeId}
     variant_cup_ids  = {p.cupSizeId for p in pvds if p.cupSizeId}
-    has_cup_size     = bool(variant_cup_ids)
 
-    # ── Load ALL MDM band sizes (both alphabetical and numerical) ────────────
-    # We intentionally do NOT filter by SizeType so that the admin palette
-    # always shows every band size regardless of what sizes are already added.
-    all_band_rows = db.execute(text("""
+    # ── Load MDM band sizes filtered by variant.isAlphaSize ─────────────────
+    # True  → alphabetical (XS/S/M/L…); False/None → numerical (28/30/32…)
+    _stype = "alphabetical" if is_alpha_size else "numerical"
+    all_band_rows = db.execute(text(f"""
         SELECT "SizeId", "SizeLabel", "SizeCode", "SizeType", "OrderNo"
         FROM mdm."Size"
         WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
           AND ("IsActive" = true OR "IsActive" IS NULL)
           AND ("IsCupSize" IS NULL OR "IsCupSize" = false)
-        ORDER BY "SizeType" NULLS LAST, "OrderNo" NULLS LAST, "SizeId"
+          AND "SizeType" = '{_stype}'
+        ORDER BY "OrderNo" NULLS LAST, "SizeId"
     """)).fetchall()
 
-    # ── Load all MDM cup sizes ───────────────────────────────────────────────
-    all_cup_rows = db.execute(text("""
-        SELECT "CupSizeId", "SizeLabel"
-        FROM mdm."CupSize"
-        WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
-          AND ("IsActive" = true OR "IsActive" IS NULL)
-        ORDER BY "CupSizeId"
-    """)).fetchall()
+    # ── Load MDM cup sizes only when variant.isCupSize = True ────────────────
+    all_cup_rows = []
+    if isCupSize:
+        all_cup_rows = db.execute(text("""
+            SELECT "CupSizeId", "SizeLabel"
+            FROM mdm."CupSize"
+            WHERE ("DeletedInd" = false OR "DeletedInd" IS NULL)
+              AND ("IsActive" = true OR "IsActive" IS NULL)
+            ORDER BY "CupSizeId"
+        """)).fetchall()
 
     # ── Index PVDs by sizeId and cupSizeId ───────────────────────────────────
     def _pvd_dict(p: ProductVariantDetail) -> dict:
@@ -691,7 +715,8 @@ def get_admin_size_palette(db: Session, product_variant_id: int) -> dict:
 
     return {
         "productVariantId": product_variant_id,
-        "hasCupSize":       has_cup_size,
+        "isCupSize":        isCupSize,
+        "isAlphaSize":      is_alpha_size,
         "bandSizes":        band_sizes,
         "bandSizesByType":  dict(band_sizes_by_type),
         "cupSizes":         cup_sizes,

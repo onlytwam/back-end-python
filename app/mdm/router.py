@@ -12,6 +12,7 @@ from app.brand        import repository as brand_repo
 from app.cupsize      import repository as cupsize_repo
 from app.shippingtype import repository as shippingtype_repo
 from app.taxhsncode   import repository as taxhsncode_repo
+from app.productcolor import repository as productcolor_repo
 from app.mdm          import repository as mdm_repo
 
 # NO auth on router — MDM is fully public (all endpoints are reference data)
@@ -167,3 +168,21 @@ def get_taxhsncode(
     db: Session = Depends(get_db),
 ):
     return taxhsncode_repo.get_all(db, *_p(request, Filters, Order_Ascending, Order_Property, Page_Index, Page_Size))
+
+
+@router.get("/ProductColor")
+def get_product_color(
+    request: Request,
+    Filters:         Optional[str]  = Query(None, alias="Filters"),
+    Order_Ascending: Optional[bool] = Query(None, alias="Order.Ascending"),
+    Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
+    Page_Index:      Optional[int]  = Query(None, alias="Page.Index"),
+    Page_Size:       Optional[int]  = Query(None, alias="Page.Size"),
+    db: Session = Depends(get_db),
+):
+    filters, order_asc, order_prop, page_index, page_size = _p(
+        request, Filters, Order_Ascending, Order_Property, Page_Index, Page_Size
+    )
+    return productcolor_repo.get_all_product_colors(
+        db, filters, order_asc, order_prop, page_index, page_size, active_only=True
+    )

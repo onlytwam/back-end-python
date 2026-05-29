@@ -49,6 +49,7 @@ from app.packagingtemplates.models   import PackagingTemplates
 from app.people.models               import People
 from app.productreview.models        import ProductReview
 from app.products.models             import Products
+from app.productcolor.models         import ProductColor
 from app.productvariant.models       import ProductVariant, ProductImage
 from app.productvariantdetail.models import ProductVariantDetail
 from app.shipment.models             import Shipment
@@ -103,9 +104,7 @@ async def lifespan(app: FastAPI):
         #    call get_setting() without hitting the DB each time.
         load_settings(db)
 
-        # 6. Auto-create ProductColor table and populate hex values
-        from app.shared.color_init import init_product_color_table
-        init_product_color_table(db)
+        
 
         # 7. Seed PageImages defaults (inserts a row for every known page-image
         #    slot using the static asset path as the initial value; skips rows
@@ -233,6 +232,7 @@ from app.packagingtemplates.router   import router as packagingtemplates_router
 from app.people.router               import router as people_router
 from app.productreview.router        import router as productreview_router
 from app.products.router             import router as products_router
+from app.productcolor.router         import router as productcolor_router
 from app.report.router               import router as report_router
 from app.shipment.router             import router as shipment_router
 from app.shippingtype.router         import router as shippingtype_router
@@ -268,7 +268,7 @@ for _router in (
     fabric_router, fileupload_router, integrationlocation_router, invoice_router,
     menu_router, menuroleclaim_router, notification_router,
     orderitems_router, orders_router, packagingtemplates_router, people_router,
-    productreview_router, products_router, report_router, shipment_router,
+    productreview_router, products_router, productcolor_router, report_router, shipment_router,
     shippingtype_router, size_router, state_router, stores_router,
     supplierinfo_router, supportrequest_router, taxhsncode_router,
     userrole_router, wishlist_router, bulkimport_router,

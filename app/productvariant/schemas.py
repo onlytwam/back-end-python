@@ -23,10 +23,11 @@ class ProductVariantCreate(BaseModel):
     # fabricId    removed — lives on Products
     # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
-    colorFamily:        Optional[str]  = None
+    colorFamilyId:      Optional[int]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
+    isAlphaSize:        Optional[bool] = None
     createdBy:          Optional[str]  = None
     modifiedBy:         Optional[str]  = None
 
@@ -41,10 +42,11 @@ class ProductVariantUpdate(BaseModel):
     # fabricId    removed — lives on Products
     # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
-    colorFamily:        Optional[str]  = None
+    colorFamilyId:      Optional[int]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
+    isAlphaSize:        Optional[bool] = None
     modifiedBy:         Optional[str]  = None
 
 
@@ -59,10 +61,14 @@ class ProductVariantResponse(BaseModel):
     # fabricId    removed — lives on Products
     # taxHSNCodeId removed — lives on Products
     color:              Optional[str]  = None
+    colorFamilyId:      Optional[int]  = None
     colorFamily:        Optional[str]  = None
+    colorFamilyHex:     Optional[str]  = None
+    colorHex:           Optional[str]  = None
     isBestSeller:       Optional[bool] = None
     isReturnAvailable:  Optional[bool] = None
     isCupSize:          Optional[bool] = None
+    isAlphaSize:        Optional[bool] = None
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
     images:             Optional[List[ImageResponse]] = []
@@ -100,7 +106,10 @@ class CupSizeDetail(BaseModel):
 class ColorDetail(BaseModel):
     productVariantId: int
     color:            Optional[str] = None
+    colorFamilyId:    Optional[int] = None
     colorFamily:      Optional[str] = None
+    colorFamilyHex:   Optional[str] = None
+    colorHex:         Optional[str] = None
     image:            Optional[str] = None
 
 
