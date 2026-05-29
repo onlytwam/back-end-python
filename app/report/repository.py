@@ -150,109 +150,122 @@ def get_available_order_dates(db: Session, channel: str = None) -> list[str]:
 # repository
 # repository.py — remove ALL inline -- comments from SQL
 
-def get_products_category_report(db, type_val, id_val, from_date, to_date, filters, page_index, page_size):
+def get_products_category_report(db, type_val, id_val, from_date, to_date, channel, page_index, page_size):
 
     if not id_val:
         return _paginate([], page_index, page_size)
 
-    date_filter = ""
-    if from_date and to_date:
-        date_filter = f'AND o."OrderDate" BETWEEN \'{from_date}\' AND \'{to_date}\''
+    date_where    = ""
+    channel_where = ""
 
-    # ── Common SELECT columns ─────────────────────────────────────────────────
+    if from_date and to_date:
+        date_where = f'AND o."CreatedDate" BETWEEN \'{from_date}\' AND \'{to_date}\''
+
+    if channel:
+        # ── Orders from website have Platform = NULL or 'Web' or 'Online' ────
+        # ── Admin/POS orders have Platform set to channel name ────────────────
+        channel_where = f"AND o.\"Platform\" ILIKE '%{channel}%'"
+
     SELECT = """
-                COALESCE(COUNT(DISTINCT oi."OrderId"), 0)                                AS "totalOrders",
-                COALESCE(SUM(oi."Quantity"), 0)                                           AS "unitsSold",
-                COALESCE(SUM(pvd."FinalPrice"                     * oi."Quantity"), 0)   AS "grossRevenue",
-                COALESCE(SUM((pvd."FinalPrice" - pvd."TaxAmount") * oi."Quantity"), 0)   AS "taxableValue",
-                COALESCE(SUM((pvd."CGST"       + pvd."SGST")      * oi."Quantity"), 0)   AS "gstAmount"
+                COALESCE(COUNT(DISTINCT o."OrderId"),                                         0) AS "totalOrders",
+                COALESCE(SUM(oi."Quantity"),                                                   0) AS "unitsSold",
+                COALESCE(SUM(oi."Price" * oi."Quantity"),                                      0) AS "grossRevenue",
+                COALESCE(SUM((oi."Price" - COALESCE(oi."TaxAmount",0)) * oi."Quantity"),       0) AS "taxableValue",
+                COALESCE(SUM(COALESCE(oi."CGST",0) * oi."Quantity"),                           0) AS "cgst",
+                COALESCE(SUM(COALESCE(oi."SGST",0) * oi."Quantity"),                           0) AS "sgst",
+                COALESCE(SUM((COALESCE(oi."CGST",0)+COALESCE(oi."SGST",0)) * oi."Quantity"),   0) AS "gstAmount",
+                COALESCE(SUM(o."TotalAmount"),                                                 0) AS "grandTotal",
+                COALESCE(SUM(COALESCE(o."CouponAmount",0)),                                    0) AS "discount",
+                COALESCE(SUM(o."TotalAmount"),                                                 0) AS "receivedAmount"
     """
 
-    # ── Common JOINs to OrderItems / Orders ──────────────────────────────────
     ORDER_JOINS = f"""
             LEFT JOIN twam."OrderItems" oi
-                ON oi."ProductVariantDetailId" = pvd."ProductVariantDetailId"
+                ON oi."ProductId" = p."ProductId"
                 AND oi."DeletedInd" = false
             LEFT JOIN twam."Orders" o
                 ON o."OrderId" = oi."OrderId"
                 AND o."DeletedInd" = false
-                {date_filter}
+                AND o."State" NOT IN (
+                    'AwaitingPayment', 'Payment Pending', 'Payment Failed',
+                    'PaymentFailed', 'Refunded', 'Cancelled'
+                )
+                {date_where}
+                {channel_where}
     """
 
     if type_val == "C":
         sql = f"""
             SELECT
-                c."Name" AS "name",
+                c."Name"  AS "name",
+                p."Name"  AS "productName",
                 {SELECT}
             FROM twam."Category" c
             LEFT JOIN twam."Products" p
                 ON p."CategoryId" = c."CategoryId"
                 AND p."DeletedInd" = false
-            LEFT JOIN twam."ProductVariants" pv
-                ON pv."ProductId" = p."ProductId"
-                AND pv."DeletedInd" = false
-            LEFT JOIN twam."ProductVariantDetail" pvd
-                ON pvd."ProductVariantId" = pv."ProductVariantId"
             {ORDER_JOINS}
             WHERE c."DeletedInd" = false
               AND c."CategoryId" = {id_val}
-            GROUP BY c."Name"
+            GROUP BY c."Name", p."Name"
+            ORDER BY "unitsSold" DESC NULLS LAST
         """
 
     elif type_val == "B":
         sql = f"""
             SELECT
                 b."brandName" AS "name",
+                p."Name"      AS "productName",
                 {SELECT}
             FROM mdm."Brand" b
             LEFT JOIN twam."Products" p
                 ON p."BrandId" = b."brandId"
                 AND p."DeletedInd" = false
-            LEFT JOIN twam."ProductVariants" pv
-                ON pv."ProductId" = p."ProductId"
-                AND pv."DeletedInd" = false
-            LEFT JOIN twam."ProductVariantDetail" pvd
-                ON pvd."ProductVariantId" = pv."ProductVariantId"
             {ORDER_JOINS}
             WHERE b."brandId" = {id_val}
-            GROUP BY b."brandName"
+            GROUP BY b."brandName", p."Name"
+            ORDER BY "unitsSold" DESC NULLS LAST
         """
 
-    else:  # type_val == "P" — Product
+    else:  # type_val == "P"
         sql = f"""
             SELECT
                 p."Name" AS "name",
+                p."Name" AS "productName",
                 {SELECT}
             FROM twam."Products" p
-            LEFT JOIN twam."ProductVariants" pv
-                ON pv."ProductId" = p."ProductId"
-                AND pv."DeletedInd" = false
-            LEFT JOIN twam."ProductVariantDetail" pvd
-                ON pvd."ProductVariantId" = pv."ProductVariantId"
             {ORDER_JOINS}
             WHERE p."DeletedInd" = false
               AND p."ProductId" = {id_val}
             GROUP BY p."Name"
+            ORDER BY "unitsSold" DESC NULLS LAST
         """
 
     try:
         result = db.execute(text(sql))
         rows = [
             {
-                "name":         r["name"],
-                "type":         type_val,
-                "totalOrders":  int(r["totalOrders"]   or 0),
-                "unitsSold":    int(r["unitsSold"]      or 0),
-                "grossRevenue": float(r["grossRevenue"] or 0),
-                "taxableValue": float(r["taxableValue"] or 0),
-                "gstAmount":    float(r["gstAmount"]    or 0),
+                "name":           r["name"],
+                "productName":    r["productName"],
+                "type":           type_val,
+                "totalOrders":    int(r["totalOrders"]     or 0),
+                "unitsSold":      int(r["unitsSold"]        or 0),
+                "grossRevenue":   float(r["grossRevenue"]   or 0),
+                "taxableValue":   float(r["taxableValue"]   or 0),
+                "cgst":           float(r["cgst"]           or 0),
+                "sgst":           float(r["sgst"]           or 0),
+                "gstAmount":      float(r["gstAmount"]      or 0),
+                "grandTotal":     float(r["grandTotal"]     or 0),
+                "discount":       float(r["discount"]       or 0),
+                "receivedAmount": float(r["receivedAmount"] or 0),
             }
             for r in result.mappings().all()
         ]
-        print(f">>> ROWS: {len(rows)} | first: {rows[0] if rows else 'empty'}")
+        # print(f">>> type={type_val} id={id_val} rows={len(rows)} sample={rows[0] if rows else 'empty'}")
         return _paginate(rows, page_index, page_size)
 
     except Exception as e:
+        # print(f">>> SQL ERROR: {e}")
         db.rollback()
         return _paginate([], page_index, page_size)
     
@@ -350,158 +363,135 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
     if filters is None:
         filters = {}
 
-    from_date  = filters.get("fromDate")
-    to_date    = filters.get("toDate")
-    org_id     = filters.get("organizationId")
-    report_type = filters.get("type", "all")   # "coupon" | "gift" | "all"
+    from_date   = filters.get("fromDate")
+    to_date     = filters.get("toDate")
+    org_id      = filters.get("organizationId")
+    report_type = filters.get("type", "all")
 
-    # ── Date clause builder ───────────────────────────────────────────────────
-    def date_clauses(table_alias: str) -> str:
+    def date_join_clause(alias: str) -> str:
         parts = []
         if from_date:
-            parts.append(f'{table_alias}."OrderDate" >= \'{from_date}\'')
+            parts.append(f'{alias}."UsedAt" >= \'{from_date}\'')
         if to_date:
-            parts.append(f'{table_alias}."OrderDate" <= \'{to_date} 23:59:59\'')
+            parts.append(f'{alias}."UsedAt" <= \'{to_date} 23:59:59\'')
         return (" AND " + " AND ".join(parts)) if parts else ""
 
-    def org_clause_coupons(table_alias: str) -> str:
-        if org_id:
-            return f' AND {table_alias}."OrganizationId" = {org_id}'
-        return ""
+    def order_date_clause(alias: str) -> str:
+        parts = []
+        if from_date:
+            parts.append(f'{alias}."OrderDate" >= \'{from_date}\'')
+        if to_date:
+            parts.append(f'{alias}."OrderDate" <= \'{to_date} 23:59:59\'')
+        return (" AND " + " AND ".join(parts)) if parts else ""
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PART 1 — Digital Coupons (coupons.Coupons → twam.Orders via CouponId)
-    # ─────────────────────────────────────────────────────────────────────────
+    def org_clause(alias: str) -> str:
+        return f'AND {alias}."OrganizationId" = {org_id}' if org_id else ''
+
+    # ── PART 1: Digital Coupons (coupons."Coupons") ──────────────────────────
     coupon_sql = f"""
         SELECT
-            'coupon'                                    AS "ReportType",
-            c."CouponCode"                              AS "Code",
-            c."CouponName"                              AS "Name",
-            c."Description"                             AS "Description",
-            c."Discount"                                AS "DiscountValue",
-            NULL                                        AS "GiftType",
-            c."CouponType"                              AS "SubType",
-            c."StartDate"                               AS "StartDate",
-            c."EndDate"                                 AS "EndDate",
-            c."IsActive"                                AS "IsActive",
-            COUNT(o."OrderId")                          AS "TimesUsed",
-            COALESCE(SUM(o."CouponAmount"), 0)          AS "TotalDiscount",
-            COALESCE(SUM(o."TotalAmount"), 0)           AS "TotalRevenue",
-            NULL                                        AS "SKU",
-            NULL                                        AS "HSNCode",
-            NULL                                        AS "Weight"
-        FROM coupons."Coupons" c
+            'coupon'::text                                  AS "ReportType",
+            c."CouponCode"::text                            AS "Code",
+            c."CouponName"::text                            AS "Name",
+            c."Description"::text                           AS "Description",
+            c."Discount"::numeric                           AS "DiscountValue",
+            NULL::text                                      AS "GiftType",
+            COALESCE(c."CouponType", c."State")::text       AS "SubType",
+            c."StartDate"::text                             AS "StartDate",
+            c."EndDate"::text                               AS "EndDate",
+            c."IsActive"::boolean                           AS "IsActive",
+            COUNT(DISTINCT cu."UsageId")::bigint            AS "TimesUsed",
+            COALESCE(SUM(o."CouponAmount"), 0)::numeric     AS "TotalDiscount",
+            COALESCE(SUM(o."TotalAmount"),  0)::numeric     AS "TotalRevenue",
+            NULL::text                                      AS "SKU",
+            NULL::text                                      AS "HSNCode",
+            NULL::numeric                                   AS "Weight"
+        FROM coupons."Coupons" c                           -- ✅ correct schema
+        LEFT JOIN coupons."CouponUsage" cu
+            ON  cu."CouponId" = c."CouponId"
+            {date_join_clause('cu')}
         LEFT JOIN twam."Orders" o
-            ON  o."CouponId"    = c."CouponId"
-            AND o."DeletedInd"  = false
-            {date_clauses('o')}
+            ON  o."OrderId"    = cu."OrderId"
+            AND o."DeletedInd" = false
         WHERE c."DeletedInd" = false
-          {org_clause_coupons('c')}
+          {org_clause('c')}
         GROUP BY
-            c."CouponCode", c."CouponName", c."Description",
-            c."Discount", c."CouponType",
+            c."CouponId", c."CouponCode", c."CouponName", c."Description",
+            c."Discount", c."CouponType", c."State",
             c."StartDate", c."EndDate", c."IsActive"
     """
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PART 2 — Physical Coupons (coupons.PhysicalCoupons — scratch-card style)
-    # ─────────────────────────────────────────────────────────────────────────
-#     physical_coupon_sql = f"""
-#         SELECT
-#             'physical_coupon'                           AS "ReportType",
-#             pc."CouponCode"                             AS "Code",
-#             pc."Description"                            AS "Name",
-#             pc."Description"                            AS "Description",
-#             pc."Discount"                               AS "DiscountValue",
-#             NULL                                        AS "GiftType",
-#             'physical_coupon'                           AS "SubType",
-#             NULL                                        AS "StartDate",
-#             NULL                                        AS "EndDate",
-#             CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
-#             CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
-#             CASE WHEN pc."IsUsed" THEN pc."Discount"
-#                  ELSE 0 END                             AS "TotalDiscount",
-#             0                                           AS "TotalRevenue",
-#             NULL                                        AS "SKU",
-#             NULL                                        AS "HSNCode",
-#             NULL                                        AS "Weight"
-#         FROM coupons."PhysicalCoupons" pc
-#         WHERE 1=1
-     
-#         {f"""AND pc."OrganizationId" = {org_id}""" if org_id else ''}
-#         {f"""AND pc."UsedAt" >= '{from_date}'""" if from_date else ''}
-#         {f"""AND pc."UsedAt" <= '{to_date} 23:59:59'""" if to_date else ''}
-#     """
-#    #   {f'AND pc."OrganizationId" = {org_id}' if org_id else ''}
-#         #   {f'AND pc."UsedAt" >= \'{from_date}\'' if from_date else ''}
-#         #   {f'AND pc."UsedAt" <= \'{to_date} 23:59:59\'' if to_date else ''}
-
+    # ── PART 2: Physical Coupons ──────────────────────────────────────────────
     physical_coupon_sql = f"""
         SELECT
-            'physical_coupon'                           AS "ReportType",
-            pc."CouponCode"                             AS "Code",
-            pc."Description"                            AS "Name",
-            pc."Description"                            AS "Description",
-            pc."Discount"                               AS "DiscountValue",
-            NULL                                        AS "GiftType",
-            'physical_coupon'                           AS "SubType",
-            NULL                                        AS "StartDate",
-            NULL                                        AS "EndDate",
-            CASE WHEN pc."IsUsed" THEN false ELSE true END AS "IsActive",
-            CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END    AS "TimesUsed",
-            CASE WHEN pc."IsUsed" THEN pc."Discount"
-                ELSE 0 END                             AS "TotalDiscount",
-            0                                           AS "TotalRevenue",
-            NULL                                        AS "SKU",
-            NULL                                        AS "HSNCode",
-            NULL                                        AS "Weight"
+            'physical_coupon'::text                              AS "ReportType",
+            pc."CouponCode"::text                                AS "Code",
+            pc."Description"::text                               AS "Name",
+            pc."Description"::text                               AS "Description",
+            pc."Discount"::numeric                               AS "DiscountValue",
+            NULL::text                                           AS "GiftType",
+            'physical_coupon'::text                              AS "SubType",
+            NULL::text                                           AS "StartDate",
+            NULL::text                                           AS "EndDate",
+            CASE WHEN pc."IsUsed" THEN false ELSE true END       AS "IsActive",
+            SUM(CASE WHEN pc."IsUsed" THEN 1 ELSE 0 END)::bigint AS "TimesUsed",
+            COALESCE(
+                SUM(CASE WHEN pc."IsUsed" THEN pc."Discount" ELSE 0 END), 0
+            )::numeric                                           AS "TotalDiscount",
+            COALESCE(SUM(o."TotalAmount"), 0)::numeric           AS "TotalRevenue",
+            NULL::text                                           AS "SKU",
+            NULL::text                                           AS "HSNCode",
+            NULL::numeric                                        AS "Weight"
         FROM coupons."PhysicalCoupons" pc
+        LEFT JOIN twam."Orders" o
+            ON  o."OrderId"    = pc."OrderId"
+            AND o."DeletedInd" = false
+            {order_date_clause('o')}
         WHERE 1=1
-
-        {'AND pc."OrganizationId" = ' + str(org_id) if org_id else ''}
-        {'AND pc."UsedAt" >= ' + "'" + str(from_date) + "'" if from_date else ''}
-        {'AND pc."UsedAt" <= ' + "'" + str(to_date) + " 23:59:59'" if to_date else ''}
+          {org_clause('pc')}
+          {'AND pc."UsedAt" >= \'' + str(from_date) + '\'' if from_date else ''}
+          {'AND pc."UsedAt" <= \'' + str(to_date) + ' 23:59:59\'' if to_date else ''}
+        GROUP BY
+            pc."CouponCode", pc."Description", pc."Discount", pc."IsUsed"
     """
-    # ─────────────────────────────────────────────────────────────────────────
-    # PART 3 — Surprise Gifts (twam.OrderSurpriseGift + SurpriseGiftRule)
-    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── PART 3: Surprise Gifts ────────────────────────────────────────────────
     gift_sql = f"""
         SELECT
-            'surprise_gift'                             AS "ReportType",
-            r."SKU"                                     AS "Code",
-            r."GiftName"                                AS "Name",
-            r."GiftDescription"                         AS "Description",
-            0                                           AS "DiscountValue",
-            r."GiftType"                                AS "GiftType",
-            r."GiftType"                                AS "SubType",
-            NULL                                        AS "StartDate",
-            NULL                                        AS "EndDate",
-            r."IsActive"                                AS "IsActive",
-            COUNT(osg."OrderSurpriseGiftId")            AS "TimesUsed",
-            0                                           AS "TotalDiscount",
-            COALESCE(SUM(o."TotalAmount"), 0)           AS "TotalRevenue",
-            r."SKU"                                     AS "SKU",
-            r."HSNCode"                                 AS "HSNCode",
-            r."Weight"                                  AS "Weight"
+            'surprise_gift'::text                                    AS "ReportType",
+            r."SKU"::text                                            AS "Code",
+            r."GiftName"::text                                       AS "Name",
+            r."GiftDescription"::text                                AS "Description",
+            0::numeric                                               AS "DiscountValue",
+            r."GiftType"::text                                       AS "GiftType",
+            r."GiftType"::text                                       AS "SubType",
+            NULL::text                                               AS "StartDate",
+            NULL::text                                               AS "EndDate",
+            r."IsActive"::boolean                                    AS "IsActive",
+            COUNT(DISTINCT osg."OrderSurpriseGiftId")::bigint        AS "TimesUsed",
+            0::numeric                                               AS "TotalDiscount",
+            COALESCE(SUM(o."TotalAmount"), 0)::numeric               AS "TotalRevenue",
+            r."SKU"::text                                            AS "SKU",
+            r."HSNCode"::text                                        AS "HSNCode",
+            r."Weight"::numeric                                      AS "Weight"
         FROM twam."SurpriseGiftRule" r
         LEFT JOIN twam."OrderSurpriseGift" osg
-            ON  osg."GiftRuleId"  = r."GiftRuleId"
-            AND osg."DeletedInd"  = false
+            ON  osg."GiftRuleId" = r."GiftRuleId"
+            AND osg."DeletedInd" = false
         LEFT JOIN twam."Orders" o
-            ON  o."OrderId"       = osg."OrderId"
-            AND o."DeletedInd"    = false
-            {date_clauses('o')}
+            ON  o."OrderId"    = osg."OrderId"
+            AND o."DeletedInd" = false
+            {order_date_clause('o')}
         WHERE r."DeletedInd" = false
-          {f'AND r."OrganizationId" = {org_id}' if org_id else ''}
+          {org_clause('r')}
         GROUP BY
             r."GiftRuleId", r."SKU", r."GiftName", r."GiftDescription",
             r."GiftType", r."IsActive", r."HSNCode", r."Weight"
     """
 
-    # ── Combine based on filter type ─────────────────────────────────────────
     if report_type == "coupon":
         final_sql = f"""
-            SELECT * FROM ({coupon_sql}) coupon_data
+            SELECT * FROM ({coupon_sql})          coupon_data
             UNION ALL
             SELECT * FROM ({physical_coupon_sql}) phys_data
             ORDER BY "TimesUsed" DESC NULLS LAST
@@ -511,30 +501,17 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             SELECT * FROM ({gift_sql}) gift_data
             ORDER BY "TimesUsed" DESC NULLS LAST
         """
-    else:  # "all" — default
+    else:
         final_sql = f"""
-            SELECT * FROM ({coupon_sql}) coupon_data
+            SELECT * FROM ({coupon_sql})          coupon_data
             UNION ALL
             SELECT * FROM ({physical_coupon_sql}) phys_data
             UNION ALL
-            SELECT * FROM ({gift_sql}) gift_data
+            SELECT * FROM ({gift_sql})            gift_data
             ORDER BY "TimesUsed" DESC NULLS LAST
         """
 
     rows = _safe(db, final_sql)
-    return _paginate(rows, page_index, page_size)
-
-
-def get_invoice_report(db: Session, filters, page_index, page_size):
-    rows = _safe(db, """
-        SELECT i."InvoiceId", i."InvoiceNumber", i."InvoiceDate",
-               o."OrderId", o."TotalAmount", o."State" AS "OrderState",
-               i."TaxAmount", i."TotalAmountWithTax"
-        FROM twam."Invoice" i
-        LEFT JOIN twam."Orders" o ON o."OrderId" = i."OrderId"
-        WHERE i."DeletedInd"=false
-        ORDER BY i."InvoiceDate" DESC
-    """)
     return _paginate(rows, page_index, page_size)
 
 
@@ -570,7 +547,7 @@ def get_net_vs_revenue_report(db: Session, filters, page_index, page_size):
             where_clauses.append('p."BrandId" = :brandId')
             params["brandId"] = int(filters["brandId"])
         if filters.get("fromDate") and filters.get("toDate"):
-            where_clauses.append('o."CreatedDate" BETWEEN :fromDate AND :toDate')
+            where_clauses.append('pvd."Date" BETWEEN :fromDate AND :toDate')
             params["fromDate"] = filters["fromDate"]
             params["toDate"]   = filters["toDate"]
 
@@ -578,41 +555,81 @@ def get_net_vs_revenue_report(db: Session, filters, page_index, page_size):
 
     rows = _safe(db, f"""
         SELECT
-            p."Name"                                                    AS "ProductName",
-            COALESCE(c."Name",        'Unknown')                       AS "Category",
-            COALESCE(b."brandName",   'Unknown')                       AS "Brand",
-            COALESCE(SUM(oi."Quantity"), 0)                            AS "UnitsSold",
-            COUNT(DISTINCT o."OrderId")                                 AS "TotalOrders",
-            COALESCE(SUM(oi."Quantity" * pvd."FinalPrice"), 0)         AS "GrossRevenue",
+            p."ProductId"                                AS "ProductId",
+            pvd."StockId"                                AS "StockId",
+            p."Name"                                     AS "ProductName",
+            COALESCE(c."Name",      'Unknown')           AS "Category",
+            COALESCE(b."brandName", 'Unknown')           AS "Brand",
+
+            COALESCE(SUM(pvd."StockQuantity"),     0)    AS "TotalStock",
+            COALESCE(SUM(pvd."ProcessedQuantity"), 0)    AS "UnitsSold",
+            COALESCE(SUM(pvd."AvailableQuantity"), 0)    AS "RemainingStock",
+
             COALESCE(
-                SUM(oi."Quantity" * pvd."FinalPrice") -
-                COALESCE(SUM(o."CouponAmount"), 0), 0
-            )                                                           AS "NetRevenue",
-            COALESCE(SUM(o."TaxAmount"),    0)                         AS "TaxAmount",
-            COALESCE(SUM(o."CouponAmount"), 0)                         AS "Discount"
+                SUM(
+                    COALESCE(pvd."StockQuantity", pvd."AvailableQuantity", 0)
+                    * COALESCE(pvd."MRPPrice", 0)
+                ), 0
+            )                                            AS "GrossRevenue",
+
+            COALESCE(
+                SUM(
+                    COALESCE(pvd."StockQuantity", pvd."AvailableQuantity", 0) *
+                    GREATEST(
+                        COALESCE(pvd."MRPPrice", 0) - COALESCE(pvd."FinalPrice", 0), 0
+                    )
+                ), 0
+            )                                            AS "Discount",
+
+            COALESCE(
+                SUM(
+                    COALESCE(pvd."StockQuantity", pvd."AvailableQuantity", 0) *
+                    CASE
+                        WHEN COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0) > 0
+                        THEN COALESCE(pvd."FinalPrice", 0) -
+                             (COALESCE(pvd."FinalPrice", 0) /
+                              (1 + (COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)) / 100.0))
+                        ELSE 0
+                    END
+                ), 0
+            )                                            AS "TaxAmount",
+
+            COALESCE(
+                SUM(
+                    COALESCE(pvd."AvailableQuantity", 0) *
+                    CASE
+                        WHEN COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0) > 0
+                        THEN COALESCE(pvd."FinalPrice", 0) /
+                             (1 + (COALESCE(pvd."CGST", 0) + COALESCE(pvd."SGST", 0)) / 100.0)
+                        ELSE COALESCE(pvd."FinalPrice", 0)
+                    END
+                ), 0
+            )                                            AS "NetRevenue"
+
         FROM twam."Products" p
-        LEFT JOIN twam."ProductVariants" pv
-            ON pv."ProductId"    = p."ProductId"
-           AND pv."DeletedInd"   = false
-        LEFT JOIN twam."ProductVariantDetail" pvd
-            ON pvd."ProductVariantId" = pv."ProductVariantId"
-           AND pvd."DeletedInd"       = false
-        LEFT JOIN twam."OrderItems" oi
-            ON oi."ProductVariantDetailId" = pvd."ProductVariantDetailId"
-           AND oi."DeletedInd"             = false
-        LEFT JOIN twam."Orders" o
-            ON o."OrderId"     = oi."OrderId"
-           AND o."DeletedInd"  = false
+
+        JOIN twam."ProductVariantDetail" pvd
+            ON pvd."ProductId"  = p."ProductId"
+           AND pvd."DeletedInd" = false
+
         LEFT JOIN twam."Category" c
-            ON c."CategoryId"  = p."CategoryId"
-           AND c."DeletedInd"  = false
+            ON c."CategoryId" = p."CategoryId"
+           AND c."DeletedInd" = false
+
         LEFT JOIN mdm."Brand" b
-            ON b."brandId"     = p."BrandId"
-           AND b."deletedInd"  = false
+            ON b."brandId"    = p."BrandId"
+           AND b."deletedInd" = false
+
         WHERE {where_sql}
-        GROUP BY p."Name", c."Name", b."brandName"
-        ORDER BY SUM(oi."Quantity" * pvd."FinalPrice") DESC NULLS LAST
+
+        GROUP BY p."ProductId", pvd."StockId", p."Name", c."Name", b."brandName"
+        ORDER BY
+            SUM(
+                COALESCE(pvd."StockQuantity", pvd."AvailableQuantity", 0)
+                * COALESCE(pvd."MRPPrice", 0)
+            ) DESC NULLS LAST
     """, params)
+
     return _paginate(rows, page_index, page_size)
 
 
@@ -1025,40 +1042,75 @@ def get_customer_segmentation(db: Session, filters, page_index, page_size):
  
  
 def get_customer_churn_rate(db: Session, filters, page_index, page_size):
+
     inactive_days = int((filters or {}).get("inactive_days", 90))
     period_months = int((filters or {}).get("period_months", 12))
- 
-    rows = _safe(db, """
-        WITH active_customers AS (
-            SELECT DISTINCT o."UserProfileId"
-            FROM twam."Orders" o
-            WHERE o."DeletedInd" = false
-              AND o."OrderDate" >= NOW() - (:period_months || ' months')::INTERVAL
-        ),
-        last_order AS (
+
+    query = """
+        WITH customer_last_order AS (
             SELECT
-                o."UserProfileId",
-                MAX(o."OrderDate") AS "LastOrderDate"
-            FROM twam."Orders" o
-            WHERE o."DeletedInd" = false
-              AND o."UserProfileId" IN (SELECT "UserProfileId" FROM active_customers)
-            GROUP BY o."UserProfileId"
+                iu."Id" AS "UserId",
+                iu."FirstName",
+                iu."LastName",
+                MAX(o."OrderDate") AS "LastOrderDate",
+                COUNT(o."OrderId") AS "TotalOrders",
+                COALESCE(SUM(o."TotalAmount"), 0) AS "TotalSpent"
+            FROM auth."IdentityUser" iu
+            LEFT JOIN twam."Orders" o
+                ON iu."Id" = o."UserProfileId"
+                AND o."DeletedInd" = false
+            WHERE iu."DeletedInd" = false
+            GROUP BY
+                iu."Id",
+                iu."FirstName",
+                iu."LastName"
         )
+
         SELECT
-            EXTRACT(YEAR  FROM "LastOrderDate")::int               AS "Year",
-            EXTRACT(MONTH FROM "LastOrderDate")::int               AS "Month",
-            COUNT("UserProfileId")                                  AS "ChurnedCustomers",
-            (SELECT COUNT(*) FROM active_customers)                 AS "TotalActiveCustomers",
-            ROUND(
-                COUNT("UserProfileId") * 100.0 /
-                NULLIF((SELECT COUNT(*) FROM active_customers), 0), 2
-            )                                                       AS "ChurnRatePct"
-        FROM last_order
-        WHERE "LastOrderDate" < NOW() - (:inactive_days || ' days')::INTERVAL
-        GROUP BY "Year", "Month"
-        ORDER BY "Year" DESC, "Month" DESC
-    """, {"inactive_days": inactive_days, "period_months": period_months})
- 
+            "UserId",
+            CONCAT(
+                COALESCE("FirstName", ''),
+                ' ',
+                COALESCE("LastName", '')
+            ) AS "CustomerName",
+
+            "LastOrderDate",
+
+            EXTRACT(DAY FROM (NOW() - "LastOrderDate"))::INT
+                AS "InactiveDays",
+
+            "TotalOrders",
+
+            "TotalSpent",
+
+            CASE
+                WHEN "LastOrderDate" IS NULL THEN 'Churned'
+                WHEN "LastOrderDate" < NOW() - (:inactive_days || ' days')::INTERVAL
+                    THEN 'Churned'
+                ELSE 'Active'
+            END AS "CustomerStatus"
+
+        FROM customer_last_order
+
+        WHERE
+            (
+                "LastOrderDate" IS NULL
+                OR
+                "LastOrderDate" < NOW() - (:inactive_days || ' days')::INTERVAL
+            )
+
+        ORDER BY "LastOrderDate" ASC NULLS FIRST
+    """
+
+    rows = _safe(
+        db,
+        query,
+        {
+            "inactive_days": inactive_days,
+            "period_months": period_months
+        }
+    )
+
     return _paginate(rows, page_index, page_size)
  
  
@@ -1203,7 +1255,7 @@ def get_stock_level_report(
 ):
     # ── Parse filters ─────────────────────────────────────────────────────────
     f = _parse_filters(filters)
-    print(f"[StockLevel] Parsed filters: {f}")
+    # print(f"[StockLevel] Parsed filters: {f}")
 
     # ── Build WHERE clauses ───────────────────────────────────────────────────
     where_clauses = ['pvd."DeletedInd" = false']
@@ -1220,7 +1272,8 @@ def get_stock_level_report(
             params["categoryId"] = int(f["categoryId"])
             where_clauses.append('p."CategoryId" = :categoryId')
         except (ValueError, TypeError) as e:
-            print(f"[StockLevel] Invalid categoryId: {e}")
+            # print(f"[StockLevel] Invalid categoryId: {e}")
+            pass
 
     if f.get("isLowStock") is not None:
         val = f["isLowStock"]
@@ -1241,14 +1294,16 @@ def get_stock_level_report(
             params["minStock"] = int(f["minStock"])
             where_clauses.append('pvd."StockQuantity" >= :minStock')
         except (ValueError, TypeError) as e:
-            print(f"[StockLevel] Invalid minStock: {e}")
+            # print(f"[StockLevel] Invalid minStock: {e}")
+            pass
 
     if f.get("maxStock") is not None:
         try:
             params["maxStock"] = int(f["maxStock"])
             where_clauses.append('pvd."StockQuantity" <= :maxStock')
         except (ValueError, TypeError) as e:
-            print(f"[StockLevel] Invalid maxStock: {e}")
+            # print(f"[StockLevel] Invalid maxStock: {e}")
+            pass
 
     where_sql = " AND ".join(where_clauses)
 
@@ -1267,9 +1322,9 @@ def get_stock_level_report(
         total = db.execute(
             text(f'SELECT COUNT(*) {base_from}'), count_params
         ).scalar() or 0
-        print(f"[StockLevel] Total count: {total}")
+        # print(f"[StockLevel] Total count: {total}")
     except Exception as e:
-        print(f"[StockLevel] COUNT query error: {e}")
+        # print(f"[StockLevel] COUNT query error: {e}")
         traceback.print_exc()
         db.rollback()
         return {
@@ -1340,7 +1395,7 @@ def get_inventory_aging_report(
 ):
     # ── Parse filters ────────────────────────────────────────────────────────
     f = _parse_filters(filters)   # reuse your existing _parse_filters()
-    print(f"[AgingReport] Parsed filters: {f}")
+    # print(f"[AgingReport] Parsed filters: {f}")
 
     # ── WHERE clauses ────────────────────────────────────────────────────────
     where_clauses = [
@@ -1399,9 +1454,9 @@ def get_inventory_aging_report(
         total = db.execute(
             text(f"SELECT COUNT(*) {base_from}"), count_params
         ).scalar() or 0
-        print(f"[AgingReport] Total: {total}")
+        # print(f"[AgingReport] Total: {total}")
     except Exception as e:
-        print(f"[AgingReport] COUNT error: {e}")
+        # print(f"[AgingReport] COUNT error: {e}")
         traceback.print_exc()
         db.rollback()
         return {"TotalCount": 0, "Page": page_index or 1, "PageSize": page_size or 20, "Data": []}
@@ -1445,9 +1500,9 @@ def get_inventory_aging_report(
             if row.get("ReceivedDate") is not None:
                 row["ReceivedDate"] = str(row["ReceivedDate"])
 
-        print(f"[AgingReport] Rows: {len(rows)}")
+        # print(f"[AgingReport] Rows: {len(rows)}")
     except Exception as e:
-        print(f"[AgingReport] DATA error: {e}")
+        # print(f"[AgingReport] DATA error: {e}")
         traceback.print_exc()
         db.rollback()
         return {"TotalCount": total, "Page": page_index, "PageSize": page_size, "Data": []}

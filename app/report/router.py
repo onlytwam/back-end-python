@@ -66,11 +66,28 @@ def products_category_report(
         db, type_val, id_val, from_date, to_date, None, Page_Index, Page_Size
     )
 
+# ✅ NEW — reads all params directly from query string
 @router.get("/SalesByRegionReport", response_model=schemas.ReportListResponse)
-def sales_by_region(Filters: Optional[str]=Query(None,alias="Filters"),
-    Page_Index: Optional[int]=Query(None,alias="Page.Index",ge=1),
-    Page_Size: Optional[int]=Query(None,alias="Page.Size",ge=1), db: Session=Depends(get_db)):
-    return repository.get_sales_by_region(db, *_paging(Page_Index, Page_Size, Filters))
+def sales_by_region(
+    state:      Optional[str] = Query(None),
+    city:       Optional[str] = Query(None),
+    fromDate:   Optional[str] = Query(None),
+    toDate:     Optional[str] = Query(None),
+    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(None, alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+):
+    # Build filters dict from direct query params
+    filters: dict = {}
+    if state:    filters["state"]    = state      # ← "Telangana"
+    if city:     filters["city"]     = city
+    if fromDate: filters["fromDate"] = fromDate   # ← "2026-03-01"
+    if toDate:   filters["toDate"]   = toDate
+
+    page_index = Page_Index or 1
+    page_size  = Page_Size  or 100
+
+    return repository.get_sales_by_region(db, filters, page_index, page_size)
 
 @router.get("/TopLowSellingReport", response_model=schemas.ReportListResponse)
 def top_low_selling(Filters: Optional[str]=Query(None,alias="Filters"),
@@ -82,6 +99,9 @@ def top_low_selling(Filters: Optional[str]=Query(None,alias="Filters"),
 @router.get("/ProductsCategoryReport", response_model=schemas.ReportListResponse)
 def products_category_report(
     request:    Request,
+    # ── accept both lowercase (frontend) and uppercase (legacy) ──────────────
+    page_index: Optional[int] = Query(None, alias="page.index", ge=1),
+    page_size:  Optional[int] = Query(None, alias="page.size",  ge=1),
     Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
     Page_Size:  Optional[int] = Query(None, alias="Page.Size",  ge=1),
     db:         Session = Depends(get_db)
@@ -89,9 +109,11 @@ def products_category_report(
     params      = dict(request.query_params)
     filters_map = {}
     for key, val in params.items():
-        m = re.match(r"filters\[(\d+)\]\.(\w+)", key)
+        # ── case-insensitive match for filters[N].property/value/comparison ──
+        m = re.match(r"filters\[(\d+)\]\.(property|value|comparison)", key, re.IGNORECASE)
         if m:
-            idx, field = m.group(1), m.group(2)
+            idx   = m.group(1)
+            field = m.group(2).lower()   # normalize to lowercase
             filters_map.setdefault(idx, {})[field] = val
 
     parsed    = { f["property"]: f.get("value", "") for f in filters_map.values() if "property" in f }
@@ -100,10 +122,14 @@ def products_category_report(
     from_date = parsed.get("FromDate", None)
     to_date   = parsed.get("ToDate",   None)
 
-    print(f">>> type_val={type_val}, id_val={id_val}, from={from_date}, to={to_date}")  # debug
+    # ── use whichever page params arrived ────────────────────────────────────
+    pi = page_index or Page_Index
+    ps = page_size  or Page_Size
+
+    # # print(f">>> type={type_val} id={id_val} from={from_date} to={to_date} page={pi}/{ps}")
 
     return repository.get_products_category_report(
-        db, type_val, id_val, from_date, to_date, None, Page_Index, Page_Size
+        db, type_val, id_val, from_date, to_date, None, pi, ps
     )
 
 @router.get("/SalesbyPlatform", response_model=schemas.ReportListResponse)
@@ -114,24 +140,33 @@ def sales_by_platform(Filters: Optional[str]=Query(None,alias="Filters"),
 
 @router.get("/CouponUsageReport", response_model=schemas.ReportListResponse)
 def coupon_usage(
-    Filters:    Optional[str] = Query(None, alias="Filters"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size:  Optional[int] = Query(None, alias="Page.Size",  ge=1),
-    fromDate:   Optional[str] = Query(None),
-    toDate:     Optional[str] = Query(None),
-    type:       Optional[str] = Query("all"),          # "coupon" | "gift" | "all"
+    fromDate:       Optional[str] = Query(None),
+    toDate:         Optional[str] = Query(None),
+    type:           Optional[str] = Query("all"),
     organizationId: Optional[int] = Query(None),
+    Page_Index:     Optional[int] = Query(None, alias="Page.Index", ge=1),
+    Page_Size:      Optional[int] = Query(None, alias="Page.Size",  ge=1),
+    Filters:        Optional[str] = Query(None, alias="Filters"),
     db: Session = Depends(get_db)
 ):
-    filters = {
-        "fromDate":       fromDate,
-        "toDate":         toDate,
-        "type":           type,
-        "organizationId": str(organizationId) if organizationId else None,
-    }
-    return repository.get_coupon_usage_report(
-        db, filters, *_paging(Page_Index, Page_Size, Filters)
-    )
+    try:
+        filters = {
+            "fromDate":       fromDate,
+            "toDate":         toDate,
+            "type":           type or "all",
+            "organizationId": str(organizationId) if organizationId else None,
+        }
+        # ✅ Pass page_index and page_size directly — no _paging unpacking
+        return repository.get_coupon_usage_report(
+            db,
+            filters,
+            Page_Index or 1,
+            Page_Size  or 20,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise
 
 @router.get("/InvoiceReport", response_model=schemas.ReportListResponse)
 def invoice_report(Filters: Optional[str]=Query(None,alias="Filters"),
