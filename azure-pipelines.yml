@@ -1,0 +1,68 @@
+trigger:
+  branches:
+    include:
+      - main                       # ✅ merge → build + push + deploy
+
+pr:
+  branches:
+    include:
+      - main                       # ✅ PR raised → build only, no push/deploy
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  imageRepository: 'twam-backend'
+  containerRegistry: 'twamregistry.azurecr.io'
+
+steps:
+  - task: Docker@2
+    displayName: Build only (PR validation)
+    condition: or(
+      eq(variables['Build.Reason'], 'PullRequest'),
+      and(
+        ne(variables['Build.SourceBranch'], 'refs/heads/main'),
+        eq(variables['Build.Reason'], 'IndividualCI')
+      ))
+    inputs:
+      command: build
+      repository: $(imageRepository)
+      dockerfile: $(Build.SourcesDirectory)/Dockerfile
+      containerRegistry: twamregistry
+      tags: |
+        latest
+        $(Build.BuildId)
+      arguments: '--no-cache'
+
+  - task: Docker@2
+    displayName: Build and Push to ACR (main merge only)
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    inputs:
+      command: buildAndPush
+      repository: $(imageRepository)
+      dockerfile: $(Build.SourcesDirectory)/Dockerfile
+      containerRegistry: twamregistry
+      tags: |
+        latest
+        $(Build.BuildId)
+      arguments: '--no-cache'
+
+  - task: AzureCLI@2
+    displayName: Deploy to Container Apps
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    inputs:
+      azureSubscription: twam-azure-connection
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az containerapp update \
+          --name twam-backend \
+          --resource-group twam-production \
+          --image twamregistry.azurecr.io/twam-backend:$(Build.BuildId) \
+          --revision-suffix build$(Build.BuildId)
