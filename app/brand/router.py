@@ -29,12 +29,7 @@ router = APIRouter(
 # Helpers
 # ─────────────────────────────────────────────
 
-def _to_url(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    if path.startswith("/") or path.startswith("http"):
-        return path
-    return "/" + path.replace("\\", "/")
+from app.shared.url_helpers import resolve_url as _to_url
 
 
 def _parse_filters(raw: Optional[str]) -> Optional[list[dict]]:
