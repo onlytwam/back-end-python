@@ -64,12 +64,7 @@ def recalculate_pvd_taxes_for_product(db: Session, product_id: int) -> dict:
     return {"updated": updated, "skipped": skipped, "errors": errors}
 
 
-def _image_path_to_url(path: str | None) -> str | None:
-    if not path:
-        return None
-    if path.startswith("http") or path.startswith("/"):
-        return path
-    return "http://127.0.0.1:8000/" + path.lstrip("/")
+from app.shared.url_helpers import resolve_url as _image_path_to_url  # noqa: F401
 
 
 def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -> list[dict]:

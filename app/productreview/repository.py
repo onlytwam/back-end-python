@@ -1,12 +1,10 @@
-import os
 from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy.orm import Session
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
+from app.shared.url_helpers import resolve_url
 
 from .models import ProductReview
-
-BASE_URL = os.getenv("BASE_URL", "")
 
 
 def _to_dict(r: ProductReview) -> dict:
@@ -22,9 +20,8 @@ def _to_dict(r: ProductReview) -> dict:
         "userProfileId":    r.userProfileId,
         "state":            r.state,
         "itemId":           r.itemId,
-        # Return full URL if photo is a relative path, otherwise return as-is
-        # "photo":            f"{BASE_URL}{r.photo}" if r.photo and not r.photo.startswith("http") else r.photo,
-        "photo":            r.photo,
+        # Return full Azure URL for photo
+        "photo":            resolve_url(r.photo),
         "createdDate":      r.createdDate,
         "modifiedDate":     r.modifiedDate,
     }

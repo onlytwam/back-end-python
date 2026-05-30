@@ -4,8 +4,7 @@ from typing import Optional, List, Dict
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .models import Wishlist
-
-BASE_URL = os.getenv("BASE_URL", "")
+from app.shared.url_helpers import resolve_url
 
 def _enrich(db: Session, w: Wishlist) -> dict:
     image = None
@@ -17,8 +16,7 @@ def _enrich(db: Session, w: Wishlist) -> dict:
     try:
         row = db.execute(text("""
             SELECT p."Name", pv."VariantName", pvd."FinalPrice", pvd."MRPPrice", s."SizeLabel",
-                   (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                           ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
+                   (SELECT pi2."FilePath"
                     FROM twam."ProductImage" pi2
                     WHERE pi2."ProductVariantId" = :vid AND pi2."DeletedInd"=false
                     AND pi2."FilePath" IS NOT NULL LIMIT 1)
@@ -27,12 +25,12 @@ def _enrich(db: Session, w: Wishlist) -> dict:
             LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantId" = :vid
             LEFT JOIN mdm."Size" s ON s."SizeId" = pvd."Size"
             WHERE p."ProductId" = :pid LIMIT 1
-        """), {"pid": w.productId, "vid": w.productVariantId, "base": BASE_URL}).fetchone()
+        """), {"pid": w.productId, "vid": w.productVariantId}).fetchone()
         if row:
             product_name, variant_name = row[0], row[1]
             final_price = float(row[2]) if row[2] else None
             mrp_price = float(row[3]) if row[3] else None
-            size_label, image = row[4], row[5]
+            size_label, image = row[4], resolve_url(row[5])
     except Exception:
         pass
     return {"wishlistId": w.wishlistId, "productId": w.productId, "productVariantId": w.productVariantId,
@@ -148,10 +146,8 @@ def get_all(db, filters, order_ascending, order_property, page_index, page_size)
 
         img = g('imageURL') or g('imageurl') or ''
         hover_img = g('hoverImage') or g('hoverimage') or ''
-        if img and not img.startswith('http'):
-            img = BASE_URL.rstrip('/') + '/' + img.lstrip('/')
-        if hover_img and not hover_img.startswith('http'):
-            hover_img = BASE_URL.rstrip('/') + '/' + hover_img.lstrip('/')
+        img = resolve_url(img) or ''
+        hover_img = resolve_url(hover_img) or ''
 
         results.append({
             'wishlistId':             g('wishlistId'),

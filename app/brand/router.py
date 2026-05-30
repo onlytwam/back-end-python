@@ -29,12 +29,7 @@ router = APIRouter(
 # Helpers
 # ─────────────────────────────────────────────
 
-def _to_url(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    if path.startswith("/") or path.startswith("http"):
-        return path
-    return "/" + path.replace("\\", "/")
+from app.shared.url_helpers import resolve_url as _to_url
 
 
 def _parse_filters(raw: Optional[str]) -> Optional[list[dict]]:
@@ -251,8 +246,7 @@ def upload_brand_image(
     old_url = brand.brandImage or ""
     new_url = upload_image(file, container_key="brands", folder=f"brand_{brand_id}")
 
-    if new_url and new_url.startswith("/uploads/"):
-        new_url = str(request.base_url).rstrip("/") + new_url
+    # Store raw path — resolve_url() handles display at read time
 
     brand.brandImage   = new_url
     brand.modifiedDate = datetime.now(timezone.utc)
