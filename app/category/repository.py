@@ -5,15 +5,7 @@ from sqlalchemy import asc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import Category
-
-
-def _to_url(path):
-    """Resolve a stored image path to an absolute URL path."""
-    if not path:
-        return None
-    if path.startswith("/") or path.startswith("http"):
-        return path
-    return "/" + path.replace("\\", "/")
+from app.shared.url_helpers import resolve_url as _to_url
 
 
 
