@@ -1,0 +1,71 @@
+trigger:
+  branches:
+    include:
+      - testing # ✅ push → build only
+      - main # ✅ merge → build + push + deploy
+
+pr:
+  branches:
+    include:
+      - main # ✅ PR raised → build only, no push/deploy
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: twam-live-secrets
+
+steps:
+  # ✅ Build only — on testing push or PR to main
+  - task: Docker@2
+    displayName: Build only (testing branch and PR validation)
+    condition: or(
+      eq(variables['Build.Reason'], 'PullRequest'),
+      and(
+      eq(variables['Build.SourceBranch'], 'refs/heads/testing'),
+      eq(variables['Build.Reason'], 'IndividualCI')
+      ))
+    inputs:
+      command: build
+      repository: twam-live-backend
+      dockerfile: $(Build.SourcesDirectory)/Dockerfile
+      containerRegistry: twam-live-acr
+      tags: |
+        latest
+        $(Build.BuildId)
+      arguments: "--no-cache"
+
+  # ✅ Build and Push — only on main merge
+  - task: Docker@2
+    displayName: Build and Push to ACR (main merge only)
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    inputs:
+      command: buildAndPush
+      repository: twam-live-backend
+      dockerfile: $(Build.SourcesDirectory)/Dockerfile
+      containerRegistry: twam-live-acr
+      tags: |
+        latest
+        $(Build.BuildId)
+      arguments: "--no-cache"
+
+  # ✅ Deploy to Container Apps — only on main merge
+  - task: AzureCLI@2
+    displayName: Deploy to Container Apps
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+      in(variables['Build.Reason'], 'IndividualCI', 'Manual'))
+    inputs:
+      azureSubscription: twam-live-azure
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az containerapp update \
+          --name twam-live-backend \
+          --resource-group twam-live \
+          --image twamliveregistry2026.azurecr.io/twam-live-backend:$(Build.BuildId) \
+          --revision-suffix build$(Build.BuildId)
