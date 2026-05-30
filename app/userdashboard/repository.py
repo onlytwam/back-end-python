@@ -1,16 +1,14 @@
-import os
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-
-BASE_URL = os.getenv("BASE_URL", "")
+from app.shared.url_helpers import resolve_url
 
 def _get_variant_image(db: Session, product_variant_id: int) -> str:
     try:
         row = db.execute(text(
-            'SELECT CONCAT(:base, "FilePath") FROM twam."ProductImage" '
+            'SELECT "FilePath" FROM twam."ProductImage" '
             'WHERE "ProductVariantId"=:vid AND "DeletedInd"=false AND "FilePath" IS NOT NULL LIMIT 1'
-        ), {"base": BASE_URL, "vid": product_variant_id}).fetchone()
-        return row[0] if row else None
+        ), {"vid": product_variant_id}).fetchone()
+        return resolve_url(row[0]) if row else None
     except Exception:
         return None
 
