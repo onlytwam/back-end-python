@@ -1,0 +1,13 @@
+venv1/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.production
+test.db
+uploads/
+*.zip
+*.md
+.git/
+.gitignore
+seed.py/
