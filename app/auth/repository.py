@@ -927,38 +927,10 @@ def _next_people_id(db: Session) -> Optional[int]:
 
 
 def _normalize_profile_image_url(path: Optional[str]) -> Optional[str]:
-
+    from app.shared.url_helpers import resolve_url
     if not path:
-
         return None
-
-
-
-    normalized = str(path).strip().replace("\\", "/")
-
-    if not normalized:
-
-        return None
-
-
-
-    # Full URL (Azure blob or external) — return as-is
-
-    if normalized.startswith("http://") or normalized.startswith("https://"):
-
-        return normalized
-
-
-
-    # Local relative path — ensure leading slash
-
-    if not normalized.startswith("/"):
-
-        normalized = f"/{normalized}"
-
-
-
-    return normalized
+    return resolve_url(str(path).strip().replace("\\", "/"))
 
 
 

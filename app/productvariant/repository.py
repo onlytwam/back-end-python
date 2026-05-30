@@ -11,6 +11,7 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import ProductVariant, ProductImage
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+from app.shared.url_helpers import resolve_url as _resolve_url
 
 
 
@@ -172,7 +173,7 @@ def get_variant_by_id(db: Session, variant_id: int) -> Optional[dict]:
     for img in result["images"]:
         if img.get("filePath"):
             fp = img.get("filePath") or ""
-            img["fileData"] = fp if fp.startswith("http") else f"{BASE_URL}/{fp.lstrip('/')}"
+            img["fileData"] = _resolve_url(fp)
     return result
 
 
@@ -368,7 +369,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         ), {"pid": prod_id}).fetchall()
 
     images = [
-        r[0] if (r[0] or "").startswith("http") else f"{BASE_URL}/{r[0].lstrip('/')}"
+        _resolve_url(r[0])
         for r in img_rows if r[0]
     ]
 
@@ -599,6 +600,7 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
 
 def _fallback_product_list(db, filters, page_index, page_size, order_property, order_ascending):
     BASE = os.getenv("BASE_URL", "").rstrip("/")
+    from app.shared.url_helpers import resolve_url as _resolve_url_local
 
     def _fv(prop, default=""):
         for f in (filters or []):

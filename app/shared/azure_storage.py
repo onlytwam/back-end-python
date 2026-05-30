@@ -724,13 +724,13 @@ def upload_bytes(
             )
 
 
-            url = f"{AZURE_BASE_URL}/{container_name}/{blob_name}"
+            relative_path = f"{container_name}/{blob_name}"
 
 
-            print(f"[AzureBlob] Uploaded: {url}")
+            print(f"[AzureBlob] Uploaded: {AZURE_BASE_URL}/{relative_path}")
 
 
-            return url
+            return relative_path
 
 
         except HTTPException:
@@ -804,6 +804,21 @@ def delete_image(blob_url: str) -> bool:
 
     # Azure path
 
+
+    # Handle relative path like "products/folder/file.jpg" (new format)
+    if not blob_url.startswith("http://") and not blob_url.startswith("https://") and not blob_url.startswith("/uploads/"):
+        parts = blob_url.lstrip("/").split("/", 1)
+        if len(parts) == 2:
+            try:
+                blob_service = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+                blob_client  = blob_service.get_blob_client(container=parts[0], blob=parts[1])
+                blob_client.delete_blob()
+                print(f"[AzureBlob] Deleted relative: {blob_url}")
+                return True
+            except Exception as exc:
+                print(f"[AzureBlob] Delete failed: {exc}")
+                return False
+        return False
 
     if not blob_url.startswith(AZURE_BASE_URL):
 
@@ -988,13 +1003,13 @@ def _do_upload(
             )
 
 
-            url = f"{AZURE_BASE_URL}/{container_name}/{blob_name}"
+            relative_path = f"{container_name}/{blob_name}"
 
 
-            print(f"[AzureBlob] Uploaded: {url}")
+            print(f"[AzureBlob] Uploaded: {AZURE_BASE_URL}/{relative_path}")
 
 
-            return url
+            return relative_path
 
 
         except HTTPException:
