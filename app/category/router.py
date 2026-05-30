@@ -212,9 +212,7 @@ def upload_category_image(
     old_url = cat.categoryImage or ""
     new_url = upload_image(file, container_key="category", folder=f"category_{category_id}")
 
-    if new_url and new_url.startswith("/uploads/"):
-        new_url = str(request.base_url).rstrip("/") + new_url
-
+    # Store raw path — resolve_url() handles display at read time
     cat.categoryImage = new_url
     cat.modifiedDate  = datetime.now(timezone.utc)
     db.commit()
