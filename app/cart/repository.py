@@ -5,10 +5,9 @@ from sqlalchemy.orm import Session
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 from sqlalchemy import asc, desc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
+from app.shared.url_helpers import resolve_url
 
 from .models import Cart
-
-BASE_URL = os.getenv("BASE_URL", "")
 
 # ── Get Cart List ─────────────────────────────────────────────────────────────
 
@@ -49,8 +48,7 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             c."CreatedDate",
             c."ModifiedDate",
             (
-                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                      ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
+                SELECT pi2."FilePath"
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = c."ProductVariantId"
                   AND pi2."DeletedInd" = false
@@ -172,7 +170,7 @@ def get_cart_list(db: Session, filters, order_ascending, order_property, page_in
             "state":                 r[29],
             "createdDate":           r[30],
             "modifiedDate":          r[31],
-            "image":                 r[32] or "",
+            "image":                 resolve_url(r[32]) or "",
             "categoryIsActive":      bool(r[33]) if r[33] is not None else True,
             "quantity":              r[19],  # processedQuantity = cart quantity
         })

@@ -18,6 +18,7 @@ from app.people.models import People
 from app.auth.models import IdentityUser
 from app.shared.app_settings import get_setting
 from app.state.repository import resolve_state_id
+from app.shared.url_helpers import resolve_url
 
 BASE_URL = os.getenv("BASE_URL", "")
 
@@ -150,8 +151,7 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
 
             p."ProductCode" AS sku,
                 (
-                    SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                      ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
+                    SELECT pi2."FilePath"
                     FROM twam."ProductImage" pi2
                     WHERE (
                         (
@@ -219,7 +219,7 @@ def _get_order_items_with_details(db: Session, order_ids: List[int], include_rev
                     "color":                  r[12],  
                     "isReturnAvailable":      r[13],  
                     "sku":                    r[14],  
-                    "productImage":           r[15] or "", 
+                    "productImage":           resolve_url(r[15]) or "",
                     "rating": 0,
                     "comment": None
                 })
@@ -322,8 +322,7 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
             pvd."CGST",
             pvd."SGST",
             (
-                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
+                SELECT pi2."FilePath"
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = c."ProductVariantId"
                   AND pi2."DeletedInd" = false
@@ -374,7 +373,7 @@ def _get_cart_checkout_items(db: Session, cart_ids: List[int], user_profile_id: 
             "sgstAmount":             round(sgst_unit * quantity, 2),
             "taxAmount":              round((cgst_unit + sgst_unit) * quantity, 2),
             "lineTotal":              round(unit_price * quantity, 2),
-            "productImage":           row[10] or "",
+            "productImage":           resolve_url(row[10]) or "",
         })
     return items
 
@@ -403,8 +402,7 @@ def _get_buynow_checkout_items(db: Session, order_items: list) -> List[dict]:
             pvd."FinalPrice",
             pvd."TaxAmount",
             (
-                SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
+                SELECT pi2."FilePath"
                 FROM twam."ProductImage" pi2
                 WHERE pi2."ProductVariantId" = pvd."ProductVariantId"
                   AND pi2."DeletedInd" = false
@@ -452,7 +450,7 @@ def _get_buynow_checkout_items(db: Session, order_items: list) -> List[dict]:
             "sgstAmount":             round(tax["sgstAmount"] * quantity, 2),
             "taxAmount":              round((tax["cgstAmount"] + tax["sgstAmount"]) * quantity, 2),
             "lineTotal":              round(unit_price * quantity, 2),
-            "productImage":           row[6] or "",
+            "productImage":           resolve_url(row[6]) or "",
         })
     return items
 
@@ -1424,8 +1422,7 @@ def get_return_order_items(db: Session, order_id: int, filters, order_ascending,
         SELECT
             oi."OrderItemId", oi."Quantity", oi."Price",
             p."Name", s."SizeLabel", pv."Color", pv."IsReturnAvailable",
-            (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                ELSE CONCAT('{BASE_URL}/', LTRIM(pi2."FilePath", '/')) END
+            (SELECT pi2."FilePath"
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = oi."ProductVariantId" AND pi2."DeletedInd" = false
              LIMIT 1) AS product_image
@@ -1443,7 +1440,7 @@ def get_return_order_items(db: Session, order_id: int, filters, order_ascending,
         "price": float(r[2]) if r[2] else None,
         "productName": r[3], "size": r[4], "color": r[5],
         "isReturnable": r[6] or False,
-        "productImage": r[7] or "",
+        "productImage": resolve_url(r[7]) or "",
         "returnExpiryDate": return_expiry,
         "isReturnExpired": (now > return_expiry) if return_expiry else None,
     } for r in rows]
