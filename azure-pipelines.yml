@@ -3,7 +3,7 @@ trigger:
     include:
       - develop
       - backend-setup/Vishnu
-      - feature/*                  # ✅ covers ALL feature branches
+      - feature/*
       - backend/v2/Mamatha
       - feature/Eshwar
 
@@ -11,6 +11,12 @@ pr:
   branches:
     include:
       - develop
+
+resources:
+  repositories:
+    - repository: self
+      type: git
+      name: twam-be-python    # ✅ exact repo name — this authorizes PR access
 
 pool:
   vmImage: ubuntu-latest
@@ -20,8 +26,8 @@ variables:
   containerRegistry: 'twamregistry.azurecr.io'
 
 steps:
-  # ❌ Removed checkout: self and resources block
-  # (same as frontend — uses implicit access)
+  - checkout: self
+    persistCredentials: true
 
   - task: Docker@2
     displayName: Build only (feature branch and PR validation)
