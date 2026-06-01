@@ -11,6 +11,8 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import ProductVariant, ProductImage
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+_AZURE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
+BLOB_BASE = f"https://{_AZURE_ACCOUNT}.blob.core.windows.net".rstrip("/")
 from app.shared.url_helpers import resolve_url as _resolve_url
 
 
@@ -599,7 +601,7 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
 
 
 def _fallback_product_list(db, filters, page_index, page_size, order_property, order_ascending):
-    BASE = os.getenv("BASE_URL", "").rstrip("/")
+    BASE = BLOB_BASE
     from app.shared.url_helpers import resolve_url as _resolve_url_local
 
     def _fv(prop, default=""):
@@ -1010,7 +1012,7 @@ def get_new_arrivals(
     last 6 months, ordered newest-first.  Only active/non-deleted variants with
     at least one non-deleted ProductVariantDetail are returned.
     """
-    BASE = os.getenv("BASE_URL", "").rstrip("/")
+    BASE = BLOB_BASE
 
     p_index = max(1, page_index)
     p_size  = max(1, page_size)
