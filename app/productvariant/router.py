@@ -13,6 +13,7 @@ from . import schemas, repository
 from .models import ProductImage, ProductVariant
 from app.products.models import Products
 from app.shared.azure_storage import upload_image, delete_image, AZURE_BASE_URL, CONTAINERS
+from app.shared.url_helpers import resolve_url
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
@@ -179,8 +180,8 @@ def get_variant_images(variant_id: int, db: Session = Depends(get_db)):
             "productId":       img.productId,
             "productVariantId": img.productVariantId,
             "fileName":        img.fileName,
-            "filePath":        img.filePath,   # full Azure URL or /uploads/… path
-            "imageUrl":        img.filePath,   # alias for frontend convenience
+            "filePath":        resolve_url(img.filePath),
+            "imageUrl":        resolve_url(img.filePath),
             "fileType":        img.fileType,
         }
         for img in images
