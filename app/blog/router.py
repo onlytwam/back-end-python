@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 
 from app.shared.azure_storage import upload_image, delete_image
+from app.shared.url_helpers import resolve_url
 
 from database import get_db
 
@@ -90,7 +91,10 @@ def get_all_blogs(
 
         "count": total,
 
-        "list": paged,
+        "list": [
+            {**b.__dict__, "imageUrl": resolve_url(b.imageUrl)}
+            for b in paged
+        ],
 
         "parameters": {
 
@@ -250,7 +254,7 @@ def get_blog_by_id(id: int, db: Session = Depends(get_db)):
 
         raise HTTPException(status_code=404, detail="Blog not found")
 
-    return blog
+    return {**blog.__dict__, "imageUrl": resolve_url(blog.imageUrl)}
 
 
 
