@@ -220,11 +220,7 @@ def _to_response(db: Session, product: Products) -> dict:
             LIMIT 1
             """), {"pid": product.productId}).fetchone()
         if img_row and img_row[0]:
-            fp = img_row[0]
-            if fp.startswith("http"):
-                image_url = fp
-            else:
-                image_url = "http://127.0.0.1:8000/" + fp.lstrip("/")
+                image_url = _image_path_to_url(img_row[0])
     except Exception:
         pass
 
