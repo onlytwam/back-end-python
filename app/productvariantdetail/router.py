@@ -180,11 +180,11 @@ def create_variant_detail(command: schemas.ProductVariantDetailCreate, db: Sessi
         except Exception:
             pass
         err_msg = str(exc)
-        # Extract the most useful part of a PostgreSQL error (detail line)
+        # Show the full error so we can see which column is null
         import re as _re
-        detail = _re.search(r'DETAIL:\s*(.+?)(?:\n|$)', err_msg)
-        if detail:
-            err_msg = detail.group(1).strip()
+        col_match = _re.search(r'null value in column "(.*?)"', err_msg)
+        if col_match:
+            err_msg = f'Column "{col_match.group(1)}" is NOT NULL in DB but ORM sent null — add it to the model'
         raise HTTPException(status_code=500, detail=f"Failed to add size: {err_msg}")
     # ── Audit log ─────────────────────────────────────────────────────────────
     try:
