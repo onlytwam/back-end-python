@@ -390,6 +390,23 @@ def _registration_conflict_message() -> str:
     return "This email or phone number is already registered. Please sign in instead."
 
 
+def _validate_signup_contact(request: RegisterUserRequest) -> None:
+    email = _normalize_identifier(request.EmailId or "")
+    phone = _normalize_identifier(request.PhoneNumber or "")
+
+    if not email:
+        raise HTTPException(status_code=400, detail={"message": "Email is required."})
+    if not phone:
+        raise HTTPException(status_code=400, detail={"message": "Phone number is required."})
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail={"message": "Invalid email address."})
+    if not re.fullmatch(r"\d{10}", phone):
+        raise HTTPException(status_code=400, detail={"message": "10-digit phone number required."})
+
+    request.EmailId = email
+    request.PhoneNumber = phone
+
+
 def _has_duplicate_registration_error(errors: list[dict]) -> bool:
     return any(
         (error or {}).get("code") in {"DuplicatePhoneNumber", "DuplicateEmail"}
@@ -580,29 +597,11 @@ async def token(
 
 @router.post("/signup", status_code=201, summary="Register a new user")
 async def signup(request: RegisterUserRequest, db: Session = Depends(get_db)):
+    _validate_signup_contact(request)
     result = create_identity_user(db, request)
 
     if result["succeeded"]:
         return {"message": "User created successfully.", "userId": result["user_id"]}
-    errors = result.get("errors", [])
-    if _has_duplicate_registration_error(errors):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "already_registered": True,
-                "message": _registration_conflict_message(),
-            },
-        )
-    raise HTTPException(status_code=400, detail={"message": "User creation failed.", "errors": errors})
-
-
-@router.post("/guest-signup", status_code=201, summary="Register a guest/user-role account")
-async def guest_signup(request: RegisterUserRequest, db: Session = Depends(get_db)):
-    request.RoleId = request.RoleId or Roles.USER
-    result = create_identity_user(db, request)
-
-    if result["succeeded"]:
-        return {"Succeeded": True, "message": "User created successfully.", "userId": result["user_id"]}
     errors = result.get("errors", [])
     if _has_duplicate_registration_error(errors):
         raise HTTPException(
@@ -897,55 +896,6 @@ async def me(current_user: CurrentUser = Depends(get_current_user)):
     return current_user
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SEND OTP — POST /auth/send-otp  (guest checkout)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.post("/send-otp", summary="Send OTP to email/sms for guest checkout or verification")
-async def send_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier = _normalize_identifier(
-        payload.get("identifier") or payload.get("email") or payload.get("phone")
-    )
-    channel = _normalize_identifier(payload.get("channel") or "")
-    purpose = payload.get("purpose", "guest_checkout")
-
-    if not identifier:
-        raise HTTPException(status_code=400, detail="Identifier is required.")
-
-    registered_user = _get_identity_user_by_username(db, identifier)
-    if registered_user and not registered_user.DeletedInd and registered_user.IsActive:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "already_registered": True,
-                "message": _registration_conflict_message(),
-            },
-        )
-
-    otp = _gen_otp()
-    if _is_email_identifier(identifier):
-        channel = "email"
-    elif channel.lower() not in {"whatsapp", "sms"}:
-        channel = "whatsapp"
-
-    extra_email = _normalize_identifier(payload.get("email") or "")
-    extra_phone = _normalize_identifier(payload.get("phone") or "")
-    for value in _unique_identifiers(identifier, extra_email, extra_phone):
-        _db_otp_store(db, value, otp, purpose)
-
-    sent = False
-    if _is_email_identifier(identifier):
-        sent = _send_email_otp(db, identifier, otp, full_name=identifier.split("@")[0])
-    else:
-        sent = _send_phone_otp(db, identifier, otp, channel)
-
-    return {
-        "success": True,
-        "message": "OTP sent. Please check your email or phone.",
-        "channel": channel,
-        "sent":    sent,
-    }
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORGOT PASSWORD — 3-step OTP flow
@@ -1074,118 +1024,6 @@ async def forgot_password_verify_otp(payload: dict, db: Session = Depends(get_db
 
     return {"success": True, "message": "Password has been reset successfully. You can now sign in."}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VERIFY OTP — POST /auth/verify-otp  (guest checkout)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.post("/verify-otp", summary="Verify OTP and create guest account")
-async def verify_otp(payload: dict, db: Session = Depends(get_db)):
-    identifier = _normalize_identifier(
-        payload.get("identifier") or payload.get("email") or payload.get("phone")
-    )
-    otp     = (payload.get("otp") or "").strip()
-    purpose = payload.get("purpose", "guest_checkout")
-
-    if not identifier or not otp:
-        raise HTTPException(status_code=400, detail="Identifier and OTP are required.")
-
-    stored = _db_otp_get(db, identifier, purpose="guest_checkout")
-    if not stored:
-        user = _get_identity_user_by_username(db, identifier)
-        if user:
-            for alt_identifier in _unique_identifiers(identifier, user.Email, user.PhoneNumber):
-                stored = _db_otp_get(db, alt_identifier, purpose="guest_checkout")
-                if stored:
-                    identifier = alt_identifier
-                    break
-    if not stored:
-        raise HTTPException(status_code=400, detail="No OTP found. Please request a new one.")
-    if stored["otp"] != otp:
-        raise HTTPException(status_code=400, detail="Invalid OTP.")
-
-    expires_at = stored["expires_at"]
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) > expires_at:
-        user = _get_identity_user_by_username(db, identifier)
-        for alt_identifier in _unique_identifiers(
-            identifier,
-            user.Email        if user else None,
-            user.PhoneNumber  if user else None,
-            payload.get("email"),
-            payload.get("phone"),
-        ):
-            _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
-        raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
-
-    if purpose == "guest_checkout":
-        existing          = _get_identity_user_by_username(db, identifier)
-        DEFAULT_PASSWORD  = "twam@1234"
-
-        if not existing:
-            from app.auth.schemas import RegisterUserRequest as RUR
-            first_name    = payload.get("firstName") or (
-                identifier.split("@")[0] if _is_email_identifier(identifier) else identifier
-            )
-            account_email = _normalize_identifier(payload.get("email") or "")
-            account_phone = _normalize_identifier(payload.get("phone") or "")
-            if _is_email_identifier(identifier):
-                account_email = identifier
-            elif not account_phone:
-                account_phone = identifier
-
-            reg = RUR(
-                FirstName         = first_name,
-                LastName          = payload.get("lastName") or "",
-                EmailId           = account_email or None,
-                Password          = DEFAULT_PASSWORD,
-                TemporaryPassword = DEFAULT_PASSWORD,
-                PhoneNumber       = account_phone or None,
-                IsActive          = True,
-                RoleId            = Roles.USER,
-            )
-            result = create_identity_user(db, reg)
-            if not result["succeeded"]:
-                raise HTTPException(status_code=500, detail="Account creation failed.")
-        else:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "already_registered": True,
-                    "message": _registration_conflict_message(),
-                },
-            )
-
-        user         = _get_identity_user_by_username(db, identifier)
-        claims       = build_token_claims(db, user)
-        access_token = create_access_token(claims)
-        for alt_identifier in _unique_identifiers(
-            identifier,
-            user.Email, user.PhoneNumber,
-            payload.get("email"), payload.get("phone"),
-        ):
-            _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
-
-        return {
-            "success":      True,
-            "access_token": access_token,
-            "token_type":   "Bearer",
-            "is_new_user":  not existing,
-            "message":      "Account verified successfully.",
-        }
-
-    user = _get_identity_user_by_username(db, identifier)
-    for alt_identifier in _unique_identifiers(
-        identifier,
-        user.Email        if user else None,
-        user.PhoneNumber  if user else None,
-        payload.get("email"),
-        payload.get("phone"),
-    ):
-        _db_otp_delete(db, alt_identifier, purpose="guest_checkout")
-
-    return {"success": True, "message": "OTP verified."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

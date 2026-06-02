@@ -22,6 +22,7 @@ Update them with a single DB row — no code change or redeploy needed.
 
 import os
 import random
+import re
 import string
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -64,6 +65,27 @@ _otp_store: dict[str, dict] = {}
 
 OTP_TTL_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
+
+
+def _normalize_identifier(identifier: str) -> str:
+    return (identifier or "").strip()
+
+
+def _validate_signup_contact(request: RegisterUserRequest) -> None:
+    email = _normalize_identifier(request.EmailId or "")
+    phone = _normalize_identifier(request.PhoneNumber or "")
+
+    if not email:
+        raise HTTPException(status_code=400, detail={"message": "Email is required."})
+    if not phone:
+        raise HTTPException(status_code=400, detail={"message": "Phone number is required."})
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=400, detail={"message": "Invalid email address."})
+    if not re.fullmatch(r"\d{10}", phone):
+        raise HTTPException(status_code=400, detail={"message": "10-digit phone number required."})
+
+    request.EmailId = email
+    request.PhoneNumber = phone
 
 
 # ── OAuth2 client validation (reads from AppSettings, not hardcoded) ──────────
@@ -224,6 +246,7 @@ async def oidc_discovery(request: Request):
 
 @router.post("/api/register/signup", status_code=201)
 async def register_signup(request: RegisterUserRequest, db: Session = Depends(get_db)):
+    _validate_signup_contact(request)
     result = create_identity_user(db, request)
     if result["succeeded"]:
         return {"message": "User created successfully.", "userId": result["user_id"]}
