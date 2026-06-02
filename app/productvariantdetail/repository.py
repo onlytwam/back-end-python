@@ -160,6 +160,15 @@ def create_variant_detail(db: Session, data) -> int:
     # Auto-compute CGST/SGST/TaxAmount from the parent product's TaxHSNCode + price slab.
     tax_info = _auto_compute_tax(db, data.productId, final_price)
 
+    # ── Satisfy chk_store_xor_warehouse DB CHECK constraint ─────────────────
+    # The DB requires exactly one of StoreId / WarehouseId to be non-null.
+    # Both are optional in the API; when neither is supplied we default to
+    # warehouseId=1 (the primary warehouse) so the constraint is satisfied.
+    _store_id     = getattr(data, "storeId",     None)
+    _warehouse_id = getattr(data, "warehouseId", None)
+    if _store_id is None and _warehouse_id is None:
+        _warehouse_id = 1  # default warehouse — satisfies chk_store_xor_warehouse
+
     pvd = ProductVariantDetail(
         productId         = data.productId,
         productVariantId  = data.productVariantId,
@@ -177,6 +186,8 @@ def create_variant_detail(db: Session, data) -> int:
         userProfileId     = data.userProfileId,
         state             = data.state,
         cupSizeId         = data.cupSizeId,
+        storeId           = _store_id,
+        warehouseId       = _warehouse_id,
         stockId           = data.stockId,
         isLowStock        = 0 < total_qty <= 3,
         isOutOfStock      = total_qty <= 0,
