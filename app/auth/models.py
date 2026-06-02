@@ -84,7 +84,7 @@ class OtpStore(Base):
     Identifier     = Column("Identifier",     String(255),             nullable=False, index=True)
     IdentifierType = Column("IdentifierType", String(10),              nullable=False)
     Otp            = Column("Otp",            String(10),              nullable=False)
-    Purpose        = Column("Purpose",        String(50),              nullable=False, default="guest_checkout")
+    Purpose        = Column("Purpose",        String(50),              nullable=False, default="login")
     UserId         = Column("UserId",         String(255),             nullable=True)
     ExpiresAt      = Column("ExpiresAt",      DateTime(timezone=True), nullable=False)
     CreatedAt      = Column("CreatedAt",      DateTime(timezone=True), server_default=func.now())
