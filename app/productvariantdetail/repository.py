@@ -184,9 +184,13 @@ def create_variant_detail(db: Session, data) -> int:
         createdDate       = datetime.now(timezone.utc),
         deletedInd        = False,
     )
-    db.add(pvd)
-    db.commit()
-    db.refresh(pvd)
+    try:
+        db.add(pvd)
+        db.commit()
+        db.refresh(pvd)
+    except Exception as exc:
+        db.rollback()
+        raise exc  # re-raise so router returns HTTP 500 with the real DB error message
 
     # ── Snapshot the ID immediately after the first successful commit ──────────
     # This must happen BEFORE any subsequent try/except blocks that may rollback,
