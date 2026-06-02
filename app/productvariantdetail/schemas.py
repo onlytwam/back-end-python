@@ -23,6 +23,10 @@ class ProductVariantDetailCreate(BaseModel):
     userProfileId:      Optional[str]   = None
     state:              Optional[str]   = None
     cupSizeId:          Optional[int]   = None   # stored in DB column "CupSize"
+    # storeId/warehouseId optional; repository defaults warehouseId when both are None
+    # to satisfy DB CHECK constraint chk_store_xor_warehouse.
+    storeId:            Optional[int]   = None
+    warehouseId:        Optional[int]   = None
     stockId:            Optional[str]   = None
     isLowStock:         Optional[bool]  = None
     isOutOfStock:       Optional[bool]  = None
