@@ -36,5 +36,5 @@ class ProductVariantDetail(Base):
     modifiedBy             = Column("ModifiedBy",             String,     nullable=True)
     createdDate            = Column("CreatedDate",            DateTime(timezone=True), server_default=func.now())
     modifiedDate           = Column("ModifiedDate",           DateTime(timezone=True), onupdate=func.now(), nullable=True)
-    isActive               = Column("IsActive",               Boolean,    default=True)
-    deletedInd             = Column("DeletedInd",             Boolean,    default=False)
+    isActive               = Column("IsActive",               Boolean,    default=True,  server_default="true")
+    deletedInd             = Column("DeletedInd",             Boolean,    default=False, server_default="false")

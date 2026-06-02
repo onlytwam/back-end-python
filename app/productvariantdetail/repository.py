@@ -182,6 +182,7 @@ def create_variant_detail(db: Session, data) -> int:
         isOutOfStock      = total_qty <= 0,
         createdBy         = data.createdBy,
         createdDate       = datetime.now(timezone.utc),
+        isActive          = True,
         deletedInd        = False,
     )
     try:
