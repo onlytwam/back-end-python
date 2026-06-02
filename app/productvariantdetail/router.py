@@ -171,7 +171,21 @@ def get_variant_details(
 @router.post("/", status_code=201, dependencies=[Depends(get_current_user)], include_in_schema=False)
 @router.post("", status_code=201, dependencies=[Depends(get_current_user)])
 def create_variant_detail(command: schemas.ProductVariantDetailCreate, db: Session = Depends(get_db)):
-    new_id = repository.create_variant_detail(db, command)
+    try:
+        new_id = repository.create_variant_detail(db, command)
+    except Exception as exc:
+        # Roll back any partial transaction and surface the real DB error message
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        err_msg = str(exc)
+        # Extract the most useful part of a PostgreSQL error (detail line)
+        import re as _re
+        detail = _re.search(r'DETAIL:\s*(.+?)(?:\n|$)', err_msg)
+        if detail:
+            err_msg = detail.group(1).strip()
+        raise HTTPException(status_code=500, detail=f"Failed to add size: {err_msg}")
     # ── Audit log ─────────────────────────────────────────────────────────────
     try:
         from app.stocklog.repository import add_audit_event as add_event
