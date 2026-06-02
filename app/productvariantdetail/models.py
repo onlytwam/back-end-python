@@ -30,6 +30,12 @@ class ProductVariantDetail(Base):
     stockId                = Column("StockId",                String,     nullable=True)
     # FK to mdm.CupSize.CupSizeId — stored as "CupSize" column
     cupSizeId              = Column("CupSize",                BigInteger, nullable=True)
+    # StoreId / WarehouseId: DB has a CHECK constraint chk_store_xor_warehouse
+    # that requires exactly one of these to be non-null. Both are exposed as
+    # optional here; the repository supplies a default warehouseId when neither
+    # is provided by the caller so the constraint is always satisfied.
+    storeId                = Column("StoreId",                BigInteger, nullable=True)
+    warehouseId            = Column("WarehouseId",            BigInteger, nullable=True)
     isLowStock             = Column("IsLowStock",             Boolean,    nullable=True)
     isOutOfStock           = Column("IsOutOfStock",           Boolean,    nullable=True)
     createdBy              = Column("CreatedBy",              String,     nullable=True)
