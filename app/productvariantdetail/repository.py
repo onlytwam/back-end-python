@@ -195,7 +195,9 @@ def create_variant_detail(db: Session, data) -> int:
         )
         db.commit()
     except Exception:
-        pass
+        db.rollback()  # MUST rollback — PostgreSQL aborts the txn on any error,
+                       # leaving the session in InFailedSqlTransaction state which
+                       # causes all subsequent db calls in this session to also fail.
 
     # Snapshot the ID now while pvd is in a valid session state
     pvd_id_to_return = pvd.productVariantDetailId
@@ -295,7 +297,7 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         )
         db.commit()
     except Exception:
-        pass
+        db.rollback()  # Rollback aborted txn so subsequent StockLog inserts succeed
 
     # ── Auto-create StockLog entries for any changed stock fields ────────────
     # changedBy = "ProductDetail" so these are distinguishable in the stock log.
