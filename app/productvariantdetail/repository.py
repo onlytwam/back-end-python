@@ -160,6 +160,15 @@ def create_variant_detail(db: Session, data) -> int:
     # Auto-compute CGST/SGST/TaxAmount from the parent product's TaxHSNCode + price slab.
     tax_info = _auto_compute_tax(db, data.productId, final_price)
 
+    # ── Satisfy chk_store_xor_warehouse DB CHECK constraint ─────────────────
+    # The DB requires exactly one of StoreId / WarehouseId to be non-null.
+    # Both are optional in the API; when neither is supplied we default to
+    # warehouseId=1 (the primary warehouse) so the constraint is satisfied.
+    _store_id     = getattr(data, "storeId",     None)
+    _warehouse_id = getattr(data, "warehouseId", None)
+    if _store_id is None and _warehouse_id is None:
+        _warehouse_id = 1  # default warehouse — satisfies chk_store_xor_warehouse
+
     pvd = ProductVariantDetail(
         productId         = data.productId,
         productVariantId  = data.productVariantId,
@@ -177,45 +186,65 @@ def create_variant_detail(db: Session, data) -> int:
         userProfileId     = data.userProfileId,
         state             = data.state,
         cupSizeId         = data.cupSizeId,
+        storeId           = _store_id,
+        warehouseId       = _warehouse_id,
         stockId           = data.stockId,
         isLowStock        = 0 < total_qty <= 3,
         isOutOfStock      = total_qty <= 0,
         createdBy         = data.createdBy,
         createdDate       = datetime.now(timezone.utc),
+        isActive          = True,
         deletedInd        = False,
     )
-    db.add(pvd)
-    db.commit()
-    db.refresh(pvd)
+    try:
+        db.add(pvd)
+        db.commit()
+        db.refresh(pvd)
+    except Exception as exc:
+        db.rollback()
+        raise exc  # re-raise so router returns HTTP 500 with the real DB error message
 
+    # ── Snapshot the ID immediately after the first successful commit ──────────
+    # This must happen BEFORE any subsequent try/except blocks that may rollback,
+    # because a rollback expires all ORM object attributes (pvd becomes detached).
+    pvd_id_to_return = pvd.productVariantDetailId
+    pvd_product_id = pvd.productId
+    pvd_variant_id = pvd.productVariantId
+    pvd_stock_id   = pvd.stockId
+    pvd_stock_qty  = pvd.stockQuantity or 0
+    pvd_processed  = pvd.processedQuantity or 0
+    pvd_returned   = pvd.returnedQuantity or 0
+    pvd_available  = pvd.availableQuantity or 0
+    pvd_created_by = getattr(data, "createdBy", None) or "system"
+
+    # ── Optional: call AutoCreateProductAudit SP (non-fatal if missing) ───────
     try:
         db.execute(
             text("SELECT twam.\"AutoCreateProductAudit\"(:ref_id, :profile)"),
-            {"ref_id": pvd.productVariantDetailId, "profile": "ProductVariantDetail"}
+            {"ref_id": pvd_id_to_return, "profile": "ProductVariantDetail"}
         )
         db.commit()
     except Exception:
-        pass
-
-    # Snapshot the ID now while pvd is in a valid session state
-    pvd_id_to_return = pvd.productVariantDetailId
+        db.rollback()  # MUST rollback — PostgreSQL aborts the txn on any error,
+                       # leaving the session in InFailedSqlTransaction state which
+                       # causes all subsequent db calls in this session to also fail.
 
     # ── Auto-create initial StockLog entry (system-only, not shown in history UI) ──
     try:
         log_entry = StockLog(
             productVariantDetailId = pvd_id_to_return,
-            productId              = pvd.productId,
-            productVariantId       = pvd.productVariantId,
-            stockId                = pvd.stockId,
+            productId              = pvd_product_id,
+            productVariantId       = pvd_variant_id,
+            stockId                = pvd_stock_id,
             changeType             = "INITIAL_STOCK",
             previousValue          = None,
-            newValue               = pvd.stockQuantity or 0,
-            totalStock             = pvd.stockQuantity or 0,
-            processedQuantity      = pvd.processedQuantity or 0,
-            returnedQuantity       = pvd.returnedQuantity or 0,
-            availableQuantity      = pvd.availableQuantity or 0,
+            newValue               = pvd_stock_qty,
+            totalStock             = pvd_stock_qty,
+            processedQuantity      = pvd_processed,
+            returnedQuantity       = pvd_returned,
+            availableQuantity      = pvd_available,
             note                   = "Created with product variant detail",
-            changedBy              = getattr(data, "createdBy", None) or "system",
+            changedBy              = pvd_created_by,
         )
         db.add(log_entry)
         db.commit()
@@ -295,7 +324,7 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         )
         db.commit()
     except Exception:
-        pass
+        db.rollback()  # Rollback aborted txn so subsequent StockLog inserts succeed
 
     # ── Auto-create StockLog entries for any changed stock fields ────────────
     # changedBy = "ProductDetail" so these are distinguishable in the stock log.
