@@ -4,6 +4,7 @@ from sqlalchemy import asc, desc
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 from .models import People
 from app.userrole.models import UserRole
+from app.shared.url_helpers import resolve_url
 
 def _get_role(db: Session, role_id):
     if not role_id:
@@ -28,7 +29,7 @@ def _to_response(db: Session, p: People) -> dict:
         "lastName": p.lastName,
         "emailId": p.emailId,
         "phoneNumber": p.phoneNumber,
-        "profileImageUrl": p.profileImageUrl,
+        "profileImageUrl": resolve_url(p.profileImageUrl),
         "userProfileId": p.userProfileId,
         "isActive": p.isActive,
         "roleId": p.roleId,

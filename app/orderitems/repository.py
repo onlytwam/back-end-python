@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from app.shared.url_helpers import resolve_url
 from typing import Optional
 
 from .schemas import (
@@ -124,7 +125,12 @@ def get_order_items_grid(db: Session, grid: GridParameters) -> OrderItemGrid:
     params["offset"] = offset
 
     rows  = db.execute(text(data_sql), params).mappings().all()
-    items = [OrderItemResponse(**dict(row)) for row in rows]
+    items = []
+    for row in rows:
+        d = dict(row)
+        if d.get("Image"):
+            d["Image"] = resolve_url(d["Image"]) or d["Image"]
+        items.append(OrderItemResponse(**d))
 
     return OrderItemGrid(total=total, page=page_number, page_size=page_size, items=items)
 
@@ -132,7 +138,12 @@ def get_order_items_grid(db: Session, grid: GridParameters) -> OrderItemGrid:
 def get_order_item_by_id(db: Session, order_item_id: int) -> Optional[OrderItemResponse]:
     sql = f'{BASE_SELECT} WHERE oi."DeletedInd" = false AND oi."OrderItemId" = :order_item_id LIMIT 1'
     row = db.execute(text(sql), {"order_item_id": order_item_id}).mappings().first()
-    return OrderItemResponse(**dict(row)) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("Image"):
+        d["Image"] = resolve_url(d["Image"]) or d["Image"]
+    return OrderItemResponse(**d)
 
 
 def create_order_item(db: Session, payload: OrderItemCreate) -> OrderItemResponse:

@@ -267,7 +267,7 @@ def get_stock_summary(db: Session, page: int = 1, size: int = 50, search: str = 
                 "productId":   r[0],
                 "productCode": r[1],
                 "name":        r[2],
-                "image":       r[3],
+                "image":       resolve_url(r[3]) or "",
             }
             for r in rows
         ],
@@ -306,7 +306,7 @@ def get_variants_for_product(db: Session, product_id: int) -> list:
             "color":            r[3],
             "isCupSize":        r[4],
             "isActive":         r[5],
-            "image":            r[6],
+            "image":            resolve_url(r[6]) or "",
         }
         for r in rows
     ]
@@ -405,6 +405,7 @@ def get_pvds_for_variant(db: Session, variant_id: int) -> list:
 # ─── ProductAuditLog helpers (folded into stocklog — no new module needed) ────
 
 from .models import ProductAuditLog as _PAL
+from app.shared.url_helpers import resolve_url
 
 def _fmt_size(band: str, cup: str) -> str:
     """Combine band and cup size into a single display string like '32B'.
@@ -1020,7 +1021,7 @@ def get_product_directory(db: Session, page: int = 1, size: int = 50, search: st
             "productId":     pid,
             "productName":   name,
             "productCode":   code,
-            "image":         image,
+            "image":         resolve_url(image) or "",
             "createdDate":   created_date.isoformat() if created_date else None,
             "createdBy":     created_by,
             "createdByRole": role_map.get(created_by or "", ""),
