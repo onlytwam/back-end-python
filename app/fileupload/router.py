@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 from database import get_db
 from . import schemas, repository
 from app.auth.dependencies import get_current_user, CurrentUser
-from app.shared.azure_storage import upload_file
+from app.shared.azure_storage import upload_file
+from app.shared.url_helpers import resolve_url
 
 router = APIRouter(
     dependencies=[Depends(get_current_user)],
@@ -76,8 +77,10 @@ async def upload(
         created_by=getattr(current_user, "user_id", None),
     )
 
-    return {
+    resolved_url = resolve_url(file_url) or ""
+
+    return {
         "fileUploadId": record_id,
-        "url":          file_url,   # ← primary key the frontend reads
-        "fileUrl":      file_url,   # ← alias for back-compat
+        "url":          resolved_url,   # ← primary key the frontend reads
+        "fileUrl":      resolved_url,   # ← alias for back-compat
     }

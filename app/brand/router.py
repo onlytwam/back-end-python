@@ -256,7 +256,7 @@ def upload_brand_image(
         delete_image(old_url)
 
     logger.info("Brand %s image updated → %s", brand_id, new_url)
-    return {"success": True, "brandId": brand_id, "imageUrl": new_url}
+    return {"success": True, "brandId": brand_id, "imageUrl": _to_url(new_url)}
 
 
 @router.delete(
