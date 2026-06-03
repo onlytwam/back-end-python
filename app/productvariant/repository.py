@@ -629,7 +629,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         # b is LEFT JOINed so products with no brand (BrandId IS NULL) are always shown.
         "(p.\"BrandId\" IS NULL OR (b.\"isActive\" = true AND b.\"deletedInd\" = false))",
     ]
-    params: dict = {"base": BASE}
+    params: dict = {}
 
     # ── State ──────────────────────────────────────────────────────────────────
     state = _fv("State", "")
