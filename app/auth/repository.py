@@ -75,6 +75,7 @@ MAX_PROFILE_IMAGE_BYTES = 5 * 1024 * 1024
 # Azure storage helper (imported here; auto-falls-back to local when Azure not configured)
 
 from app.shared.azure_storage import upload_bytes, delete_image as _azure_delete_image, _is_azure_mode
+from app.shared.url_helpers import resolve_url, storage_path_for_db
 
 ALLOWED_PROFILE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -927,10 +928,15 @@ def _next_people_id(db: Session) -> Optional[int]:
 
 
 def _normalize_profile_image_url(path: Optional[str]) -> Optional[str]:
-    from app.shared.url_helpers import resolve_url
     if not path:
         return None
     return resolve_url(str(path).strip().replace("\\", "/"))
+
+
+def _profile_image_path_for_db(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return storage_path_for_db(str(path).strip().replace("\\", "/"))
 
 
 
@@ -1316,7 +1322,7 @@ def update_identity_user_profile(
 
 
 
-    existing_image = _normalize_profile_image_url(user.ProfileImageUrl)
+    existing_image = _profile_image_path_for_db(user.ProfileImageUrl)
 
     incoming_profile_image_value = request.ProfileImageUrl
 
@@ -1366,7 +1372,7 @@ def update_identity_user_profile(
 
         else:
 
-            requested_profile_image = _normalize_profile_image_url(incoming_profile_image_value)
+            requested_profile_image = _profile_image_path_for_db(incoming_profile_image_value)
 
             image_will_change = image_will_change or requested_profile_image != existing_image
 
@@ -1454,7 +1460,7 @@ def update_identity_user_profile(
 
             else:
 
-                next_profile_image = _normalize_profile_image_url(incoming_profile_image_value)
+                next_profile_image = _profile_image_path_for_db(incoming_profile_image_value)
 
 
 
@@ -1616,13 +1622,13 @@ def update_identity_user_profile(
 
         "dateOfBirth": next_dob.isoformat() if next_dob else None,
 
-        "profileImageUrl": next_profile_image,
+        "profileImageUrl": _normalize_profile_image_url(next_profile_image),
 
     }
 
     if original_profile_image_path:
 
-        response["profileImageOriginalUrl"] = original_profile_image_path
+        response["profileImageOriginalUrl"] = _normalize_profile_image_url(original_profile_image_path)
 
 
 
@@ -1744,7 +1750,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
 
             DateOfBirth=_parse_dob(request.DateOfBirth),
 
-            ProfileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
+            ProfileImageUrl=_profile_image_path_for_db(request.ProfileImageUrl),
 
             IsActive=True,
 
@@ -1796,7 +1802,7 @@ def create_identity_user(db: Session, request: RegisterUserRequest) -> dict:
 
                     phoneNumber=request.PhoneNumber or None,
 
-                    profileImageUrl=_normalize_profile_image_url(request.ProfileImageUrl),
+                    profileImageUrl=_profile_image_path_for_db(request.ProfileImageUrl),
 
                     userProfileId=new_user.Id,
 

@@ -264,7 +264,8 @@ def upload_variant_images(
         "images": [
             {
                 "productImageId": img.productImageId,
-                "filePath":       img.filePath,
+                "filePath":       resolve_url(img.filePath),
+                "imageUrl":       resolve_url(img.filePath),
             }
             for img in saved_images
         ],
