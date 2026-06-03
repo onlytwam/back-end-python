@@ -5,7 +5,7 @@ from sqlalchemy import asc, text
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
 
 from .models import Category
-from app.shared.url_helpers import resolve_url as _to_url
+from app.shared.url_helpers import resolve_url as _to_url, storage_path_for_db
 
 
 
@@ -108,7 +108,7 @@ def get_category_by_id(db: Session, category_id: int) -> Optional[dict]:
         "parentCategoryId": cat.parentCategoryId,
         "groupCategoryId":  cat.groupCategoryId,
         "isActive":         cat.isActive,
-        "categoryImage":    cat.categoryImage,
+        "categoryImage":    _to_url(cat.categoryImage),
         "createdDate":      cat.createdDate,
         "modifiedDate":     cat.modifiedDate,
     }
@@ -126,7 +126,7 @@ def create_category(db: Session, data) -> int:
         parentCategoryId = data.parentCategoryId,
         groupCategoryId  = data.groupCategoryId if data.groupCategoryId is not None else auto_group,
         isActive         = data.isActive if data.isActive is not None else True,
-        categoryImage    = data.categoryImage,
+        categoryImage    = storage_path_for_db(data.categoryImage),
         createdDate      = datetime.now(timezone.utc),
         deletedInd       = False,
     )
@@ -152,7 +152,7 @@ def update_category(db: Session, category_id: int, data) -> Optional[int]:
     cat.parentCategoryId = data.parentCategoryId
     cat.isActive         = data.isActive if data.isActive is not None else True
     if data.categoryImage is not None:
-        cat.categoryImage = data.categoryImage
+        cat.categoryImage = storage_path_for_db(data.categoryImage)
     cat.modifiedDate     = datetime.now(timezone.utc)
 
     if data.groupCategoryId is not None:
@@ -301,7 +301,7 @@ def get_category_menu(db: Session) -> dict:
                 "name":             child.name,
                 "url":              child.url,
                 "about":            child.about,
-                "categoryImage":    child.categoryImage,
+                "categoryImage":    _to_url(child.categoryImage),
                 "parentCategoryId": child.parentCategoryId,
                 "groupCategoryId":  child.groupCategoryId,
                 "children":         _build(child.categoryId),

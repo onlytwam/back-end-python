@@ -1,4 +1,3 @@
-import os
 import base64
 import json
 from datetime import datetime, timezone
@@ -7,15 +6,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc, text
 from app.productvariantdetail.models import ProductVariantDetail
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
+from app.shared.url_helpers import resolve_url as _resolve_url, storage_path_for_db
 
 from .models import ProductVariant, ProductImage
     
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-_AZURE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
-BLOB_BASE = f"https://{_AZURE_ACCOUNT}.blob.core.windows.net".rstrip("/")
-from app.shared.url_helpers import resolve_url as _resolve_url
-
-
 
 # def _get_images(db: Session, product_variant_id: int) -> list:
 #     rows = db.execute(
@@ -211,7 +205,7 @@ def create_variant(db: Session, data, images: Optional[list] = None) -> int:
                 productVariantId = variant_id,
                 fileName         = img.get("fileName"),
                 fileType         = img.get("fileType"),
-                filePath         = img.get("filePath"),
+                filePath         = storage_path_for_db(img.get("filePath")),
                 createdDate      = datetime.now(timezone.utc),
                 deletedInd       = False,
             ))
@@ -265,7 +259,7 @@ def update_variant(db: Session, variant_id: int, data, images: Optional[list] = 
                 productVariantId = variant_id,
                 fileName         = img.get("fileName"),
                 fileType         = img.get("fileType"),
-                filePath         = img.get("filePath"),
+                filePath         = storage_path_for_db(img.get("filePath")),
                 createdDate      = datetime.now(timezone.utc),
                 deletedInd       = False,
             ))
@@ -476,8 +470,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     color_rows = db.execute(text("""
         SELECT pv2."ProductVariantId", pv2."Color", pv2."ColorFamilyId",
             pc."ColorFamilyName", pc."HexCode",
-            (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
+            (SELECT pi2."FilePath"
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = pv2."ProductVariantId"
                AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
@@ -510,7 +503,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
         ORDER BY
           COALESCE(best_pvd."FinalPrice", best_pvd."MRPPrice") ASC NULLS LAST,
           pv2."ProductVariantId" ASC
-    """), {"pid": prod_id, "base": BASE_URL}).fetchall()
+    """), {"pid": prod_id}).fetchall()
 
     return {
         "productId":          prod_id,
@@ -556,7 +549,7 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             "colorFamily": cr[3],
             "colorFamilyHex": cr[4],
             "colorHex": cr[4],
-            "image": cr[5],
+            "image": _resolve_url(cr[5]),
             "minFinalPrice": float(cr[6]) if cr[6] is not None else None,
             "minMrpPrice": float(cr[7]) if cr[7] is not None else None,
             "minProductVariantDetailId": cr[8],
@@ -601,9 +594,6 @@ def _get_descendant_category_ids(db, root_id: str) -> list:
 
 
 def _fallback_product_list(db, filters, page_index, page_size, order_property, order_ascending):
-    BASE = BLOB_BASE
-    from app.shared.url_helpers import resolve_url as _resolve_url_local
-
     def _fv(prop, default=""):
         for f in (filters or []):
             if f.get("property") == prop:
@@ -639,7 +629,7 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
         # b is LEFT JOINed so products with no brand (BrandId IS NULL) are always shown.
         "(p.\"BrandId\" IS NULL OR (b.\"isActive\" = true AND b.\"deletedInd\" = false))",
     ]
-    params: dict = {"base": BASE}
+    params: dict = {}
 
     # ── State ──────────────────────────────────────────────────────────────────
     state = _fv("State", "")
@@ -881,16 +871,14 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
                 0                                                       AS reserved_col,
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS price,
                 pvd."MRPPrice"                                          AS old_price,
-                (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
+                (SELECT pi2."FilePath"
                  FROM twam."ProductImage" pi2
                  WHERE pi2."ProductVariantId" = pv."ProductVariantId"
                    AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
                    AND pi2."FilePath" IS NOT NULL
                  ORDER BY pi2."ProductImageId" LIMIT 1)                 AS image,
                 (SELECT ARRAY_AGG(
-                       CASE WHEN pi3."FilePath" LIKE 'http%' THEN pi3."FilePath"
-                            ELSE CONCAT(:base, '/', LTRIM(pi3."FilePath", '/')) END
+                       pi3."FilePath"
                        ORDER BY pi3."ProductImageId")
                  FROM twam."ProductImage" pi3
                  WHERE pi3."ProductVariantId" = pv."ProductVariantId"
@@ -986,8 +974,12 @@ def _fallback_product_list(db, filters, page_index, page_size, order_property, o
             "totalCount":        total,
             "price":             _f(m["price"]),
             "oldPrice":          _f(m["old_price"]),
-            "image":             m["image"],
-            "images":            list(m["images_arr"]) if m["images_arr"] else ([m["image"]] if m["image"] else []),
+            "image":             _resolve_url(m["image"]),
+            "images":            [
+                _resolve_url(img)
+                for img in (list(m["images_arr"]) if m["images_arr"] else ([m["image"]] if m["image"] else []))
+                if img
+            ],
             "name":              m["name"],
             "description":       m["description"],
             "rating":            _f(m["_sort_rating"]),
@@ -1012,13 +1004,11 @@ def get_new_arrivals(
     last 6 months, ordered newest-first.  Only active/non-deleted variants with
     at least one non-deleted ProductVariantDetail are returned.
     """
-    BASE = BLOB_BASE
-
     p_index = max(1, page_index)
     p_size  = max(1, page_size)
     offset  = (p_index - 1) * p_size
 
-    params = {"base": BASE, "lim": p_size, "off": offset}
+    params = {"lim": p_size, "off": offset}
 
     where = """
         (pv."DeletedInd" = false OR pv."DeletedInd" IS NULL)
@@ -1076,16 +1066,14 @@ def get_new_arrivals(
                 0                                                       AS reserved_col,
                 COALESCE(pvd."FinalPrice", pvd."MRPPrice")              AS price,
                 pvd."MRPPrice"                                          AS old_price,
-                (SELECT CASE WHEN pi2."FilePath" LIKE 'http%' THEN pi2."FilePath"
-                      ELSE CONCAT(:base, '/', LTRIM(pi2."FilePath", '/')) END
+                (SELECT pi2."FilePath"
                  FROM twam."ProductImage" pi2
                  WHERE pi2."ProductVariantId" = pv."ProductVariantId"
                    AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
                    AND pi2."FilePath" IS NOT NULL
                  ORDER BY pi2."ProductImageId" LIMIT 1)                 AS image,
                 (SELECT ARRAY_AGG(
-                       CASE WHEN pi3."FilePath" LIKE 'http%' THEN pi3."FilePath"
-                            ELSE CONCAT(:base, '/', LTRIM(pi3."FilePath", '/')) END
+                       pi3."FilePath"
                        ORDER BY pi3."ProductImageId")
                  FROM twam."ProductImage" pi3
                  WHERE pi3."ProductVariantId" = pv."ProductVariantId"
@@ -1178,8 +1166,12 @@ def get_new_arrivals(
             "totalCount":        total,
             "price":             _f(m["price"]),
             "oldPrice":          _f(m["old_price"]),
-            "image":             m["image"],
-            "images":            list(m["images_arr"]) if m["images_arr"] else ([m["image"]] if m["image"] else []),
+            "image":             _resolve_url(m["image"]),
+            "images":            [
+                _resolve_url(img)
+                for img in (list(m["images_arr"]) if m["images_arr"] else ([m["image"]] if m["image"] else []))
+                if img
+            ],
             "name":              m["name"],
             "description":       m["description"],
             "rating":            _f(m["rating"]),

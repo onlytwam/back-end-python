@@ -20,17 +20,27 @@ Usage (in any repository or router):
 """
 
 import os
+from urllib.parse import urlparse
+
+
+def _account_name_from_connection_string(connection_string: str) -> str | None:
+    for part in connection_string.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "accountname" and value.strip():
+            return value.strip()
+    return None
 
 # ── Read once at startup ──────────────────────────────────────────────────────
-_AZURE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
+_CONN_STRING   = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+_AZURE_ACCOUNT = (
+    os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+    or _account_name_from_connection_string(_CONN_STRING)
+    or "twamstorage"
+)
 _AZURE_BASE    = f"https://{_AZURE_ACCOUNT}.blob.core.windows.net"
 
 # BASE_URL is the backend's own public URL — used only for local /uploads/ paths
 _BACKEND_URL   = os.getenv("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-
-# Whether Azure storage is configured
-_CONN_STRING   = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-
 
 def resolve_url(path: str | None) -> str | None:
     """
@@ -60,3 +70,41 @@ def resolve_url(path: str | None) -> str | None:
 def resolve_urls(paths: list[str | None]) -> list[str | None]:
     """Batch version of resolve_url for lists of paths."""
     return [resolve_url(p) for p in paths]
+
+
+def storage_path_for_db(path: str | None) -> str | None:
+    """
+    Convert a display URL back to the compact path stored in the DB.
+
+    Azure rows should store: products/folder/file.jpg
+    Local fallback rows should store: /uploads/products/folder/file.jpg
+    """
+    if not path:
+        return None
+
+    value = str(path).strip().replace("\\", "/")
+    if not value:
+        return None
+
+    if value.startswith("data:") or value.startswith("blob:"):
+        return None
+
+    if value.startswith("http://") or value.startswith("https://"):
+        try:
+            parsed_path = urlparse(value).path
+        except Exception:
+            parsed_path = value.split("/", 3)[-1] if "/" in value else value
+        value = parsed_path
+
+    clean = value.strip()
+    if clean.startswith("/uploads/"):
+        return clean
+
+    clean = clean.lstrip("/")
+    if clean.startswith("uploads/"):
+        return f"/{clean}"
+
+    if clean.startswith("product-images/"):
+        return clean[len("product-images/"):]
+
+    return clean

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy.orm import Session
 from app.shared.filters import apply_filters, apply_ordering, apply_pagination, build_paged_response
-from app.shared.url_helpers import resolve_url
+from app.shared.url_helpers import resolve_url, storage_path_for_db
 
 from .models import ProductReview
 
@@ -72,7 +72,7 @@ def create_or_update_review(db, data) -> int:
         existing.comment      = data.comment
         # Only overwrite photo if a new one is provided
         if data.photo is not None:
-            existing.photo    = data.photo
+            existing.photo    = storage_path_for_db(data.photo)
         existing.modifiedDate = datetime.now(timezone.utc)
         db.commit()
         return existing.productReviewId
@@ -88,7 +88,7 @@ def create_or_update_review(db, data) -> int:
             userProfileId    = data.userProfileId,
             state            = data.state or 'Active',
             itemId           = data.itemId,
-            photo            = data.photo,
+            photo            = storage_path_for_db(data.photo),
             createdDate      = datetime.now(timezone.utc),
             deletedInd       = False,
         )
@@ -111,7 +111,7 @@ def update_review(db, review_id: int, data) -> Optional[int]:
     r.email        = data.email
     r.state        = data.state
     if data.photo is not None:
-        r.photo    = data.photo
+        r.photo    = storage_path_for_db(data.photo)
     r.modifiedDate = datetime.now(timezone.utc)
     db.commit()
     return r.productReviewId

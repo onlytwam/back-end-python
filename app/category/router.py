@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from app.auth.dependencies import get_current_user, require_roles, Roles
 from app.shared.azure_storage import upload_image, delete_image
+from app.shared.url_helpers import resolve_url
 from . import schemas, repository
 
 router = APIRouter(prefix="/api/Category", tags=["Category"])
@@ -220,7 +221,7 @@ def upload_category_image(
     if old_url and old_url != new_url:
         delete_image(old_url)
 
-    return {"success": True, "categoryId": category_id, "imageUrl": new_url}
+    return {"success": True, "categoryId": category_id, "imageUrl": resolve_url(new_url)}
 
 
 

@@ -14,17 +14,18 @@ from sqlalchemy import asc, desc
 from sqlalchemy.orm import Session
 
 from .models import FileUpload
-from app.shared.azure_storage import upload_bytes, _is_azure_mode, AZURE_BASE_URL
+from app.shared.azure_storage import upload_bytes
+from app.shared.url_helpers import resolve_url, storage_path_for_db
 
-BASE_URL = os.getenv("BASE_URL", "")
+BASE_URL = os.getenv("BASE_URL", "")
 
 
 def _to_dict(r: FileUpload) -> dict:
-    file_url = r.filePath  # may be a full Azure URL or a local /uploads/… path
+    file_url = resolve_url(r.filePath)
     return {
         "fileUploadId": r.fileUploadId,
         "fileName":     r.fileName,
-        "filePath":     r.filePath,
+        "filePath":     file_url,
         "fileType":     r.fileType,
         "fileUrl":      file_url,
         "createdDate":  r.createdDate,
@@ -65,7 +66,7 @@ def create(db: Session, data) -> int:
     Legacy JSON endpoint: accepts base-64 fileData or a pre-existing filePath.
     Uploads bytes to Azure / local and persists the record.
     """
-    file_path = data.filePath
+    file_path = storage_path_for_db(data.filePath)
 
     if data.fileData and data.fileName:
         try:
@@ -106,7 +107,7 @@ def create_from_upload(
     """
     entity = FileUpload(
         fileName    = file_name,
-        filePath    = file_url,
+        filePath    = storage_path_for_db(file_url),
         fileType    = file_type,
         createdDate = datetime.now(timezone.utc),
         deletedInd  = False,
