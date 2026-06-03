@@ -11,7 +11,22 @@ from app.shared.filters import apply_filters, apply_ordering, apply_pagination, 
 from .models import ProductVariant, ProductImage
     
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-_AZURE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
+
+
+def _account_name_from_connection_string(connection_string: str) -> Optional[str]:
+    for part in connection_string.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "accountname" and value.strip():
+            return value.strip()
+    return None
+
+
+_AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+_AZURE_ACCOUNT = (
+    os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+    or _account_name_from_connection_string(_AZURE_CONNECTION_STRING)
+    or "twamstorage"
+)
 BLOB_BASE = f"https://{_AZURE_ACCOUNT}.blob.core.windows.net".rstrip("/")
 from app.shared.url_helpers import resolve_url as _resolve_url
 

@@ -215,32 +215,49 @@ def upload_variant_images(
     product_folder = sanitize_folder_name(raw_folder_name)
 
     saved_images = []
+    uploaded_blob_paths = []
 
-    for f in files:
-        if not f.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="Only image files are allowed")
+    try:
+        for f in files:
+            if not f.content_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="Only image files are allowed")
 
-        # Validate size before uploading
-        content = f.file.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="File too large (max 5MB)")
-        f.file.seek(0)
+            # Validate size before uploading
+            content = f.file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail="File too large (max 5MB)")
+            f.file.seek(0)
 
-        # upload_image handles container auto-creation + local fallback
-        # Each product gets its own named subfolder: product-images/<ProductName>/
-        file_url = upload_image(f, container_key="products", folder=product_folder)
+            # upload_image handles container auto-creation + local fallback
+            # Each product gets its own named subfolder: products/<ProductName>/
+            file_url = upload_image(f, container_key="products", folder=product_folder)
+            uploaded_blob_paths.append(file_url)
 
-        img = ProductImage(
-            productId        = variant.productId,
-            productVariantId = variant_id,
-            fileName         = f.filename,
-            fileType         = f.content_type,
-            filePath         = file_url,
-        )
-        db.add(img)
-        saved_images.append(img)
+            img = ProductImage(
+                productId        = variant.productId,
+                productVariantId = variant_id,
+                fileName         = f.filename,
+                fileType         = f.content_type,
+                filePath         = file_url,
+            )
+            db.add(img)
+            db.flush()
+            saved_images.append(img)
 
-    db.commit()
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        for path in uploaded_blob_paths:
+            delete_image(path)
+        raise
+    except Exception as exc:
+        db.rollback()
+        for path in uploaded_blob_paths:
+            delete_image(path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Image uploaded to storage but DB save failed: {exc}",
+        ) from exc
 
     return {
         "uploaded": len(saved_images),
