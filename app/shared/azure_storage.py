@@ -284,6 +284,45 @@ def _safe_blob_name(filename: str, prefix: str = "") -> str:
 
 
 def _ensure_container(blob_service: "BlobServiceClient", container_name: str) -> None:
+    """Create the container if it does not exist.
+
+    Some Azure storage accounts disable anonymous public access at the account
+    level. In those environments, create_container(public_access="blob") fails
+    with PublicAccessNotPermitted even though private uploads are allowed.
+    """
+    container_client = blob_service.get_container_client(container_name)
+
+    if container_client.exists():
+        return
+
+    try:
+        container_client.create_container(public_access="blob")
+        print(f"[AzureBlob] Created public container: {container_name}")
+        return
+    except Exception as exc:
+        msg = str(exc).lower()
+
+        if "containeralreadyexists" in msg or "already exists" in msg:
+            return
+
+        if "publicaccessnotpermitted" not in msg:
+            raise
+
+        print(
+            f"[AzureBlob] Public access disabled; creating private container: {container_name}"
+        )
+
+    try:
+        container_client.create_container()
+        print(f"[AzureBlob] Created private container: {container_name}")
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "containeralreadyexists" in msg or "already exists" in msg:
+            return
+        raise
+
+
+def _ensure_container_legacy_unused(blob_service: "BlobServiceClient", container_name: str) -> None:
 
 
     """Create the container (with public blob read access) if it does not exist."""
