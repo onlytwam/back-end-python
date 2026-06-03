@@ -133,7 +133,19 @@ except ImportError:
 AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 
 
-AZURE_ACCOUNT_NAME      = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
+def _account_name_from_connection_string(connection_string: str) -> Optional[str]:
+    for part in connection_string.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "accountname" and value.strip():
+            return value.strip()
+    return None
+
+
+AZURE_ACCOUNT_NAME      = (
+    os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+    or _account_name_from_connection_string(AZURE_CONNECTION_STRING)
+    or "twamstorage"
+)
 
 
 AZURE_BASE_URL          = f"https://{AZURE_ACCOUNT_NAME}.blob.core.windows.net"

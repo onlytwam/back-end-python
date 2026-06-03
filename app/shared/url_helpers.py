@@ -21,16 +21,25 @@ Usage (in any repository or router):
 
 import os
 
+
+def _account_name_from_connection_string(connection_string: str) -> str | None:
+    for part in connection_string.split(";"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "accountname" and value.strip():
+            return value.strip()
+    return None
+
 # ── Read once at startup ──────────────────────────────────────────────────────
-_AZURE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "twamstorage")
+_CONN_STRING   = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+_AZURE_ACCOUNT = (
+    os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+    or _account_name_from_connection_string(_CONN_STRING)
+    or "twamstorage"
+)
 _AZURE_BASE    = f"https://{_AZURE_ACCOUNT}.blob.core.windows.net"
 
 # BASE_URL is the backend's own public URL — used only for local /uploads/ paths
 _BACKEND_URL   = os.getenv("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-
-# Whether Azure storage is configured
-_CONN_STRING   = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-
 
 def resolve_url(path: str | None) -> str | None:
     """
