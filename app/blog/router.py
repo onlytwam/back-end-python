@@ -160,7 +160,7 @@ def create_blog(
 
         "message": "Blog created successfully",
 
-        "data": created_blog
+        "data": {**created_blog.__dict__, "imageUrl": resolve_url(created_blog.imageUrl)},
 
     }
 
@@ -234,7 +234,7 @@ def update_blog(
 
         "message": "Blog updated successfully",
 
-        "data": updated_blog
+        "data": {**updated_blog.__dict__, "imageUrl": resolve_url(updated_blog.imageUrl)},
 
     }
 
