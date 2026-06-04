@@ -55,7 +55,7 @@ async def get_current_user_optional(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _frontend_url() -> str:
-    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"
+    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"  #  PayG and causes silent failures
 
 
 def _record_payment_log(
