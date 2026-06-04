@@ -21,17 +21,30 @@ from app.state.repository import resolve_state_id
 from app.shared.url_helpers import resolve_url
 
 
-def _get_payg_redirect_url() -> str:
+def _get_payg_redirect_url(db: Session = None) -> str:
     """
     Return the PayG redirect (callback) URL from twam."AppSettings".
     Key: payg_redirect_url — set via the Admin → Payment Config panel
     or directly in the DB.
 
-    Raises RuntimeError if the setting is missing or still holds the
-    localhost default, so a misconfiguration fails loudly at order-creation
-    time rather than silently sending PayG to an unreachable URL.
+    If the in-process cache is empty (e.g. fresh container restart before
+    the first admin save), falls back to querying the DB directly and
+    refreshes the cache so subsequent calls are fast.
+
+    Raises RuntimeError if the setting is still missing/unconfigured after
+    the DB fallback, so misconfiguration fails loudly at order-creation time.
     """
+    from app.shared.app_settings import reload_settings
     url = get_setting("payg_redirect_url", "")
+
+    # Cache miss or stale default — try to reload from DB before giving up
+    if (not url or "localhost" in url) and db is not None:
+        try:
+            reload_settings(db)
+            url = get_setting("payg_redirect_url", "")
+        except Exception as _reload_err:
+            print(f"[PayG] Warning: cache reload failed: {_reload_err}")
+
     if not url or "localhost" in url:
         raise RuntimeError(
             "payg_redirect_url is not configured. "
@@ -846,7 +859,7 @@ def create_order(db: Session, data) -> dict:
             billing_state   = payg_billing_state or "",
             shipping_state  = payg_shipping_state or payg_billing_state or "",
             billing_zip     = (payg_address or {}).get("pinCode", ""),
-            redirect_url    = _get_payg_redirect_url(),
+            redirect_url    = _get_payg_redirect_url(db),
         )
     except Exception as _exc:
         # ── PayG failed: roll back everything so no orphan order is saved ──
@@ -1010,7 +1023,7 @@ def create_guest_order(db: Session, data) -> dict:
             billing_state   = _state_name,
             shipping_state  = _state_name,
             billing_zip     = _zip,
-            redirect_url    = _get_payg_redirect_url(),
+            redirect_url    = _get_payg_redirect_url(db),
         )
     except Exception as _exc:
         import traceback
