@@ -68,6 +68,9 @@ from app.shared.url_helpers import resolve_url as _image_path_to_url  # noqa: F4
 
 
 def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -> list[dict]:
+    # Strict per-variant query — no product-level fallback.
+    # Falling back to productId would return images belonging to ALL variants
+    # of the product, causing every colour swatch to show the same images.
     rows = db.execute(
         text(
             """
@@ -81,21 +84,6 @@ def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -
         ),
         {"pvid": product_variant_id},
     ).fetchall()
-
-    if not rows:
-        rows = db.execute(
-            text(
-                """
-                SELECT "ProductImageId", "FileName", "FilePath", "FileType"
-                FROM twam."ProductImage"
-                WHERE "ProductId" = :pid
-                  AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
-                  AND "FilePath" IS NOT NULL
-                ORDER BY "ProductImageId" ASC
-                """
-            ),
-            {"pid": product_id},
-        ).fetchall()
 
     return [
         {
@@ -212,21 +200,11 @@ def _to_response(db: Session, product: Products) -> dict:
         except Exception:
             db.rollback()
 
-    # Resolve the first image for this product (variant image first, then product-level fallback)
+    # imageUrl is intentionally left null at the product level.
+    # Each variant carries its own `images` list (from _get_variant_images),
+    # so the frontend should always read images from the selected variant,
+    # never from a product-level imageUrl which has no variant binding.
     image_url = None
-    try:
-        img_row = db.execute(text("""
-            SELECT "FilePath" FROM twam."ProductImage"
-            WHERE "ProductId" = :pid
-              AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
-              AND "FilePath" IS NOT NULL
-            ORDER BY "ProductImageId" ASC
-            LIMIT 1
-            """), {"pid": product.productId}).fetchone()
-        if img_row and img_row[0]:
-                image_url = _image_path_to_url(img_row[0])
-    except Exception:
-        pass
 
     # Resolve Tax / HSN code details
     tax_hsn_code        = None
