@@ -295,7 +295,7 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         item_rows = db.execute(text("""
             SELECT
                 p."Name",
-                COALESCE(pv."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
+                COALESCE(p."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
                 oi."Quantity", oi."Price",
                 thc."HSNCode"
             FROM twam."OrderItems" oi
