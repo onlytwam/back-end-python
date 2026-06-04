@@ -28,28 +28,19 @@ from .models import ProductVariant, ProductImage
 
 
 def _get_images(db: Session, product_variant_id: int, product_id: int) -> list:
-    # Step 1: Try variant images
+    # Strict per-variant query — no product-level fallback.
+    # Falling back to productId returns images belonging to ALL variants of the
+    # product, causing every colour swatch to show the same image pool.
     rows = db.execute(
         text("""
             SELECT "ProductImageId", "FileName", "FilePath", "FileType"
             FROM twam."ProductImage"
             WHERE "ProductVariantId" = :pvid
               AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
+              AND "FilePath" IS NOT NULL
         """),
         {"pvid": product_variant_id}
     ).fetchall()
-
-    # 🔥 Step 2: Fallback to product-level images
-    if not rows:
-        rows = db.execute(
-            text("""
-                SELECT "ProductImageId", "FileName", "FilePath", "FileType"
-                FROM twam."ProductImage"
-                WHERE "ProductId" = :pid
-                  AND ("DeletedInd" = false OR "DeletedInd" IS NULL)
-            """),
-            {"pid": product_id}
-        ).fetchall()
 
     return [
         {
@@ -353,16 +344,10 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     is_cup_size  = bool(row[7])
     is_alpha_size = bool(row[8])   # IsAlphaSize — drives which mdm.Size SizeType to load
 
-    # Step 1: try variant-level images
+    # Strict per-variant query — no product-level fallback.
     img_rows = db.execute(text(
         'SELECT "FilePath" FROM twam."ProductImage" WHERE "ProductVariantId"=:pvid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
     ), {"pvid": pv_id}).fetchall()
-
-    # Step 2: fall back to product-level images (Bug 3 fix)
-    if not img_rows:
-        img_rows = db.execute(text(
-            'SELECT "FilePath" FROM twam."ProductImage" WHERE "ProductId"=:pid AND ("DeletedInd"=false OR "DeletedInd" IS NULL) AND "FilePath" IS NOT NULL'
-        ), {"pid": prod_id}).fetchall()
 
     images = [
         _resolve_url(r[0])
@@ -470,11 +455,11 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
     color_rows = db.execute(text("""
         SELECT pv2."ProductVariantId", pv2."Color", pv2."ColorFamilyId",
             pc."ColorFamilyName", pc."HexCode",
-            (SELECT pi2."FilePath"
+            (SELECT ARRAY_AGG(pi2."FilePath" ORDER BY pi2."ProductImageId")
              FROM twam."ProductImage" pi2
              WHERE pi2."ProductVariantId" = pv2."ProductVariantId"
                AND (pi2."DeletedInd" = false OR pi2."DeletedInd" IS NULL)
-             LIMIT 1) AS image,
+               AND pi2."FilePath" IS NOT NULL) AS images_arr,
             best_pvd."FinalPrice" AS min_final_price,
             best_pvd."MRPPrice" AS min_mrp_price,
             best_pvd."ProductVariantDetailId" AS min_pvd_id,
@@ -549,7 +534,13 @@ def get_user_product_variant(db: Session, product_variant_id: int = 0, name: str
             "colorFamily": cr[3],
             "colorFamilyHex": cr[4],
             "colorHex": cr[4],
-            "image": _resolve_url(cr[5]),
+            # images: full per-variant list used by ProductDetail gallery
+            "images": [
+                {"filePath": _resolve_url(p), "fileData": _resolve_url(p)}
+                for p in (cr[5] or []) if p
+            ],
+            # image: first image, kept for swatch thumbnail backward-compat
+            "image": _resolve_url(cr[5][0]) if cr[5] else None,
             "minFinalPrice": float(cr[6]) if cr[6] is not None else None,
             "minMrpPrice": float(cr[7]) if cr[7] is not None else None,
             "minProductVariantDetailId": cr[8],
