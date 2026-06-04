@@ -65,8 +65,8 @@ _DEFAULTS: dict[str, tuple[str, str]] = {
     "payg_auth_token":      ("",                         "PayG AuthenticationToken for Basic Auth"),
     "payg_secure_hash":     ("",                         "PayG SecureHashKey for HMAC-SHA256 signing"),
     "payg_merchant_key_id": ("",                         "PayG MerchantKeyId (numeric)"),
-    "payg_redirect_url":    ("http://localhost:8000/api/Payment/Callback",
-                                                         "Backend URL PayG redirects browser to after payment"),
+    "payg_redirect_url":    ("",
+                                                         "Backend URL PayG redirects browser to after payment — must be set to the public HTTPS callback URL before payments can be initiated"),
     "frontend_base_url":    ("http://localhost:5173",    "Frontend app base URL for post-payment redirects"),
 }
 
