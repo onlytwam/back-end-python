@@ -34,7 +34,6 @@ def _safe(db: Session, sql: str, params: dict = {}):
 
 
 def get_order_report(db: Session, filters, page_index, page_size):
-    # Extract filters
     channel = (filters or {}).get("channel")
 
     channel_filter = 'AND bo."Channel" = :channel' if channel else ''
@@ -48,12 +47,10 @@ def get_order_report(db: Session, filters, page_index, page_size):
             o."PaymentMethod",
             o."State",
 
-            -- Product info from OrderItems
             STRING_AGG(DISTINCT p."Name", ', ')     AS "ProductName",
             SUM(oi."Quantity")                      AS "Quantity",
             SUM(oi."Quantity" * pvd."FinalPrice")   AS "TotalAmount",
 
-            -- Billing info
             bo."InvoiceNo",
             bo."CustomerName",
             bo."CustomerPhone",
@@ -68,7 +65,6 @@ def get_order_report(db: Session, filters, page_index, page_size):
             bo."IGSTTotal",
             bo."GSTTotal",
 
-            -- Window functions
             COUNT(o."OrderId") OVER()               AS "TotalOrders",
             SUM(SUM(oi."Quantity" * pvd."FinalPrice")) OVER() AS "TotalRevenue"
 
@@ -84,7 +80,6 @@ def get_order_report(db: Session, filters, page_index, page_size):
         LEFT JOIN twam."Products" p
             ON p."ProductId" = pv."ProductId"
 
-        -- Billing joins
         LEFT JOIN twam."BillingOrders" bo
             ON bo."OrderId" = o."OrderId"
         LEFT JOIN twam."BillingOrderItems" boi
@@ -126,13 +121,15 @@ def get_order_report_channels(db: Session):
         WHERE "Channel" IS NOT NULL
         ORDER BY "Channel"
     """)
-    print("rows:", rows)          # see what _safe actually returns
-    print("type:", type(rows))    # confirm it's a list and not None
+    print("rows:", rows)
+    print("type:", type(rows))
     if not rows:
         return []
-    print("first row:", rows[0])  # see what a single row looks like
+    print("first row:", rows[0])
     print("first row type:", type(rows[0]))
     return [r["Channel"] for r in rows]
+
+
 def get_available_order_dates(db: Session, channel: str = None) -> list[str]:
     where = ['o."DeletedInd" = false']
     if channel:
@@ -147,8 +144,6 @@ def get_available_order_dates(db: Session, channel: str = None) -> list[str]:
     """)
     return [r["date"] for r in rows if r.get("date")]
 
-# repository
-# repository.py — remove ALL inline -- comments from SQL
 
 def get_products_category_report(db, type_val, id_val, from_date, to_date, channel, page_index, page_size):
 
@@ -162,8 +157,6 @@ def get_products_category_report(db, type_val, id_val, from_date, to_date, chann
         date_where = f'AND o."CreatedDate" BETWEEN \'{from_date}\' AND \'{to_date}\''
 
     if channel:
-        # ── Orders from website have Platform = NULL or 'Web' or 'Online' ────
-        # ── Admin/POS orders have Platform set to channel name ────────────────
         channel_where = f"AND o.\"Platform\" ILIKE '%{channel}%'"
 
     SELECT = """
@@ -227,7 +220,7 @@ def get_products_category_report(db, type_val, id_val, from_date, to_date, chann
             ORDER BY "unitsSold" DESC NULLS LAST
         """
 
-    else:  # type_val == "P"
+    else:
         sql = f"""
             SELECT
                 p."Name" AS "name",
@@ -261,16 +254,14 @@ def get_products_category_report(db, type_val, id_val, from_date, to_date, chann
             }
             for r in result.mappings().all()
         ]
-        # print(f">>> type={type_val} id={id_val} rows={len(rows)} sample={rows[0] if rows else 'empty'}")
         return _paginate(rows, page_index, page_size)
 
     except Exception as e:
-        # print(f">>> SQL ERROR: {e}")
         db.rollback()
         return _paginate([], page_index, page_size)
-    
+
+
 def get_sales_by_region(db: Session, filters, page_index, page_size):
-    # ── Guard: treat None or missing filters as empty dict ──
     if filters is None:
         filters = {}
 
@@ -347,6 +338,8 @@ def get_top_low_selling(db: Session, filters, page_index, page_size):
         ORDER BY SUM(oi."Quantity") DESC NULLS LAST
     """)
     return _paginate(rows, page_index, page_size)
+
+
 def get_sales_by_platform(db: Session, filters, page_index, page_size):
     rows = _safe(db, """
         SELECT o."OrderSource" AS "Platform",
@@ -387,7 +380,7 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
     def org_clause(alias: str) -> str:
         return f'AND {alias}."OrganizationId" = {org_id}' if org_id else ''
 
-    # ── PART 1: Digital Coupons (coupons."Coupons") ──────────────────────────
+    # ── PART 1: Digital Coupons ───────────────────────────────────────────────
     coupon_sql = f"""
         SELECT
             'coupon'::text                                  AS "ReportType",
@@ -406,7 +399,7 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             NULL::text                                      AS "SKU",
             NULL::text                                      AS "HSNCode",
             NULL::numeric                                   AS "Weight"
-        FROM coupons."Coupons" c                           -- ✅ correct schema
+        FROM coupons."Coupons" c
         LEFT JOIN coupons."CouponUsage" cu
             ON  cu."CouponId" = c."CouponId"
             {date_join_clause('cu')}
@@ -422,6 +415,9 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
     """
 
     # ── PART 2: Physical Coupons ──────────────────────────────────────────────
+    _pc_from_clause = f"AND pc.\"UsedAt\" >= '{from_date}'" if from_date else ""
+    _pc_to_clause   = f"AND pc.\"UsedAt\" <= '{to_date} 23:59:59'" if to_date else ""
+
     physical_coupon_sql = f"""
         SELECT
             'physical_coupon'::text                              AS "ReportType",
@@ -449,14 +445,9 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             {order_date_clause('o')}
         WHERE 1=1
           {org_clause('pc')}
-          _pc_from_clause = ("AND pc.\"UsedAt\" >= '" + str(from_date) + "'") if from_date else ""
-_pc_to_clause   = ("AND pc.\"UsedAt\" <= '" + str(to_date) + " 23:59:59'") if to_date else ""
-physical_coupon_sql = f"""
-    ...
           {_pc_from_clause}
           {_pc_to_clause}
-    ...
-"""
+        GROUP BY
             pc."CouponCode", pc."Description", pc."Discount", pc."IsUsed"
     """
 
@@ -784,20 +775,6 @@ def get_tax_by_region(db: Session, filters, page_index, page_size):
     return _paginate(rows, page_index, page_size)
 
 
-# def get_stock_level_report(db: Session, filters, page_index, page_size):
-#     rows = _safe(db, """
-#         SELECT p."Name" AS "ProductName", pv."VariantName",
-#                pvd."ProductVariantDetailId", pvd."StockQuantity",
-#                pvd."FinalPrice", pvd."MRPPrice"
-#         FROM twam."ProductVariantDetail" pvd
-#         LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
-#         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
-#         WHERE pvd."DeletedInd"=false
-#         ORDER BY pvd."StockQuantity" ASC
-#     """)
-#     return _paginate(rows, page_index, page_size)
-
-
 def get_inventory_aging_report(db: Session, filters, page_index, page_size):
     rows = _safe(db, """
         SELECT p."Name" AS "ProductName", pvd."ProductVariantDetailId",
@@ -810,26 +787,6 @@ def get_inventory_aging_report(db: Session, filters, page_index, page_size):
         ORDER BY "AgeDays" DESC
     """)
     return _paginate(rows, page_index, page_size)
-
-
-# def get_fast_slow_moving_inventory(db: Session, filters, page_index, page_size):
-#     rows = _safe(db, """
-#         SELECT p."Name" AS "ProductName", pvd."ProductVariantDetailId",
-#                COALESCE(SUM(oi."Quantity"), 0) AS "TotalSold",
-#                pvd."StockQuantity" AS "CurrentStock",
-#                CASE WHEN COALESCE(SUM(oi."Quantity"), 0) > 50 THEN 'Fast'
-#                     WHEN COALESCE(SUM(oi."Quantity"), 0) > 10 THEN 'Medium'
-#                     ELSE 'Slow' END AS "MovementCategory"
-#         FROM twam."ProductVariantDetail" pvd
-#         LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
-#         LEFT JOIN twam."Products" p ON p."ProductId" = pv."ProductId"
-#         LEFT JOIN twam."OrderItems" oi ON oi."ProductVariantDetailId" = pvd."ProductVariantDetailId"
-#             AND oi."DeletedInd"=false
-#         WHERE pvd."DeletedInd"=false
-#         GROUP BY p."Name", pvd."ProductVariantDetailId", pvd."StockQuantity"
-#         ORDER BY "TotalSold" DESC
-#     """)
-#     return _paginate(rows, page_index, page_size)
 
 
 def get_product_return_rate(db: Session, filters, page_index, page_size):
@@ -869,97 +826,87 @@ def get_stock_reorder_alerts(db: Session, filters, page_index, page_size):
 
 
 def get_customer_acquisition_report(db: Session, filters, page_index, page_size):
-    filters    = filters or {}
-    group_by   = filters.get("group_by", "month")
-    start_date = filters.get("start_date") or None
-    end_date   = filters.get("end_date")   or None
- 
-    trunc_map = {"day": "day", "week": "week", "month": "month", "year": "year"}
+    group_by = (filters or {}).get("group_by", "month")
+
+    trunc_map = {
+        "day":   "day",
+        "week":  "week",
+        "month": "month",
+        "year":  "year",
+    }
     trunc = trunc_map.get(group_by, "month")
- 
-    start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '1 year')::date"
-    end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
- 
-    params: dict = {}
-    if start_date: params["start_date"] = start_date
-    if end_date:   params["end_date"]   = end_date
- 
+
     rows = _safe(db, f"""
+        WITH period_customers AS (
+            SELECT
+                DATE_TRUNC('{trunc}', u."CreatedDate")  AS "Period",
+                u."Id"                                   AS "UserId",
+                u."EmailConfirmed"                       AS "IsVerified"
+            FROM auth."IdentityUser" u
+            WHERE u."DeletedInd" = false
+              AND u."UserRoleId" = 2
+        )
         SELECT
-            DATE_TRUNC('{trunc}', u."CreatedDate")                               AS "Period",
-            COUNT(u."Id")                                                          AS "NewCustomers",
-            COUNT(u."Id") FILTER (WHERE u."EmailConfirmed" = true)               AS "VerifiedCustomers",
-            SUM(COUNT(u."Id")) OVER ()                                             AS "TotalNewCustomers"
-        FROM auth."IdentityUser" u
-        WHERE u."DeletedInd" = false
-          AND u."UserRoleId" = 2
-          AND u."CreatedDate" >= {start_expr}
-          AND u."CreatedDate" <= {end_expr}
-        GROUP BY DATE_TRUNC('{trunc}', u."CreatedDate")
+            "Period",
+            COUNT("UserId")                          AS "NewCustomers",
+            COUNT("UserId") FILTER (WHERE "IsVerified" = true) AS "VerifiedCustomers",
+            SUM(COUNT("UserId")) OVER ()              AS "TotalNewCustomers"
+        FROM period_customers
+        GROUP BY "Period"
         ORDER BY "Period" DESC
-    """, params)
- 
+    """)
+
     return _paginate(rows, page_index, page_size)
- 
- 
+
+
 def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
     filters    = filters or {}
     start_date = filters.get("start_date") or None
     end_date   = filters.get("end_date")   or None
- 
-    start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '90 days')::date"
-    end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
- 
+
+    date_filter = ""
     params: dict = {}
-    if start_date: params["start_date"] = start_date
-    if end_date:   params["end_date"]   = end_date
- 
+    if start_date:
+        date_filter += " AND o.\"OrderDate\" >= :start_date ::date"
+        params["start_date"] = start_date
+    if end_date:
+        date_filter += " AND o.\"OrderDate\" <= :end_date ::date"
+        params["end_date"] = end_date
+
     rows = _safe(db, f"""
-        WITH period_orders AS (
+        WITH customer_orders AS (
             SELECT
-                o."UserId",
-                MIN(o."CreatedDate") AS "FirstInPeriod"
+                o."UserProfileId",
+                COUNT(o."OrderId") AS "OrderCount"
             FROM twam."Orders" o
             WHERE o."DeletedInd" = false
-              AND o."CreatedDate" >= {start_expr}
-              AND o."CreatedDate" <= {end_expr}
-            GROUP BY o."UserId"
-        ),
-        all_time_first AS (
-            SELECT
-                o."UserId",
-                MIN(o."CreatedDate") AS "FirstEver"
-            FROM twam."Orders" o
-            WHERE o."DeletedInd" = false
-            GROUP BY o."UserId"
+              AND o."State" NOT IN ('Cancelled', 'Returned')
+              {date_filter}
+            GROUP BY o."UserProfileId"
         ),
         classified AS (
             SELECT
-                p."UserId",
-                CASE
-                    WHEN a."FirstEver" >= {start_expr} THEN 'New'
-                    ELSE 'Repeat'
-                END AS "CustomerType"
-            FROM period_orders p
-            JOIN all_time_first a ON a."UserId" = p."UserId"
+                CASE WHEN "OrderCount" = 1 THEN 'New' ELSE 'Repeat' END AS "CustomerType",
+                COUNT(*) AS "CustomerCount"
+            FROM customer_orders
+            GROUP BY 1
         )
         SELECT
             "CustomerType",
-            COUNT("UserId")                                                        AS "CustomerCount",
-            ROUND(COUNT("UserId") * 100.0 / NULLIF(SUM(COUNT("UserId")) OVER (), 0), 2) AS "Percentage",
-            SUM(COUNT("UserId")) OVER ()                                           AS "TotalCustomers"
+            "CustomerCount",
+            ROUND("CustomerCount" * 100.0 / NULLIF(SUM("CustomerCount") OVER (), 0), 2) AS "Percentage",
+            SUM("CustomerCount") OVER () AS "TotalCustomers"
         FROM classified
-        GROUP BY "CustomerType"
-        ORDER BY "CustomerCount" DESC
+        ORDER BY "CustomerType"
     """, params)
- 
+
     return _paginate(rows, page_index, page_size)
- 
- 
+
+
 def get_customer_lifetime_value(db: Session, filters, page_index, page_size):
     min_orders = int((filters or {}).get("min_orders", 1))
     top_n      = int((filters or {}).get("top_n", 20))
- 
+
     rows = _safe(db, """
         SELECT
             u."Id"                                                                 AS "UserId",
@@ -982,10 +929,10 @@ def get_customer_lifetime_value(db: Session, filters, page_index, page_size):
         ORDER BY "TotalRevenue" DESC
         LIMIT :top_n
     """, {"min_orders": min_orders, "top_n": top_n})
- 
+
     return _paginate(rows, page_index, page_size)
- 
- 
+
+
 def get_customer_segmentation(db: Session, filters, page_index, page_size):
     segment_by = (filters or {}).get("segment_by", "location")
 
@@ -1029,7 +976,7 @@ def get_customer_segmentation(db: Session, filters, page_index, page_size):
             ORDER BY "CustomerCount" DESC
         """)
 
-    else:  # location (default)
+    else:
         rows = _safe(db, """
             SELECT
                 COALESCE(o."State", 'Unknown')          AS "Location",
@@ -1045,10 +992,9 @@ def get_customer_segmentation(db: Session, filters, page_index, page_size):
         """)
 
     return _paginate(rows, page_index, page_size)
- 
- 
-def get_customer_churn_rate(db: Session, filters, page_index, page_size):
 
+
+def get_customer_churn_rate(db: Session, filters, page_index, page_size):
     inactive_days = int((filters or {}).get("inactive_days", 90))
     period_months = int((filters or {}).get("period_months", 12))
 
@@ -1118,21 +1064,21 @@ def get_customer_churn_rate(db: Session, filters, page_index, page_size):
     )
 
     return _paginate(rows, page_index, page_size)
- 
- 
+
+
 def get_top_customers_by_revenue(db: Session, filters, page_index, page_size):
     filters    = filters or {}
     start_date = filters.get("start_date") or None
     end_date   = filters.get("end_date")   or None
     top_n      = int(filters.get("top_n", 10))
- 
+
     start_expr = ":start_date ::date" if start_date else "(NOW() - INTERVAL '1 year')::date"
     end_expr   = ":end_date ::date"   if end_date   else "NOW()::date"
- 
+
     params: dict = {"top_n": top_n}
     if start_date: params["start_date"] = start_date
     if end_date:   params["end_date"]   = end_date
- 
+
     rows = _safe(db, f"""
         SELECT
             RANK() OVER (ORDER BY SUM(o."TotalAmount") DESC)                       AS "Rank",
@@ -1159,86 +1105,9 @@ def get_top_customers_by_revenue(db: Session, filters, page_index, page_size):
         ORDER BY "TotalRevenue" DESC
         LIMIT :top_n
     """, params)
- 
+
     return _paginate(rows, page_index, page_size)
- 
- 
-def get_repeat_vs_new_customers(db: Session, filters, page_index, page_size):
-    filters    = filters or {}
-    start_date = filters.get("start_date") or None
-    end_date   = filters.get("end_date")   or None
- 
-    date_filter = ""
-    params: dict = {}
-    if start_date:
-        date_filter += " AND o.\"OrderDate\" >= :start_date ::date"
-        params["start_date"] = start_date
-    if end_date:
-        date_filter += " AND o.\"OrderDate\" <= :end_date ::date"
-        params["end_date"] = end_date
- 
-    rows = _safe(db, f"""
-        WITH customer_orders AS (
-            SELECT
-                o."UserProfileId",
-                COUNT(o."OrderId") AS "OrderCount"
-            FROM twam."Orders" o
-            WHERE o."DeletedInd" = false
-              AND o."State" NOT IN ('Cancelled', 'Returned')
-              {date_filter}
-            GROUP BY o."UserProfileId"
-        ),
-        classified AS (
-            SELECT
-                CASE WHEN "OrderCount" = 1 THEN 'New' ELSE 'Repeat' END AS "CustomerType",
-                COUNT(*) AS "CustomerCount"
-            FROM customer_orders
-            GROUP BY 1
-        )
-        SELECT
-            "CustomerType",
-            "CustomerCount",
-            ROUND("CustomerCount" * 100.0 / NULLIF(SUM("CustomerCount") OVER (), 0), 2) AS "Percentage",
-            SUM("CustomerCount") OVER () AS "TotalCustomers"
-        FROM classified
-        ORDER BY "CustomerType"
-    """, params)
- 
-    return _paginate(rows, page_index, page_size)
- 
- 
-def get_customer_acquisition_report(db: Session, filters, page_index, page_size):
-    group_by = (filters or {}).get("group_by", "month")
- 
-    trunc_map = {
-        "day":   "day",
-        "week":  "week",
-        "month": "month",
-        "year":  "year",
-    }
-    trunc = trunc_map.get(group_by, "month")
- 
-    rows = _safe(db, f"""
-        WITH period_customers AS (
-            SELECT
-                DATE_TRUNC('{trunc}', u."CreatedDate")  AS "Period",
-                u."Id"                                   AS "UserId",
-                u."EmailConfirmed"                       AS "IsVerified"
-            FROM auth."IdentityUser" u
-            WHERE u."DeletedInd" = false
-              AND u."UserRoleId" = 2
-        )
-        SELECT
-            "Period",
-            COUNT("UserId")                          AS "NewCustomers",
-            COUNT("UserId") FILTER (WHERE "IsVerified" = true) AS "VerifiedCustomers",
-            SUM(COUNT("UserId")) OVER ()              AS "TotalNewCustomers"
-        FROM period_customers
-        GROUP BY "Period"
-        ORDER BY "Period" DESC
-    """)
- 
-    return _paginate(rows, page_index, page_size)
+
 
 # ===================new reports above===================
 
@@ -1248,7 +1117,7 @@ def _parse_filters(raw) -> dict:
     try:
         if isinstance(raw, dict):
             return raw
-        return json_loads(raw)   # ← use the alias, NOT json.loads
+        return json_loads(raw)
     except ValueError:
         return {}
 
@@ -1259,11 +1128,8 @@ def get_stock_level_report(
     page_index: Optional[int] = 1,
     page_size: Optional[int] = 20,
 ):
-    # ── Parse filters ─────────────────────────────────────────────────────────
     f = _parse_filters(filters)
-    # print(f"[StockLevel] Parsed filters: {f}")
 
-    # ── Build WHERE clauses ───────────────────────────────────────────────────
     where_clauses = ['pvd."DeletedInd" = false']
     params = {}
 
@@ -1277,8 +1143,7 @@ def get_stock_level_report(
         try:
             params["categoryId"] = int(f["categoryId"])
             where_clauses.append('p."CategoryId" = :categoryId')
-        except (ValueError, TypeError) as e:
-            # print(f"[StockLevel] Invalid categoryId: {e}")
+        except (ValueError, TypeError):
             pass
 
     if f.get("isLowStock") is not None:
@@ -1299,16 +1164,14 @@ def get_stock_level_report(
         try:
             params["minStock"] = int(f["minStock"])
             where_clauses.append('pvd."StockQuantity" >= :minStock')
-        except (ValueError, TypeError) as e:
-            # print(f"[StockLevel] Invalid minStock: {e}")
+        except (ValueError, TypeError):
             pass
 
     if f.get("maxStock") is not None:
         try:
             params["maxStock"] = int(f["maxStock"])
             where_clauses.append('pvd."StockQuantity" <= :maxStock')
-        except (ValueError, TypeError) as e:
-            # print(f"[StockLevel] Invalid maxStock: {e}")
+        except (ValueError, TypeError):
             pass
 
     where_sql = " AND ".join(where_clauses)
@@ -1321,16 +1184,13 @@ def get_stock_level_report(
         WHERE {where_sql}
     """
 
-    # ── COUNT ─────────────────────────────────────────────────────────────────
     count_params = dict(params)
     total = 0
     try:
         total = db.execute(
             text(f'SELECT COUNT(*) {base_from}'), count_params
         ).scalar() or 0
-        # print(f"[StockLevel] Total count: {total}")
     except Exception as e:
-        # print(f"[StockLevel] COUNT query error: {e}")
         traceback.print_exc()
         db.rollback()
         return {
@@ -1340,13 +1200,11 @@ def get_stock_level_report(
             "Data":       [],
         }
 
-    # ── PAGINATION ────────────────────────────────────────────────────────────
     page_index = max(int(page_index or 1), 1)
     page_size  = max(int(page_size  or 20), 1)
     params["limit"]  = page_size
     params["offset"] = (page_index - 1) * page_size
 
-    # ── DATA QUERY ────────────────────────────────────────────────────────────
     rows = []
     try:
         result = db.execute(
@@ -1391,19 +1249,16 @@ def get_stock_level_report(
         "PageSize":   page_size,
         "Data":       rows,
     }
-    
-    # -----------------------------
+
+
 def get_inventory_aging_report(
     db: Session,
     filters,
     page_index: Optional[int] = 1,
     page_size:  Optional[int] = 20,
 ):
-    # ── Parse filters ────────────────────────────────────────────────────────
-    f = _parse_filters(filters)   # reuse your existing _parse_filters()
-    # print(f"[AgingReport] Parsed filters: {f}")
+    f = _parse_filters(filters)
 
-    # ── WHERE clauses ────────────────────────────────────────────────────────
     where_clauses = [
         'pvd."DeletedInd" = false',
         'ia."DeletedInd"  = false',
@@ -1423,7 +1278,6 @@ def get_inventory_aging_report(
         except (ValueError, TypeError):
             pass
 
-    # Age bucket filter — translated into a day-range WHERE clause
     bucket = f.get("agingBucket")
     if bucket == "0-30":
         where_clauses.append(
@@ -1453,27 +1307,22 @@ def get_inventory_aging_report(
         WHERE {where_sql}
     """
 
-    # ── COUNT ────────────────────────────────────────────────────────────────
     count_params = dict(params)
     total = 0
     try:
         total = db.execute(
             text(f"SELECT COUNT(*) {base_from}"), count_params
         ).scalar() or 0
-        # print(f"[AgingReport] Total: {total}")
     except Exception as e:
-        # print(f"[AgingReport] COUNT error: {e}")
         traceback.print_exc()
         db.rollback()
         return {"TotalCount": 0, "Page": page_index or 1, "PageSize": page_size or 20, "Data": []}
 
-    # ── PAGINATION ───────────────────────────────────────────────────────────
     page_index = max(int(page_index or 1), 1)
     page_size  = max(int(page_size  or 20), 1)
     params["limit"]  = page_size
     params["offset"] = (page_index - 1) * page_size
 
-    # ── DATA QUERY ───────────────────────────────────────────────────────────
     rows = []
     try:
         result = db.execute(text(f"""
@@ -1501,14 +1350,11 @@ def get_inventory_aging_report(
         """), params)
 
         rows = [dict(r._mapping) for r in result]
-        # Serialize ReceivedDate to string so Pydantic doesn't choke
         for row in rows:
             if row.get("ReceivedDate") is not None:
                 row["ReceivedDate"] = str(row["ReceivedDate"])
 
-        # print(f"[AgingReport] Rows: {len(rows)}")
     except Exception as e:
-        # print(f"[AgingReport] DATA error: {e}")
         traceback.print_exc()
         db.rollback()
         return {"TotalCount": total, "Page": page_index, "PageSize": page_size, "Data": []}
@@ -1519,18 +1365,18 @@ def get_inventory_aging_report(
         "PageSize":   page_size,
         "Data":       rows,
     }
+
+
 def get_fast_slow_moving_inventory(db, filters, page_index, page_size):
     f = _parse_filters(filters)
 
     where = ['pvd."DeletedInd" = false']
     params = {}
 
-    # 🔍 Search
     if f.get("search"):
         where.append('(p."Name" ILIKE :search OR pvd."StockId" ILIKE :search)')
         params["search"] = f"%{f['search']}%"
 
-    # 📂 Category filter
     if f.get("categoryId"):
         where.append('p."CategoryId" = :categoryId')
         params["categoryId"] = f["categoryId"]
@@ -1566,7 +1412,7 @@ def get_fast_slow_moving_inventory(db, filters, page_index, page_size):
         LIMIT :limit OFFSET :offset
     """
 
-    params["limit"] = page_size
+    params["limit"]  = page_size
     params["offset"] = (page_index - 1) * page_size
 
     result = db.execute(text(query), params)
@@ -1574,7 +1420,7 @@ def get_fast_slow_moving_inventory(db, filters, page_index, page_size):
 
     return {
         "TotalCount": len(rows),
-        "Page": page_index,
-        "PageSize": page_size,
-        "Data": rows
+        "Page":       page_index,
+        "PageSize":   page_size,
+        "Data":       rows,
     }
