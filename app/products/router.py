@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from app.auth.dependencies import get_current_user, Roles
 from . import schemas, repository
-from .models import ProductImage, ProductVariant
+from app.productvariant.models import ProductImage, ProductVariant
 from app.products.models import Products
 from app.shared.azure_storage import upload_image, delete_image, AZURE_BASE_URL, CONTAINERS
 from app.shared.url_helpers import resolve_url
