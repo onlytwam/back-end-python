@@ -195,6 +195,7 @@ from app.packagingtemplates.router   import router as packagingtemplates_router
 from app.people.router               import router as people_router
 from app.productreview.router        import router as productreview_router
 from app.products.router             import router as products_router
+from app.productcolor.router         import router as productcolor_router
 from app.report.router               import router as report_router
 from app.shipment.router             import router as shipment_router
 from app.shippingtype.router         import router as shippingtype_router
