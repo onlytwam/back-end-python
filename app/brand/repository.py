@@ -30,13 +30,15 @@ def get_all_brands(
     if active_only:
         query = query.filter(Brand.isActive == True)
 
-    # Exclude brands that have no active + approved + non-deleted products
+    # Brands page: only show brands that have at least one active, non-deleted product.
+    # We intentionally do NOT filter by product.state — the storefront only gates on
+    # isActive + deletedInd, so a brand whose product is in "Draft"/"Created" state but
+    # isActive=True should still appear on the brands page.
     if with_products_only:
         has_live_product = exists().where(
-            Products.brandId   == Brand.brandId,
+            Products.brandId    == Brand.brandId,
             Products.deletedInd == False,
             Products.isActive   == True,
-            Products.state.ilike("approved"),
         )
         query = query.filter(has_live_product)
 
