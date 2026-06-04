@@ -55,7 +55,7 @@ async def get_current_user_optional(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _frontend_url() -> str:
-    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"
+    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"  #  PayG and causes silent failures
 
 
 def _record_payment_log(
@@ -295,7 +295,7 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         item_rows = db.execute(text("""
             SELECT
                 p."Name",
-                COALESCE(pv."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
+                COALESCE(p."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
                 oi."Quantity", oi."Price",
                 thc."HSNCode"
             FROM twam."OrderItems" oi

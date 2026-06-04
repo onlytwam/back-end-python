@@ -1,31 +1,14 @@
+# app/products/router.py
 import json
-import os
-import re
-import uuid
-from typing import Optional, List
-
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
-
 from database import get_db
-from app.auth.dependencies import get_current_user, Roles
 from . import schemas, repository
-from .models import ProductImage, ProductVariant
-from app.products.models import Products
-from app.shared.azure_storage import upload_image, delete_image, AZURE_BASE_URL, CONTAINERS
-from app.shared.url_helpers import resolve_url
+from app.auth.dependencies import get_current_user, require_roles, Roles, CurrentUser
 
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+router = APIRouter(prefix="/api/Products", tags=["Products"])
 
-router = APIRouter(
-    prefix="/api/ProductVariants",
-    tags=["ProductVariants"]
-)
-
-
-# ─────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────
 
 def parse_filters(raw: Optional[str]) -> Optional[list]:
     if not raw:
@@ -37,268 +20,218 @@ def parse_filters(raw: Optional[str]) -> Optional[list]:
         raise HTTPException(status_code=400, detail="Invalid Filters format.")
 
 
-def sanitize_folder_name(name: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9_-]', '', name or "default")
-
-
-# ─────────────────────────────────────────────────────────────
-# CRUD APIs
-# ─────────────────────────────────────────────────────────────
-
-@router.get("", response_model=schemas.ProductVariantListResponse)
-def get_variants(
-    Filters: Optional[str] = Query(None, alias="Filters"),
+# ── PUBLIC: list products ─────────────────────────────────────────────────────
+@router.get("/", response_model=schemas.ProductListResponse)
+def get_products(
+    Filters:         Optional[str]  = Query(None, alias="Filters"),
     Order_Ascending: Optional[bool] = Query(None, alias="Order.Ascending"),
-    Order_Property: Optional[str] = Query(None, alias="Order.Property"),
-    Page_Index: Optional[int] = Query(None, alias="Page.Index", ge=1),
-    Page_Size: Optional[int] = Query(None, alias="Page.Size", ge=1),
-    db: Session = Depends(get_db)
+    Order_Property:  Optional[str]  = Query(None, alias="Order.Property"),
+    Page_Index:      Optional[int]  = Query(None, alias="Page.Index", ge=1),
+    Page_Size:       Optional[int]  = Query(None, alias="Page.Size",  ge=1),
+    adminView:       bool           = Query(False, alias="adminView"),
+    db: Session = Depends(get_db),
 ):
-    return repository.get_all_variants(
+    return repository.get_all_products(
         db=db,
         filters=parse_filters(Filters),
         order_ascending=Order_Ascending,
         order_property=Order_Property,
         page_index=Page_Index,
         page_size=Page_Size,
+        public_only=not adminView,
     )
 
 
-@router.get("/{variant_id}", response_model=schemas.ProductVariantResponse)
-def get_variant(variant_id: int, db: Session = Depends(get_db)):
-    result = repository.get_variant_by_id(db, variant_id)
+# ── ADMIN: search products by name or productCode ────────────────────────────
+# Must be defined BEFORE /{product_id} to avoid catch-all interception
+@router.get("/Search", response_model=schemas.ProductListResponse,
+            dependencies=[Depends(get_current_user)])
+def search_products(
+    q:          str           = Query(..., min_length=1, description="Search term for name or product code"),
+    Page_Index: Optional[int] = Query(1,   alias="Page.Index", ge=1),
+    Page_Size:  Optional[int] = Query(20,  alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+):
+    """
+    Search products by name OR productCode (case-insensitive contains).
+    Returns the same ProductListResponse shape as the main listing.
+    """
+    filters = [
+        {"property": "name",        "comparison": "contains", "value": q},
+        {"property": "productCode", "comparison": "contains", "value": q},
+    ]
+    return repository.search_products_by_name_or_code(
+        db, q=q,
+        page_index=Page_Index or 1,
+        page_size=Page_Size  or 20,
+    )
+
+
+# ── ADMIN: find product by StockId (on any variant detail) ───────────────────
+@router.get("/SearchByStockId", response_model=schemas.ProductListResponse,
+            dependencies=[Depends(get_current_user)])
+def search_by_stock_id(
+    stockId: str = Query(..., min_length=1, description="StockId to look up in ProductVariantDetail"),
+    db: Session  = Depends(get_db),
+):
+    """
+    Find the product(s) that own a ProductVariantDetail with the given StockId.
+    Exact match — returns the parent product card(s).
+    """
+    return repository.search_products_by_stock_id(db, stock_id=stockId.strip())
+
+
+# ── PUBLIC: get single product ────────────────────────────────────────────────
+@router.get("/{product_id}", response_model=schemas.ProductResponse)
+def get_product(product_id: int, db: Session = Depends(get_db)):
+    result = repository.get_product_by_id(db, product_id)
     if not result:
-        raise HTTPException(status_code=404, detail="ProductVariant not found.")
+        raise HTTPException(status_code=404, detail="Product not found.")
     return result
 
 
-@router.post("", status_code=201)
-def create_variant(command: schemas.ProductVariantCreate, db: Session = Depends(get_db)):
-    new_id = repository.create_variant(db, command)
+# ── PROTECTED: create product ─────────────────────────────────────────────────
+@router.post("/", status_code=201,
+             dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
+def create_product(command: schemas.ProductCreate, request: Request, db: Session = Depends(get_db)):
+    new_id = repository.create_product(db, command)
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    try:
+        from app.stocklog.repository import add_audit_event as add_event
+        source = request.headers.get("X-Event-Source", "ProductDetail")
+        add_event(
+            db,
+            product_id   = new_id,
+            event_type   = "PRODUCT_CREATED",
+            event_source = source,
+            description  = f"Product created: {getattr(command, 'name', '') or ''} [{getattr(command, 'productCode', '') or ''}]",
+            changed_by   = getattr(command, "createdBy", None) or "system",
+            product_code = getattr(command, "productCode", None),
+            product_name = getattr(command, "name", None),
+        )
+    except Exception:
+        pass
+
+    return {"productId": new_id}
+
+
+# ── PROTECTED: update product ─────────────────────────────────────────────────
+@router.put("/{product_id}",
+            dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER,
+                                                Roles.INVENTORY_MANAGER))])
+def update_product(product_id: int, command: schemas.ProductUpdate, db: Session = Depends(get_db)):
+    result = repository.update_product(db, product_id, command)
+    if not result:
+        raise HTTPException(status_code=404, detail="Product not found.")
+    return {"productId": result}
+
+
+# ── PROTECTED: toggle active/inactive ────────────────────────────────────────
+@router.patch("/{product_id}/toggle-active",
+              dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
+def toggle_product_active(product_id: int, db: Session = Depends(get_db)):
+    result = repository.toggle_product_active(db, product_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Product not found.")
+    return result
+
+
+# ── PROTECTED: delete product ─────────────────────────────────────────────────
+@router.delete("/{product_id}", status_code=204,
+               dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))])
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    # Fetch name before deletion for the audit log
+    product = None
+    try:
+        product = repository.get_product_by_id(db, product_id)
+    except Exception:
+        pass
+
+    result = repository.delete_product(db, product_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
     # ── Audit log ─────────────────────────────────────────────────────────────
     try:
         from app.stocklog.repository import add_audit_event as add_event
         add_event(
             db,
-            product_id         = getattr(command, "productId", 0),
-            product_variant_id = new_id,
-            event_type         = "VARIANT_ADDED",
-            event_source       = "ProductDetail",
-            description        = f"Variant added: {getattr(command, 'variantName', '') or ''} [{getattr(command, 'color', '') or ''}]",
-            changed_by         = getattr(command, "createdBy", None) or "Admin",
-            product_code       = getattr(command, "productCode", None),
-            variant_name       = getattr(command, "variantName", None),
-        )
-    except Exception:
-        pass
-    return {"productVariantId": new_id}
-
-
-@router.put("/{variant_id}")
-def update_variant(variant_id: int, command: schemas.ProductVariantUpdate, db: Session = Depends(get_db)):
-    result = repository.update_variant(db, variant_id, command)
-    if not result:
-        raise HTTPException(status_code=404, detail="ProductVariant not found.")
-    return {"productVariantId": result}
-
-
-@router.delete("/{variant_id}", status_code=204)
-def delete_variant(variant_id: int, db: Session = Depends(get_db)):
-    # Snapshot before deletion for audit log
-    variant_snap = None
-    try:
-        variant_snap = repository.get_variant_by_id(db, variant_id)
-    except Exception:
-        pass
-    result = repository.delete_variant(db, variant_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="ProductVariant not found.")
-    # ── Audit log ─────────────────────────────────────────────────────────────
-    try:
-        from app.stocklog.repository import add_audit_event as add_event
-        add_event(
-            db,
-            product_id         = variant_snap.get("productId", 0) if variant_snap else 0,
-            product_variant_id = variant_id,
-            event_type         = "VARIANT_DELETED",
-            event_source       = "ProductDetail",
-            description        = f"Variant deleted: {variant_snap.get('variantName','') if variant_snap else ''} [ID {variant_id}]",
-            changed_by         = "Admin",
-            variant_name       = variant_snap.get("variantName") if variant_snap else None,
+            product_id   = product_id,
+            event_type   = "PRODUCT_DELETED",
+            event_source = "ProductDetail",
+            description  = f"Product deleted: {product.get('name', '') if product else ''} [{product.get('productCode', '') if product else product_id}]",
+            changed_by   = "Admin",
+            product_code = product.get("productCode") if product else None,
+            product_name = product.get("name") if product else None,
         )
     except Exception:
         pass
 
 
-# ─────────────────────────────────────────────────────────────
-# GET IMAGES
-# ─────────────────────────────────────────────────────────────
+# ── PROTECTED: validate product ───────────────────────────────────────────────
+@router.post("/CheckProductValidations", response_model=schemas.ProductValidationResponse,
+             dependencies=[Depends(get_current_user)])
+def check_product_validations(command: schemas.ProductValidationRequest, db: Session = Depends(get_db)):
+    is_valid = repository.check_product_validations(db, command.productId, command.state)
+    return {"isValid": is_valid}
 
+# ── ADMIN: retroactively recalculate CGST/SGST for one product's PVDs ────────
+@router.post(
+    "/{product_id}/recalculate-taxes",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+    summary="Recalculate CGST/SGST on all PVDs for a product",
+)
+def recalculate_product_taxes(product_id: int, db: Session = Depends(get_db)):
+    """
+    Re-computes CGST, SGST, and TaxAmount for every active PVD of this product
+    using the product's current TaxHSNCode and each PVD's FinalPrice.
 
-# ── toggle variant active/inactive (isActive only — NOT deletedInd) ──────────
-@router.patch("/{variant_id}/toggle-active", dependencies=[Depends(get_current_user)])
-def toggle_variant_active(variant_id: int, db: Session = Depends(get_db)):
-    from datetime import datetime, timezone
-    from sqlalchemy import or_
-    v = db.query(ProductVariant).filter(
-        ProductVariant.productVariantId == variant_id,
-        or_(ProductVariant.deletedInd == False, ProductVariant.deletedInd.is_(None)),
-    ).first()
-    if not v:
-        raise HTTPException(status_code=404, detail="Variant not found.")
-    # Treat NULL isActive as True (active), then toggle to False
-    current_state  = v.isActive if v.isActive is not None else True
-    new_state      = not current_state
-    v.isActive     = new_state
-    v.modifiedDate = datetime.now(timezone.utc)
-    db.commit()
-    return {"variantId": variant_id, "isActive": new_state}
-
-@router.get("/{variant_id}/images")
-def get_variant_images(variant_id: int, db: Session = Depends(get_db)):
-    variant = db.query(ProductVariant).filter(
-        ProductVariant.productVariantId == variant_id,
-        (ProductVariant.deletedInd == False) | (ProductVariant.deletedInd.is_(None)),
-    ).first()
-    if not variant:
-        raise HTTPException(status_code=404, detail="Variant not found")
-
-    # Strict per-variant query — no product-level fallback.
-    # The fallback (fetching all productId images when variant has none) was the
-    # root cause of every variant showing the same image pool.
-    images = db.query(ProductImage).filter(
-        ProductImage.productVariantId == variant_id,
-        (ProductImage.deletedInd == False) | (ProductImage.deletedInd.is_(None)),
-    ).order_by(ProductImage.productImageId.asc()).all()
-
-    return [
-        {
-            "productImageId":  img.productImageId,
-            "productId":       img.productId,
-            "productVariantId": img.productVariantId,
-            "fileName":        img.fileName,
-            "filePath":        resolve_url(img.filePath),
-            "imageUrl":        resolve_url(img.filePath),
-            "fileType":        img.fileType,
-        }
-        for img in images
-    ]
-
-
-# ─────────────────────────────────────────────────────────────
-# UPLOAD IMAGES
-# ─────────────────────────────────────────────────────────────
-
-@router.post("/{variant_id}/images", status_code=201)
-def upload_variant_images(
-    variant_id: int,
-    files: List[UploadFile] = File(...),
-    db: Session = Depends(get_db)
-):
-    variant = db.query(ProductVariant).filter(
-        ProductVariant.productVariantId == variant_id
-    ).first()
-    if not variant:
-        raise HTTPException(status_code=404, detail="Variant not found")
-
-    product = db.query(Products).filter(
-        Products.productId == variant.productId
-    ).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    # Use product name as the subfolder so each product's images are grouped together
-    raw_folder_name = product.name or product.productCode or str(product.productId)
-    product_folder = sanitize_folder_name(raw_folder_name)
-
-    saved_images = []
-    uploaded_blob_paths = []
-
-    try:
-        for f in files:
-            if not f.content_type.startswith("image/"):
-                raise HTTPException(status_code=400, detail="Only image files are allowed")
-
-            # Validate size before uploading
-            content = f.file.read()
-            if len(content) > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail="File too large (max 5MB)")
-            f.file.seek(0)
-
-            # upload_image handles container auto-creation + local fallback
-            # Each product gets its own named subfolder: products/<ProductName>/
-            file_url = upload_image(f, container_key="products", folder=product_folder)
-            uploaded_blob_paths.append(file_url)
-
-            img = ProductImage(
-                productId        = variant.productId,
-                productVariantId = variant_id,
-                fileName         = f.filename,
-                fileType         = f.content_type,
-                filePath         = file_url,
-            )
-            db.add(img)
-            db.flush()
-            saved_images.append(img)
-
-        db.commit()
-    except HTTPException:
-        db.rollback()
-        for path in uploaded_blob_paths:
-            delete_image(path)
-        raise
-    except Exception as exc:
-        db.rollback()
-        for path in uploaded_blob_paths:
-            delete_image(path)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Image uploaded to storage but DB save failed: {exc}",
-        ) from exc
-
+    Use this when:
+    - A TaxHSNCode was attached to an existing product that already had PVDs.
+    - The product's HSN code was changed and you want to force a re-sync.
+    - You need to confirm existing PVD tax values are up to date.
+    """
+    result = repository.recalculate_pvd_taxes_for_product(db, product_id)
     return {
-        "uploaded": len(saved_images),
-        "images": [
-            {
-                "productImageId": img.productImageId,
-                "filePath":       resolve_url(img.filePath),
-                "imageUrl":       resolve_url(img.filePath),
-            }
-            for img in saved_images
-        ],
+        "productId": product_id,
+        **result,
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# DELETE IMAGE
-# ─────────────────────────────────────────────────────────────
+# ── ADMIN: retroactively recalculate ALL products that have a TaxHSNCode ─────
+@router.post(
+    "/bulk-recalculate-taxes",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN))],
+    summary="Recalculate CGST/SGST across all products that have an HSN code",
+)
+def bulk_recalculate_all_taxes(db: Session = Depends(get_db)):
+    """
+    Sweeps every product that has a TaxHSNCodeId set and re-computes CGST/SGST
+    on all its PVDs.  Useful for one-time data fixes or after a GST rate change.
 
-@router.delete("/{variant_id}/images/{image_id}", status_code=200)
-def delete_variant_image(
-    variant_id: int,
-    image_id: int,
-    db: Session = Depends(get_db)
-):
-    variant = db.query(ProductVariant).filter(
-        ProductVariant.productVariantId == variant_id,
-        (ProductVariant.deletedInd == False) | (ProductVariant.deletedInd.is_(None)),
-    ).first()
-    if not variant:
-        raise HTTPException(status_code=404, detail="Variant not found")
+    This operation can be slow on large catalogs — it processes every PVD row.
+    Errors on individual PVDs are collected but do not abort the sweep.
+    """
+    rows = db.execute(
+        __import__("sqlalchemy").text(
+            'SELECT DISTINCT "ProductId" FROM twam."Products" '            'WHERE "TaxHSNCodeId" IS NOT NULL AND "DeletedInd" = false'
+        )
+    ).fetchall()
 
-    img = db.query(ProductImage).filter(
-        ProductImage.productImageId == image_id,
-        (ProductImage.deletedInd == False) | (ProductImage.deletedInd.is_(None)),
-    ).first()
+    product_ids = [r[0] for r in rows]
+    total_updated = total_skipped = 0
+    all_errors: list = []
 
-    if not img or (img.productVariantId not in (None, variant_id) and img.productId != variant.productId):
-        raise HTTPException(status_code=404, detail="Image not found")
+    for pid in product_ids:
+        result = repository.recalculate_pvd_taxes_for_product(db, pid)
+        total_updated += result.get("updated", 0)
+        total_skipped += result.get("skipped", 0)
+        all_errors.extend(result.get("errors", []))
 
-    # delete_image handles both Azure URLs and local /uploads/... paths
-    if img.filePath:
-        delete_image(img.filePath)
-
-    img.deletedInd = True
-    db.commit()
-
-    return {"deleted": image_id}
+    return {
+        "productsProcessed": len(product_ids),
+        "pvdsUpdated":       total_updated,
+        "pvdsSkipped":       total_skipped,
+        "errors":            all_errors,
+    }

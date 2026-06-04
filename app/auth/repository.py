@@ -34,7 +34,8 @@ from fastapi import HTTPException, UploadFile, Request
 
 
 
-from .models import IdentityUser, UserRole
+from .models import IdentityUser
+from app.userrole.models import UserRole
 
 from app.people.models import People
 
