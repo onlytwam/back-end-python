@@ -100,10 +100,14 @@ def _get_variant_images(db: Session, product_variant_id: int, product_id: int) -
     return [
         {
             "productImageId": r[0],
-            "fileName": r[1],
-            "filePath": r[2],
-            "fileType": r[3],
-            "fileData": _image_path_to_url(r[2]),
+            "fileName":  r[1],
+            # filePath is always the resolved full URL so every consumer
+            # (ProductDetail, QuickShopModal, guest-cart storage, etc.) gets
+            # the correct https:// URL without any extra client-side mapping.
+            "filePath":  _image_path_to_url(r[2]),
+            "fileType":  r[3],
+            # fileData kept for backwards-compat; identical value.
+            "fileData":  _image_path_to_url(r[2]),
         }
         for r in rows
     ]
