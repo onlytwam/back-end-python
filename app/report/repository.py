@@ -449,9 +449,14 @@ def get_coupon_usage_report(db: Session, filters, page_index, page_size):
             {order_date_clause('o')}
         WHERE 1=1
           {org_clause('pc')}
-          {'AND pc."UsedAt" >= \'' + str(from_date) + '\'' if from_date else ''}
-          {'AND pc."UsedAt" <= \'' + str(to_date) + ' 23:59:59\'' if to_date else ''}
-        GROUP BY
+          _pc_from_clause = ("AND pc.\"UsedAt\" >= '" + str(from_date) + "'") if from_date else ""
+_pc_to_clause   = ("AND pc.\"UsedAt\" <= '" + str(to_date) + " 23:59:59'") if to_date else ""
+physical_coupon_sql = f"""
+    ...
+          {_pc_from_clause}
+          {_pc_to_clause}
+    ...
+"""
             pc."CouponCode", pc."Description", pc."Discount", pc."IsUsed"
     """
 
