@@ -3,18 +3,11 @@ app/payment/payg_client.py
 ──────────────────────────
 BUG FIXES IN THIS VERSION:
 
-1. [CRITICAL] 9020 Invalid Authorization on Detail API
-   The Detail API (/payment/api/order/detail) uses a DIFFERENT auth format
-   from the Create API (/payment/api/order/create).
-
+1. Detail API auth format — FIXED
    Create API  → Basic base64(auth_key:auth_token:merchant_key_id:mid)
    Detail API  → Basic base64(auth_key:auth_token)   ← shorter, no mid/key_id
 
-   Previous code had _build_detail_auth_header() commented out and
-   get_payg_order_detail() was still calling _build_auth_header() (the
-   4-part Create format). PayG rejected every Detail call with HTTP 400
-   code 9020. Fix: _build_detail_auth_header() is now active and is the
-   only function called inside get_payg_order_detail().
+   _build_detail_auth_header() is active and called inside get_payg_order_detail().
 
 2. _parse_response_code() — safely coerces None/null → -1 (UNKNOWN sentinel)
 3. payment_code_to_order_state() — maps only real PayG codes (1, 2, 4) + -1
@@ -176,24 +169,24 @@ def _build_auth_header() -> str:
     return f"Basic {encoded}"
 
 
-# def _build_detail_auth_header() -> str:
-#     """
-#     Auth header for DETAIL API.
-#     Format: Basic base64(auth_key:auth_token)
+def _build_detail_auth_header() -> str:
+    """
+    Auth header for DETAIL API.
+    Format: Basic base64(auth_key:auth_token)
 
-#     PayG's Detail endpoint uses a SHORTER auth format — only key:token,
-#     WITHOUT merchant_key_id and mid appended. Using the Create format
-#     (4 parts) on the Detail endpoint returns HTTP 400 code 9020
-#     'Invalid Authorization' on every single call.
-#     """
-#     auth_key   = _strip_0x(_cfg("payg_auth_key"))
-#     auth_token = _strip_0x(_cfg("payg_auth_token"))
+    PayG's Detail endpoint uses a SHORTER auth format — only key:token,
+    WITHOUT merchant_key_id and mid appended. Using the Create format
+    (4 parts) on the Detail endpoint returns HTTP 400 code 9020
+    'Invalid Authorization' on every single call.
+    """
+    auth_key   = _strip_0x(_cfg("payg_auth_key"))
+    auth_token = _strip_0x(_cfg("payg_auth_token"))
 
-#     print(f"[PayG] Detail auth header built (key:token format)")
+    print(f"[PayG] Detail auth header built (key:token format)")
 
-#     raw     = f"{auth_key}:{auth_token}"
-#     encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
-#     return f"Basic {encoded}"
+    raw     = f"{auth_key}:{auth_token}"
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
+    return f"Basic {encoded}"
 
 
 # ── Hash ───────────────────────────────────────────────────────────────────
@@ -427,11 +420,10 @@ def get_payg_order_detail(
 
     ref = order_key_id or unique_request_id
 
-    # FIX: Detail API uses shorter auth format — only auth_key:auth_token.
+    # Detail API uses shorter auth format — only auth_key:auth_token.
     # NOT the 4-part Create format (auth_key:auth_token:merchant_key_id:mid).
-    # Using _build_auth_header() here causes HTTP 400 code 9020 every time.
     headers = {
-        # "Authorization": _build_detail_auth_header(),
+        "Authorization": _build_detail_auth_header(),
         "Content-Type":  "application/json",
     }
 
