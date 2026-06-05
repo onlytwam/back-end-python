@@ -311,6 +311,77 @@ def delete_category_image(category_id: int, db: Session = Depends(get_db)):
     return {"success": True, "categoryId": category_id}
 
 
+@router.put(
+    "/{category_id}/mobile-banner",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def upload_mobile_banner_image(
+    category_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload / replace the mobile banner image for a category (admin only).
+    This image is served to the mobile app via GET /api/Category/{id}/mobile-banner
+    and is NOT used on the desktop website.
+    """
+    cat = db.query(repository.Category).filter(
+        repository.Category.categoryId == category_id,
+        repository.Category.deletedInd == False,
+    ).first()
+    if not cat:
+        raise HTTPException(404, "Category not found.")
+
+    old_url = cat.mobileBannerImage or ""
+    new_url = upload_image(file, container_key="category", folder=f"category_{category_id}_mobile")
+
+    cat.mobileBannerImage = new_url
+    cat.modifiedDate      = datetime.now(timezone.utc)
+    db.commit()
+
+    if old_url and old_url != new_url:
+        delete_image(old_url)
+
+    return {
+        "success":    True,
+        "categoryId": category_id,
+        "imageUrl":   resolve_url(new_url),
+    }
+
+
+@router.delete(
+    "/{category_id}/mobile-banner",
+    dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],
+)
+def delete_mobile_banner_image(category_id: int, db: Session = Depends(get_db)):
+    """Remove the mobile banner image for a category."""
+    old_url = repository.delete_mobile_banner_image(db, category_id)
+    if old_url is None and not repository.get_category_by_id(db, category_id):
+        raise HTTPException(404, "Category not found.")
+    if old_url:
+        delete_image(old_url)
+    return {"success": True, "categoryId": category_id}
+
+
+@router.get(
+    "/{category_id}/mobile-banner",
+)
+def get_mobile_banner_image(category_id: int, db: Session = Depends(get_db)):
+    """Public endpoint — returns the mobile banner image URL for a category.
+    Mobile team: call GET /api/Category/{categoryId}/mobile-banner to get the image.
+    Response: { "categoryId": 1, "imageUrl": "https://..." }
+    """
+    cat = db.query(repository.Category).filter(
+        repository.Category.categoryId == category_id,
+        repository.Category.deletedInd == False,
+    ).first()
+    if not cat:
+        raise HTTPException(404, "Category not found.")
+    return {
+        "categoryId": category_id,
+        "imageUrl":   resolve_url(cat.mobileBannerImage) if cat.mobileBannerImage else None,
+    }
+
+
 @router.delete(
     "/{category_id}",
     dependencies=[Depends(require_roles(Roles.SUPER_ADMIN, Roles.PRODUCT_MANAGER))],

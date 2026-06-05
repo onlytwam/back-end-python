@@ -23,3 +23,4 @@ class Category(Base):
     createdBy       = Column("CreatedBy",        String,     nullable=True)
     modifiedBy      = Column("ModifiedBy",       String,     nullable=True)
     organizationId  = Column("OrganizationId",   Integer,    nullable=True)
+    mobileBannerImage = Column("MobileBannerImage", String,  nullable=True)
