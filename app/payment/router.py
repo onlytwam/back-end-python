@@ -127,11 +127,13 @@ def _send_payment_notification(db: Session, order_id: int, success: bool) -> Non
 def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") -> dict:
     detail: dict = {}
     try:
-        # Prefer UniqueRequestId (rid); fall back to OrderKeyId when rid is absent.
-        if rid:
-            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
-        elif order_key_id:
+        # Prefer OrderKeyId (most reliable) → fall back to UniqueRequestId (rid).
+        # PayG Detail API doc: body = { "OrderKeyId": "...", "MID": "..." }
+        # UniqueRequestId also works but OrderKeyId is the authoritative reference.
+        if order_key_id:
             detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+        elif rid:
+            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
         else:
             print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
             return {}

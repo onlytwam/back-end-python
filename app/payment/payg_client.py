@@ -420,11 +420,11 @@ def get_payg_order_detail(
 
     ref = order_key_id or unique_request_id
 
-    # Detail API uses shorter auth format — only auth_key:auth_token.
-    # NOT the 4-part Create format (auth_key:auth_token:merchant_key_id:mid).
+    # PayG Detail API authenticates via MID in the request body only.
+    # No Authorization header should be sent — PayG returns 400/9020 if
+    # any Authorization header is present, regardless of format.
     headers = {
-        "Authorization": _build_detail_auth_header(),
-        "Content-Type":  "application/json",
+        "Content-Type": "application/json",
     }
 
     detail_url   = _get_detail_url()
