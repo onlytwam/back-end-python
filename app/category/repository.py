@@ -84,6 +84,7 @@ def get_all_categories(
             "groupCategoryId":    r.groupCategoryId,
             "isActive":           r.isActive,
             "categoryImage":      _to_url(r.categoryImage),
+            "mobileBannerImage":  _to_url(r.mobileBannerImage) if hasattr(r, "mobileBannerImage") else None,
             "createdDate":        r.createdDate,
             "modifiedDate":       r.modifiedDate,
             "deletedInd":         bool(r.deletedInd) if r.deletedInd is not None else False,
@@ -109,6 +110,7 @@ def get_category_by_id(db: Session, category_id: int) -> Optional[dict]:
         "groupCategoryId":  cat.groupCategoryId,
         "isActive":         cat.isActive,
         "categoryImage":    _to_url(cat.categoryImage),
+        "mobileBannerImage": _to_url(cat.mobileBannerImage) if hasattr(cat, "mobileBannerImage") else None,
         "createdDate":      cat.createdDate,
         "modifiedDate":     cat.modifiedDate,
     }
@@ -127,6 +129,7 @@ def create_category(db: Session, data) -> int:
         groupCategoryId  = data.groupCategoryId if data.groupCategoryId is not None else auto_group,
         isActive         = data.isActive if data.isActive is not None else True,
         categoryImage    = storage_path_for_db(data.categoryImage),
+        mobileBannerImage = storage_path_for_db(data.mobileBannerImage) if getattr(data, "mobileBannerImage", None) else None,
         createdDate      = datetime.now(timezone.utc),
         deletedInd       = False,
     )
@@ -153,6 +156,8 @@ def update_category(db: Session, category_id: int, data) -> Optional[int]:
     cat.isActive         = data.isActive if data.isActive is not None else True
     if data.categoryImage is not None:
         cat.categoryImage = storage_path_for_db(data.categoryImage)
+    if getattr(data, 'mobileBannerImage', None) is not None:
+        cat.mobileBannerImage = storage_path_for_db(data.mobileBannerImage)
     cat.modifiedDate     = datetime.now(timezone.utc)
 
     if data.groupCategoryId is not None:
@@ -251,6 +256,21 @@ def toggle_category_visibility(
     }
 
 
+
+def delete_mobile_banner_image(db: Session, category_id: int) -> Optional[str]:
+    """Clear the mobileBannerImage field and return the old URL for blob deletion."""
+    cat = db.query(Category).filter(
+        Category.categoryId == category_id,
+        Category.deletedInd == False
+    ).first()
+    if not cat:
+        return None
+    old_url = cat.mobileBannerImage
+    cat.mobileBannerImage = None
+    cat.modifiedDate = datetime.now(timezone.utc)
+    db.commit()
+    return old_url
+
 def delete_category_image(db: Session, category_id: int) -> Optional[str]:
     """Clear the categoryImage field and return the old URL for blob deletion."""
     cat = db.query(Category).filter(
@@ -302,6 +322,7 @@ def get_category_menu(db: Session) -> dict:
                 "url":              child.url,
                 "about":            child.about,
                 "categoryImage":    _to_url(child.categoryImage),
+                "mobileBannerImage": _to_url(child.mobileBannerImage) if hasattr(child, "mobileBannerImage") else None,
                 "parentCategoryId": child.parentCategoryId,
                 "groupCategoryId":  child.groupCategoryId,
                 "children":         _build(child.categoryId),

@@ -13,7 +13,8 @@ class CategoryCreate(BaseModel):
     groupCategoryId:  Optional[bool] = None   # auto-set in repository
     isActive:         Optional[bool] = True
     userProfileId:    Optional[str]  = None
-    categoryImage:    Optional[str]  = None
+    categoryImage:       Optional[str]  = None
+    mobileBannerImage:   Optional[str]  = None
 
 
 class CategoryUpdate(BaseModel):
@@ -25,7 +26,8 @@ class CategoryUpdate(BaseModel):
     parentCategoryId: Optional[int]  = None
     groupCategoryId:  Optional[bool] = None   # auto-set in repository
     isActive:         Optional[bool] = True
-    categoryImage:    Optional[str]  = None
+    categoryImage:       Optional[str]  = None
+    mobileBannerImage:   Optional[str]  = None
 
 
 class CategoryResponse(BaseModel):
@@ -40,6 +42,7 @@ class CategoryResponse(BaseModel):
     groupCategoryId:    Optional[bool]     = None
     isActive:           Optional[bool]     = None
     categoryImage:      Optional[str]      = None
+    mobileBannerImage:  Optional[str]      = None
     createdDate:        Optional[datetime] = None
     modifiedDate:       Optional[datetime] = None
 
