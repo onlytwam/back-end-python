@@ -127,11 +127,13 @@ def _send_payment_notification(db: Session, order_id: int, success: bool) -> Non
 def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") -> dict:
     detail: dict = {}
     try:
-        # Prefer UniqueRequestId (rid); fall back to OrderKeyId when rid is absent.
-        if rid:
-            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
-        elif order_key_id:
+        # Prefer OrderKeyId (most reliable) → fall back to UniqueRequestId (rid).
+        # PayG Detail API doc: body = { "OrderKeyId": "...", "MID": "..." }
+        # UniqueRequestId also works but OrderKeyId is the authoritative reference.
+        if order_key_id:
             detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+        elif rid:
+            detail = payg_client.get_payg_order_detail(unique_request_id=rid)
         else:
             print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
             return {}
@@ -572,7 +574,23 @@ async def payment_callback(
     # If PayG gave us code=1 or code=2 directly in the redirect params → skip.
     # If Detail API is IP-blocked (403) → log clearly and proceed with code=-1
     #   (frontend will poll via /Payment/Status and resolve the outcome).
+    #
+    # PayG only sends oid+rid in the redirect URL — no OrderKeyId param.
+    # So we look up the order from DB using oid first, then pass the stored
+    # orderKeyId to the Detail API (more reliable than UniqueRequestId).
     order_key_id_from_cb = params.get("OrderKeyId", "")
+    if not order_key_id_from_cb and oid:
+        try:
+            _early_order = db.query(Orders).filter(
+                Orders.orderId == int(oid),
+                Orders.deletedInd == False,
+            ).first()
+            if _early_order and _early_order.orderKeyId:
+                order_key_id_from_cb = _early_order.orderKeyId
+                print(f"[Payment:Callback] STEP 2 — Resolved OrderKeyId={order_key_id_from_cb!r} from DB for oid={oid!r}")
+        except Exception as _e:
+            print(f"[Payment:Callback] STEP 2 — Could not pre-fetch orderKeyId: {_e}")
+
     if not payg_gave_us_params and (oid or rid or order_key_id_from_cb):
         print(
             f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved ({payg_response_code_raw!r}); "
