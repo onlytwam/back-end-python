@@ -687,20 +687,9 @@ async def payment_callback(
         f"orderKeyId={order.orderKeyId!r} | paymentRef={order.paymentTransactionRefNo!r}"
     )
 
-    # ── STEP 4: Hash verification ─────────────────────────────────────────
-    is_uat  = get_setting("payg_mode", "uat").lower() == "uat"
-    hash_ok = payg_client.verify_callback_hash(params)
-    print(
-        f"[Payment:Callback] STEP 4 — Hash check | is_uat={is_uat} | hash_ok={hash_ok}"
-    )
-    if not is_uat and not hash_ok:
-        print(f"[Payment:Callback] STEP 4 ❌ Hash MISMATCH for order {order_id} — rejecting (LIVE mode)")
-        return RedirectResponse(
-            url=f"{_frontend_url()}/user-products/payment-callback?status=error&orderId={order_id}&message=Invalid+signature",
-            status_code=302,
-        )
-    if is_uat:
-        print(f"[Payment:Callback] STEP 4 ℹ️  UAT mode — hash check SKIPPED")
+   # ── STEP 4: Hash verification skipped ────────────────────────────────
+# PayG does not send HashData in the callback redirect.
+# Payment outcome is determined solely by the Detail API response in STEP 2.
 
     # ── STEP 5: Determine payment outcome ─────────────────────────────────
     try:
