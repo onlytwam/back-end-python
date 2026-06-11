@@ -336,6 +336,7 @@ def create_payg_order(
     }
 
     create_url = _get_create_url()
+    print(f"[PayG] Outbound IP: {httpx.get('https://api.ipify.org').text}")
     print(f"[PayG] Calling headers------{headers}")
     print(f"[PayG] Calling ---{create_url}")
     print(f"[PayG] MID={mid}|merchant_key_id={merchant_key_id}| Amount={amount_str} | Phone={clean_phone}")
