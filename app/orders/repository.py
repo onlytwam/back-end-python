@@ -841,26 +841,53 @@ def create_order(db: Session, data) -> dict:
     if not payg_shipping_state:
         payg_shipping_state = payg_billing_state
 
+    _payment_mode = str(getattr(data, "paymentMode", "") or "").upper()
+
     try:
-        _payg = create_payg_order(
-            order_id       = order_id,
-            order_number   = order.orderNumber,
-            amount         = float(getattr(data, "totalAmount", 0) or 0),
-            customer_name  = (
-                ((_user[1] or "") + " " + (_user[2] or "")).strip()
-                if _user else "Customer"
-            ),
-            customer_email = _user[0] if _user else "",
-            customer_phone = (
-                (payg_address or {}).get("phone") or (_user[3] if _user else "")
-            ),
-            billing_address = (payg_address or {}).get("addressLine", ""),
-            billing_city    = (payg_address or {}).get("city", ""),
-            billing_state   = payg_billing_state or "",
-            shipping_state  = payg_shipping_state or payg_billing_state or "",
-            billing_zip     = (payg_address or {}).get("pinCode", ""),
-            redirect_url    = _get_payg_redirect_url(db),
-        )
+        if _payment_mode == "UPI":
+            from app.payment.payg_client import create_payg_upi_intent_order
+            _payg = create_payg_upi_intent_order(
+                order_id       = order_id,
+                order_number   = order.orderNumber,
+                amount         = float(getattr(data, "totalAmount", 0) or 0),
+                customer_name  = (
+                    ((_user[1] or "") + " " + (_user[2] or "")).strip()
+                    if _user else "Customer"
+                ),
+                customer_email = _user[0] if _user else "",
+                customer_phone = (
+                    (payg_address or {}).get("phone") or (_user[3] if _user else "")
+                ),
+                billing_address = (payg_address or {}).get("addressLine", ""),
+                billing_city    = (payg_address or {}).get("city", ""),
+                billing_state   = payg_billing_state or "",
+                shipping_state  = payg_shipping_state or payg_billing_state or "",
+                billing_zip     = (payg_address or {}).get("pinCode", ""),
+                redirect_url    = _get_payg_redirect_url(db),
+            )
+        else:
+            _payg = create_payg_order(
+                order_id       = order_id,
+                order_number   = order.orderNumber,
+                amount         = float(getattr(data, "totalAmount", 0) or 0),
+                customer_name  = (
+                    ((_user[1] or "") + " " + (_user[2] or "")).strip()
+                    if _user else "Customer"
+                ),
+                customer_email = _user[0] if _user else "",
+                customer_phone = (
+                    (payg_address or {}).get("phone") or (_user[3] if _user else "")
+                ),
+                billing_address = (payg_address or {}).get("addressLine", ""),
+                billing_city    = (payg_address or {}).get("city", ""),
+                billing_state   = payg_billing_state or "",
+                shipping_state  = payg_shipping_state or payg_billing_state or "",
+                billing_zip     = (payg_address or {}).get("pinCode", ""),
+                redirect_url    = _get_payg_redirect_url(db),
+                # "CARD" (mobile card button) → DB|CC only, hides QR/UPI.
+                # empty/None (website, unchanged) → "" → combined screen.
+                accepted_payment_types = "DB|CC" if _payment_mode == "CARD" else "",
+            )
     except Exception as _exc:
         # ── PayG failed: roll back everything so no orphan order is saved ──
         import traceback
@@ -881,7 +908,7 @@ def create_order(db: Session, data) -> dict:
     # Marking them here would hide items from the cart even if payment fails,
     # preventing the user from retrying with those same products.
 
-    return {"orderId": order_id, "paymentProcessUrl": payment_url}
+    return {"orderId": order_id, "paymentProcessUrl": payment_url, "upiLink": _payg.get("UpiLink")}
 
 
 # ── ReOrder (Cart) ────────────────────────────────────────────────────────────
@@ -1010,21 +1037,41 @@ def create_guest_order(db: Session, data) -> dict:
         _state_id = getattr(data, "stateId", None)
     _state_name = _get_state_name(db, _state_id) or getattr(data, "state", "") or ""
 
+    _payment_mode = str(getattr(data, "paymentMode", "") or "").upper()
+
     try:
-        _payg = create_payg_order(
-            order_id        = order_id,
-            order_number    = order.orderNumber,
-            amount          = float(getattr(data, "totalAmount", 0) or 0),
-            customer_name   = _name or "Guest",
-            customer_email  = _email,
-            customer_phone  = _phone,
-            billing_address = _addr_line,
-            billing_city    = _city,
-            billing_state   = _state_name,
-            shipping_state  = _state_name,
-            billing_zip     = _zip,
-            redirect_url    = _get_payg_redirect_url(db),
-        )
+        if _payment_mode == "UPI":
+            from app.payment.payg_client import create_payg_upi_intent_order
+            _payg = create_payg_upi_intent_order(
+                order_id        = order_id,
+                order_number    = order.orderNumber,
+                amount          = float(getattr(data, "totalAmount", 0) or 0),
+                customer_name   = _name or "Guest",
+                customer_email  = _email,
+                customer_phone  = _phone,
+                billing_address = _addr_line,
+                billing_city    = _city,
+                billing_state   = _state_name,
+                shipping_state  = _state_name,
+                billing_zip     = _zip,
+                redirect_url    = _get_payg_redirect_url(db),
+            )
+        else:
+            _payg = create_payg_order(
+                order_id        = order_id,
+                order_number    = order.orderNumber,
+                amount          = float(getattr(data, "totalAmount", 0) or 0),
+                customer_name   = _name or "Guest",
+                customer_email  = _email,
+                customer_phone  = _phone,
+                billing_address = _addr_line,
+                billing_city    = _city,
+                billing_state   = _state_name,
+                shipping_state  = _state_name,
+                billing_zip     = _zip,
+                redirect_url    = _get_payg_redirect_url(db),
+                accepted_payment_types = "DB|CC" if _payment_mode == "CARD" else "",
+            )
     except Exception as _exc:
         import traceback
         print(f"[Payment] ❌ PayG initiation FAILED — rolling back guest order {order_id}:")
@@ -1039,7 +1086,7 @@ def create_guest_order(db: Session, data) -> dict:
     db.add(order)
     db.commit()
 
-    return {"orderId": order_id, "paymentProcessUrl": payment_url}
+    return {"orderId": order_id, "paymentProcessUrl": payment_url, "upiLink": _payg.get("UpiLink")}
 
 
 # ── Cancel Order ──────────────────────────────────────────────────────────────
