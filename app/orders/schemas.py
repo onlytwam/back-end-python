@@ -94,6 +94,9 @@ class CreateOrderRequest(BaseModel):
     isWhatsappNotification: Optional[bool] = None
     paymentMethod: Optional[str] = None
     paymentAccount: Optional[str] = None
+    # "UPI" → routes to PayG UPI Intent API (returns upiLink for mobile app redirect)
+    # anything else / empty → standard Card/DB/CC create API
+    paymentMode: Optional[str] = None
     platform: Optional[str] = None
     # Surprise gift — set by the cart UI when a gift is unlocked
     surpriseGiftRuleId: Optional[int] = None
@@ -136,6 +139,7 @@ class CreateGuestOrderRequest(BaseModel):
     typeId: Optional[int] = None
     orderItems: Optional[List[OrderItemInput]] = None
     isWhatsappNotification: Optional[bool] = None
+    paymentMode: Optional[str] = None
 
 
 # ── Return Order ──────────────────────────────────────────────────────────────

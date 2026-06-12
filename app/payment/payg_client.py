@@ -39,6 +39,10 @@ _LIVE_CREATE_URL = "https://apiv2.payg.in/payment/api/order/create"
 _UAT_DETAIL_URL  = "https://uatapiv2.payg.in/payment/api/order/detail"
 _LIVE_DETAIL_URL = "https://apiv2.payg.in/payment/api/order/detail"
 
+# UPI Intent — separate endpoint for mobile UPI app redirection
+_UAT_INTENT_URL  = "https://uatapiv2.payg.in/payment/api/order/CreateIntent"
+_LIVE_INTENT_URL = "https://apiv2.payg.in/payment/api/order/CreateIntent"
+
 
 # ── Response code normalisation ────────────────────────────────────────────
 
@@ -113,6 +117,10 @@ def _is_live() -> bool:
 
 def _get_create_url() -> str:
     return _LIVE_CREATE_URL if _is_live() else _UAT_CREATE_URL
+
+
+def _get_intent_url() -> str:
+    return _LIVE_INTENT_URL if _is_live() else _UAT_INTENT_URL
 
 
 def _get_detail_url() -> str:
@@ -225,7 +233,7 @@ def verify_callback_hash(response_data: dict) -> bool:
 
 # ── Order creation ─────────────────────────────────────────────────────────
 
-def create_payg_order(
+def _build_payg_payload(
     *,
     order_id: int,
     order_number: str,
@@ -239,10 +247,11 @@ def create_payg_order(
     billing_zip: str,
     redirect_url: str,
     shipping_state: Optional[str] = None,
-) -> dict:
+    accepted_payment_types: str = "",
+    payment_type: str = "",
+) -> tuple[dict, str]:
+    """Build the common PayG order payload. Returns (payload, unique_request_id)."""
     mid               = _cfg("payg_mid")
-    merchant_key_id   = _cfg("payg_merchant_key_id")
-
 
     unique_request_id = f"ORD{order_id}-{uuid.uuid4().hex[:8].upper()}"
     amount_str        = f"{float(amount):.2f}"
@@ -285,8 +294,8 @@ def create_payg_order(
         "RequestDateTime":    now_str,
         "RedirectUrl":        redirect_url_with_ids,
         "TransactionData": {
-            "AcceptedPaymentTypes":      "",
-            "PaymentType":               "",
+            "AcceptedPaymentTypes":      accepted_payment_types,
+            "PaymentType":               payment_type,
             "SurchargeType":             "",
             "SurchargeValue":            "",
             "RefTransactionId":          "",
@@ -328,6 +337,48 @@ def create_payg_order(
             "PlatformId":      "1",
         },
     }
+    return payload, unique_request_id
+
+
+def create_payg_order(
+    *,
+    order_id: int,
+    order_number: str,
+    amount: float,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: Any,
+    billing_address: str,
+    billing_city: str,
+    billing_state: str,
+    billing_zip: str,
+    redirect_url: str,
+    shipping_state: Optional[str] = None,
+    accepted_payment_types: str = "",
+) -> dict:
+    """
+    Standard order creation — used for Card / Debit / Credit / Net Banking.
+    Returns PaymentProcessUrl for the frontend to open in WebView/browser.
+
+    accepted_payment_types:
+      ""      → default (website/desktop, unchanged) — PayG shows combined
+                QR + Debit + Credit screen.
+      "DB|CC" → mobile "Card" button — PayG shows only Debit/Credit, no QR.
+    """
+    """
+    Standard order creation — used for Card / Debit / Credit / Net Banking.
+    Returns PaymentProcessUrl for the frontend to open in WebView/browser.
+    """
+    payload, unique_request_id = _build_payg_payload(
+        order_id=order_id, order_number=order_number, amount=amount,
+        customer_name=customer_name, customer_email=customer_email,
+        customer_phone=customer_phone, billing_address=billing_address,
+        billing_city=billing_city, billing_state=billing_state,
+        billing_zip=billing_zip, redirect_url=redirect_url,
+        shipping_state=shipping_state,
+        accepted_payment_types=accepted_payment_types,
+        payment_type="",
+    )
 
     # Create API uses the full 4-part auth header
     headers = {
@@ -380,7 +431,86 @@ def create_payg_order(
     return data
 
 
-# ── Order detail / status ──────────────────────────────────────────────────
+# ── UPI Intent order creation (mobile) ─────────────────────────────────────
+
+def create_payg_upi_intent_order(
+    *,
+    order_id: int,
+    order_number: str,
+    amount: float,
+    customer_name: str,
+    customer_email: str,
+    customer_phone: Any,
+    billing_address: str,
+    billing_city: str,
+    billing_state: str,
+    billing_zip: str,
+    redirect_url: str,
+    shipping_state: Optional[str] = None,
+) -> dict:
+    """
+    Calls PayG's /payment/api/order/CreateIntent endpoint (PaymentType=UPIINTENT).
+    Returns a response containing 'UpiLink' (upi://pay?...) — the mobile
+    frontend opens this URI directly to launch the user's UPI app
+    (GPay/PhonePe/Paytm/etc).
+
+    Per PayG support: same auth header / headers as the standard Create API,
+    just a different URL and PaymentType="UPIINTENT".
+    """
+    payload, unique_request_id = _build_payg_payload(
+        order_id=order_id, order_number=order_number, amount=amount,
+        customer_name=customer_name, customer_email=customer_email,
+        customer_phone=customer_phone, billing_address=billing_address,
+        billing_city=billing_city, billing_state=billing_state,
+        billing_zip=billing_zip, redirect_url=redirect_url,
+        shipping_state=shipping_state,
+        accepted_payment_types="",
+        payment_type="UPIINTENT",
+    )
+
+    headers = {
+        "Authorization": _build_auth_header(),
+        "Content-Type":  "application/json",
+    }
+
+    intent_url = _get_intent_url()
+    print(f"[PayG] Calling UPI Intent ---{intent_url}")
+    print(f"[PayG] MID={payload['MID']} | Amount={payload['OrderAmount']}")
+
+    try:
+        resp = _safe_json_post(intent_url, payload, headers, timeout=15.0)
+        print(f"[PayG] HTTP {resp.status_code} from {intent_url}")
+        print(f"[PayG] Response body: {resp.text[:1000]}")
+        resp.raise_for_status()
+        data = resp.json()
+
+    except httpx.ConnectTimeout as exc:
+        raise RuntimeError(
+            "PayG UPI Intent gateway unreachable (connect timeout)."
+        ) from exc
+
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"PayG UPI Intent HTTP error {exc.response.status_code}: {exc.response.text}"
+        ) from exc
+
+    except Exception as exc:
+        raise RuntimeError(f"PayG UPI Intent request failed: {exc}") from exc
+
+    upi_link = data.get("UpiLink")
+    if not upi_link:
+        error_msg = (
+            data.get("PaymentResponseText") or data.get("ResponseMessage")
+            or data.get("Message") or data.get("Error")
+            or "No UpiLink in response"
+        )
+        raise RuntimeError(f"PayG UPI Intent failed — {error_msg}. Full response: {json.dumps(data)}")
+
+    data["_unique_request_id"] = unique_request_id
+    return data
+
+
+
 
 def get_payg_order_detail(
     order_key_id: Optional[str] = None,
