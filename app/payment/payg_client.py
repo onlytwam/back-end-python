@@ -390,8 +390,8 @@ def create_payg_order(
     print(f"[PayG] Outbound IP: {httpx.get('https://api.ipify.org').text}")
     print(f"[PayG] Calling headers------{headers}")
     print(f"[PayG] Calling ---{create_url}")
-    print(f"[PayG] MID={mid}|merchant_key_id={merchant_key_id}| Amount={amount_str} | Phone={clean_phone}")
-    print(f"[PayG] RedirectUrl={redirect_url_with_ids}")
+    print(f"[PayG] MID={payload['MID']} | Amount={payload['OrderAmount']} | Phone={payload['CustomerData']['MobileNo']}")
+    print(f"[PayG] RedirectUrl={payload['RedirectUrl']}")
 
     try:
         resp = _safe_json_post(create_url, payload, headers, timeout=15.0)
