@@ -177,6 +177,23 @@ def _build_auth_header() -> str:
     return f"Basic {encoded}"
 
 
+def _build_upi_intent_auth_header() -> str:
+    """
+    Auth header for UPI Intent CreateIntent API.
+    Format: Basic base64(auth_key:auth_token:M:mid)
+    NOTE: literal capital "M" replaces merchant_key_id — confirmed by PayG support.
+    """
+    auth_key   = _cfg("payg_auth_key")
+    auth_token = _cfg("payg_auth_token")
+    mid        = _cfg("payg_mid")
+
+    print(f"[PayG] Intent auth: key='{auth_key[:4]}...' token='{auth_token[:4]}...' mid='{mid}' (M literal)")
+
+    raw = f"{auth_key}:{auth_token}:M:{mid}"
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
+    return f"Basic {encoded}"
+
+
 def _build_detail_auth_header() -> str:
     """
     Auth header for DETAIL API.
@@ -469,7 +486,7 @@ def create_payg_upi_intent_order(
     )
 
     headers = {
-        "Authorization": _build_auth_header(),
+        "Authorization": _build_upi_intent_auth_header(),
         "Content-Type":  "application/json",
     }
 
