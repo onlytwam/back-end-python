@@ -23,6 +23,7 @@ class OutOfStockResult(BaseModel):
 class OrderResponse(BaseModel):
     orderId: Optional[int] = None
     paymentProcessUrl: Optional[str] = None
+    upiLink: Optional[str] = None
     outOfStockProducts: Optional[List[OutOfStockResult]] = None
     isPhoneNumber: Optional[bool] = None
     isEmailDuplicate: Optional[bool] = None
