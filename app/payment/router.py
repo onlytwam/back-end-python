@@ -1149,6 +1149,7 @@ def debug_payment(
 @router.get("/Status/{order_id}")
 async def get_payment_status(
     order_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     # FIX: use get_current_user_optional instead of get_current_user.
     # get_current_user raises HTTPException when no token is present;
@@ -1171,6 +1172,47 @@ async def get_payment_status(
             raise HTTPException(403, "Not authorised")
 
     local_state = order.state or "AwaitingPayment"
+
+    # ── UPI Intent / no-callback flows: actively poll PayG ────────────────
+    # Card payments get resolved via /Callback (browser redirect from PayG).
+    # UPI Intent has no browser redirect — the user leaves to a UPI app and
+    # nothing ever hits our server, so order.state stays "AwaitingPayment"
+    # forever unless we actively ask PayG for the live status here.
+    PENDING_STATES = {"AwaitingPayment", "Pending", "Payment Pending"}
+    if local_state in PENDING_STATES:
+        try:
+            enriched = _enrich_params_via_detail_api(
+                oid=str(order_id),
+                rid=order.paymentTransactionRefNo or "",
+                order_key_id=order.orderKeyId or "",
+            )
+            response_code = enriched.get("PaymentResponseCode", -1)
+            print(
+                f"[Payment/Status] Live PayG check for order {order_id} → "
+                f"code={response_code!r} (was '{local_state}')"
+            )
+
+            # PayG codes: 1=Approved, 2=Declined, 4/None=Pending → only act on 1/2
+            if response_code in (1, 2):
+                _record_payment_log(
+                    db, order_id,
+                    enriched.get("OrderKeyId", order.orderKeyId or ""),
+                    enriched.get("UniqueRequestId", order.paymentTransactionRefNo or ""),
+                    enriched,
+                )
+                _update_order_after_payment(db, order, int(response_code), enriched)
+                db.commit()
+                local_state = order.state
+
+                success = (response_code == 1)
+                _send_payment_notification(db, order_id, success)
+                if success:
+                    background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+
+                print(f"[Payment/Status] Order {order_id} resolved → {local_state}")
+        except Exception as exc:
+            # Don't fail the poll — just log and return current (still pending) state.
+            print(f"[Payment/Status] Live PayG check FAILED for order {order_id}: {exc}")
 
     if local_state == "Confirmed":
         try:
