@@ -766,39 +766,7 @@ async def payment_callback(
         # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
         # row that was most likely in the cart when the order was placed).
         print(f"[Payment:Callback] STEP 7 — Removing ordered cart items for order {order_id}...")
-        try:
-            result = db.execute(text("""
-                WITH user_id AS (
-                    SELECT "UserProfileId"
-                    FROM twam."Orders"
-                    WHERE "OrderId" = :oid AND "DeletedInd" = false
-                    LIMIT 1
-                ),
-                carts_to_clear AS (
-                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
-                    FROM twam."Cart" c
-                    INNER JOIN twam."OrderItems" oi
-                        ON oi."OrderId"               = :oid
-                        AND oi."DeletedInd"            = false
-                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
-                      AND c."DeletedInd"    = false
-                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
-                )
-                UPDATE twam."Cart"
-                SET "DeletedInd"   = true,
-                    "IsOrdered"    = true,
-                    "ModifiedDate" = :now
-                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
-            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
-            db.commit()
-            print(
-                f"[Payment:Callback] STEP 7 ✅ Cart cleared — "
-                f"{result.rowcount} item(s) removed for order {order_id}"
-            )
-        except Exception as exc:
-            db.rollback()
-            print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
+        _clear_ordered_cart_items(db, order_id)
     elif DEFINITIVE_FAILURE:
         # code=2: bank definitively declined — safe to clean up OrderItems
         # so they never bleed into a future invoice.  Cart items are kept so
@@ -1056,6 +1024,7 @@ def admin_confirm_payment(
 
     background_tasks.add_task(_auto_create_ekart_shipment, order_id)
     _send_payment_notification(db, order_id, success=True)
+    _clear_ordered_cart_items(db, order_id)
 
     print(f"[Payment:AdminConfirm] ✅ Order {order_id} manually confirmed by staff {current_user.user_id}")
     return {"success": True, "orderId": order_id, "state": "Confirmed"}
@@ -1146,6 +1115,47 @@ def debug_payment(
 
 # ── Status poll ────────────────────────────────────────────────────────────
 
+def _clear_ordered_cart_items(db: Session, order_id: int) -> int:
+    """
+    Marks cart rows that match this order's items as IsOrdered=true and
+    soft-deletes them, so they no longer appear in the user's cart.
+    Used by both /Callback (card flow) and /Status (UPI Intent poll flow)
+    success paths — must be called once payment is confirmed.
+    """
+    try:
+        result = db.execute(text("""
+            WITH user_id AS (
+                SELECT "UserProfileId"
+                FROM twam."Orders"
+                WHERE "OrderId" = :oid AND "DeletedInd" = false
+                LIMIT 1
+            ),
+            carts_to_clear AS (
+                SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                FROM twam."Cart" c
+                INNER JOIN twam."OrderItems" oi
+                    ON oi."OrderId"               = :oid
+                    AND oi."DeletedInd"            = false
+                    AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
+                  AND c."DeletedInd"    = false
+                ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+            )
+            UPDATE twam."Cart"
+            SET "DeletedInd"   = true,
+                "IsOrdered"    = true,
+                "ModifiedDate" = :now
+            WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+        """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+        db.commit()
+        print(f"[Payment] Cart cleared — {result.rowcount} item(s) removed for order {order_id}")
+        return result.rowcount
+    except Exception as exc:
+        db.rollback()
+        print(f"[Payment] Cart cleanup FAILED for order {order_id}: {exc}")
+        return 0
+
+
 @router.get("/Status/{order_id}")
 async def get_payment_status(
     order_id: int,
@@ -1207,6 +1217,7 @@ async def get_payment_status(
                 success = (response_code == 1)
                 _send_payment_notification(db, order_id, success)
                 if success:
+                    _clear_ordered_cart_items(db, order_id)
                     background_tasks.add_task(_auto_create_ekart_shipment, order_id)
 
                 print(f"[Payment/Status] Order {order_id} resolved → {local_state}")
