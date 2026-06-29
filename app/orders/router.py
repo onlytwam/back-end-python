@@ -1,6 +1,6 @@
 import json
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from database import get_db
@@ -128,21 +128,28 @@ def checkout_summary(
 @router.post("", response_model=schemas.OrderResponse, status_code=201)
 def create_order(
     order: schemas.CreateOrderRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     if not order.userProfileId:
         order.userProfileId = current_user.user_id
     try:
-        return repository.create_order(db, order)
+        result = repository.create_order(db, order)
+        # ── Kick off 15-min background payment poller ─────────────────────
+        # Polls PayG Detail API every 5 s regardless of whether the user
+        # returns to the site — resolves payment even on tab-close / refresh.
+        from app.payment.router import _poll_payment_until_resolved
+        order_id        = result.get("orderId") if isinstance(result, dict) else getattr(result, "orderId", None)
+        order_key_id    = result.get("orderKeyId", "") if isinstance(result, dict) else getattr(result, "orderKeyId", "")
+        unique_req_id   = result.get("uniqueRequestId", "") if isinstance(result, dict) else getattr(result, "uniqueRequestId", "")
+        if order_id:
+            background_tasks.add_task(_poll_payment_until_resolved, order_id, order_key_id or "", unique_req_id or "")
+            print(f"[Orders] ▶ Payment poller queued for order={order_id}")
+        return result
     except ValueError as e:
-        # Validation errors (out of stock, bad address, etc.) → 400
         raise HTTPException(400, str(e))
     except RuntimeError as e:
-        # ── FIX: PayG gateway errors were previously swallowed here,
-        # causing the order to appear "created" with paymentProcessUrl=null.
-        # Now we surface them as HTTP 502 so the frontend can show the real
-        # error message and prevent the user from thinking the order succeeded.
         raise HTTPException(502, str(e))
 
 
@@ -174,13 +181,20 @@ def return_order(command: schemas.CreateReturnOrderRequest, db: Session = Depend
 
 # ── PUBLIC overrides ──────────────────────────────────────────────────────────
 @router.post("/GuestOrder", response_model=schemas.OrderResponse, status_code=201, dependencies=[])
-def guest_order(command: schemas.CreateGuestOrderRequest, db: Session = Depends(get_db)):
+def guest_order(command: schemas.CreateGuestOrderRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     try:
-        return repository.create_guest_order(db, command)
+        result = repository.create_guest_order(db, command)
+        from app.payment.router import _poll_payment_until_resolved
+        order_id      = result.get("orderId") if isinstance(result, dict) else getattr(result, "orderId", None)
+        order_key_id  = result.get("orderKeyId", "") if isinstance(result, dict) else getattr(result, "orderKeyId", "")
+        unique_req_id = result.get("uniqueRequestId", "") if isinstance(result, dict) else getattr(result, "uniqueRequestId", "")
+        if order_id:
+            background_tasks.add_task(_poll_payment_until_resolved, order_id, order_key_id or "", unique_req_id or "")
+            print(f"[Orders] ▶ Payment poller queued for guest order={order_id}")
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
     except RuntimeError as e:
-        # Same PayG fix as create_order above
         raise HTTPException(502, str(e))
 
 
