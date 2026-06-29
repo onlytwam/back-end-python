@@ -451,7 +451,7 @@ def _build_invoice_email(order: dict, items: list, company: str, support: str) -
   <!-- Header: slim burgundy bar -->
   <div style="background:#6A012A;padding:10px 24px;display:flex;align-items:center;
               justify-content:space-between;">
-    <img src="https://onlytwam.com/assets/Twam-Logo_White.png" height="32" alt="{company}"
+    <img src="https://www.onlytwam.com/assets/Twam-Logo_White.png" height="32" alt="{company}"
          style="display:block;" />
     <div style="text-align:right;">
       <div style="font-family:Georgia,serif;font-size:13px;font-weight:700;
@@ -1187,7 +1187,7 @@ def send_delivery_confirmation(
         return False
     company = _cfg(db, "COMPANY_NAME", "Only TWAM")
     support = _cfg(db, "SUPPORT_EMAIL", "support@onlytwam.com")
-    website = _cfg(db, "WEBSITE_URL", "https://onlytwam.com")
+    website = _cfg(db, "WEBSITE_URL", "https://www.onlytwam.com")
 
     if order["customer_email"]:
         content = (

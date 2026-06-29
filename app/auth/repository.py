@@ -1987,7 +1987,7 @@ def _send_welcome_notifications(
 
                 <div style="text-align:center;margin:28px 0;">
 
-                  <a href="https://onlytwam.com/user-products/product-list"
+                  <a href="https://www.onlytwam.com/all-products"
 
                      style="background:#6B0F2A;color:#fff;padding:13px 32px;
 
@@ -2051,7 +2051,7 @@ def _send_welcome_notifications(
 
                 "Explore styles that celebrate you:\n"
 
-                "https://onlytwam.com/user-products/product-list\n\n"
+                "https://www.onlytwam.com/all-products\n\n"
 
                 "Need help? Email support@onlytwam.com\n\n"
 

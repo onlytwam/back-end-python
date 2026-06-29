@@ -16,7 +16,7 @@ The logo is embedded as a Base64 data-URI so it renders in every email
 client (Gmail, Outlook, Apple Mail) without relying on an external URL.
 
 If you prefer an absolute URL pass logo_url:
-    twam_email(..., logo_url="https://onlytwam.com/assets/Twam-Logo-White.png")
+    twam_email(..., logo_url="https://www.onlytwam.com/assets/Twam-Logo-White.png")
 
 Template layout
 ───────────────
@@ -56,7 +56,7 @@ _MUTED       = "#9B7080"
 #   4. File at /app/static/Twam-Logo-White.png  (Docker default)
 #   5. Falls back to an absolute HTTPS URL (works if images are enabled)
 
-_LOGO_URL_FALLBACK = "https://onlytwam.com/assets/Twam-Logo-White.png"
+_LOGO_URL_FALLBACK = "https://www.onlytwam.com/assets/Twam-Logo-White.png"
 
 def _find_logo_file() -> str | None:
     candidates = [
@@ -102,7 +102,7 @@ def twam_email(
     logo_url  : str | None = None,
     logo_b64  : str | None = None,
     website   : str  = "www.onlytwam.com",
-    support   : str  = "onlytwam.com/contact-us",
+    support   : str  = "www.onlytwam.com/contact-us",
 ) -> str:
     """
     Wrap `content` in the standard TWAM email shell.
@@ -114,7 +114,7 @@ def twam_email(
     logo_url  Override the logo src with a URL (skips file/base64 lookup).
     logo_b64  Override with a raw base64 PNG string (no data-URI prefix needed).
     website   Footer website text  (default: www.onlytwam.com)
-    support   Footer support link text  (default: onlytwam.com/contact-us)
+    support   Footer support link text  (default: www.onlytwam.com/contact-us)
 
     Returns
     ───────
