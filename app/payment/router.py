@@ -504,6 +504,172 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         db.close()
 
 
+# ── Background payment poller ──────────────────────────────────────────────
+#
+# Started immediately when an order is created and the user is sent to PayG.
+# Polls the PayG Detail API every 5 seconds for up to 15 minutes.
+# Resolves the order (Confirmed or PaymentFailed) regardless of whether the
+# user ever returns to the site — covers tab-close, refresh, app-switch, etc.
+#
+# Called from orders/router.py create_order and guest_order endpoints.
+
+async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_request_id: str) -> None:
+    """
+    Background task: polls PayG Detail API every 5 s for 15 minutes.
+    Creates its own DB session (request session is already closed).
+    Stops as soon as a definitive result (code 1 or 2) is found.
+    If 15 minutes pass with no result, marks order as PaymentFailed.
+    """
+    import asyncio
+    from database import SessionLocal
+
+    POLL_INTERVAL  = 5      # seconds between each PayG Detail API call
+    MAX_DURATION   = 900    # 15 minutes total
+    MAX_POLLS      = MAX_DURATION // POLL_INTERVAL  # 180 polls
+
+    print(f"[PaymentPoller] ▶ START polling for order={order_id} key={order_key_id!r}")
+
+    for attempt in range(1, MAX_POLLS + 1):
+        await asyncio.sleep(POLL_INTERVAL)
+
+        db = SessionLocal()
+        try:
+            # ── Check current DB state first (callback may have already resolved it) ──
+            from app.orders.models import Orders
+            order = db.query(Orders).filter(
+                Orders.orderId    == order_id,
+                Orders.deletedInd == False,
+            ).first()
+
+            if not order:
+                print(f"[PaymentPoller] Order {order_id} not found in DB — stopping")
+                return
+
+            current_state = (order.state or "").strip()
+
+            # Already resolved by callback or webhook — nothing to do
+            RESOLVED = {"Confirmed", "Processing", "Shipped", "Delivered",
+                        "PaymentFailed", "Cancelled", "Payment Failed"}
+            if current_state in RESOLVED:
+                print(f"[PaymentPoller] ✅ Order {order_id} already resolved → '{current_state}' (attempt {attempt}) — stopping")
+                return
+
+            # ── Hit PayG Detail API ───────────────────────────────────────
+            enriched = _enrich_params_via_detail_api(
+                oid          = str(order_id),
+                rid          = unique_request_id or order.paymentTransactionRefNo or "",
+                order_key_id = order_key_id or order.orderKeyId or "",
+            )
+
+            response_code = int(enriched.get("PaymentResponseCode", -1)) if enriched else -1
+            print(
+                f"[PaymentPoller] attempt={attempt}/{MAX_POLLS} | "
+                f"order={order_id} | code={response_code} | state={current_state!r}"
+            )
+
+            if response_code == 1:
+                # ── SUCCESS ──────────────────────────────────────────────
+                _update_order_after_payment(db, order, response_code, enriched)
+                _record_payment_log(
+                    db, order_id,
+                    enriched.get("OrderKeyId", ""),
+                    enriched.get("UniqueRequestId", ""),
+                    enriched,
+                )
+                db.commit()
+                print(f"[PaymentPoller] ✅ Order {order_id} → Confirmed (attempt {attempt})")
+
+                # Clear cart
+                try:
+                    db.execute(text("""
+                        WITH carts_to_clear AS (
+                            SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                            FROM twam."Cart" c
+                            INNER JOIN twam."OrderItems" oi
+                                ON oi."OrderId"               = :oid
+                                AND oi."DeletedInd"            = false
+                                AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                            WHERE c."UserProfileId" = :uid
+                              AND c."DeletedInd"    = false
+                            ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                        )
+                        UPDATE twam."Cart"
+                        SET "DeletedInd"   = true,
+                            "IsOrdered"    = true,
+                            "ModifiedDate" = :now
+                        WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+                    """), {"oid": order_id, "uid": order.userProfileId, "now": datetime.now(timezone.utc)})
+                    db.commit()
+                except Exception as ce:
+                    db.rollback()
+                    print(f"[PaymentPoller] ⚠️  Cart clear failed (non-fatal): {ce}")
+
+                # Send notification + create Ekart shipment
+                _send_payment_notification(db, order_id, success=True)
+                await _auto_create_ekart_shipment(order_id)
+                return
+
+            elif response_code == 2:
+                # ── DEFINITIVE FAILURE ───────────────────────────────────
+                _update_order_after_payment(db, order, response_code, enriched)
+                _record_payment_log(
+                    db, order_id,
+                    enriched.get("OrderKeyId", ""),
+                    enriched.get("UniqueRequestId", ""),
+                    enriched,
+                )
+                db.execute(text("""
+                    UPDATE twam."OrderItems"
+                    SET "DeletedInd" = true, "ModifiedDate" = :now
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false
+                """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+                db.commit()
+                print(f"[PaymentPoller] ❌ Order {order_id} → PaymentFailed (attempt {attempt})")
+                _send_payment_notification(db, order_id, success=False)
+                return
+
+            # code=-1, 0, 4 → still pending, keep polling
+
+        except Exception as exc:
+            print(f"[PaymentPoller] ⚠️  attempt={attempt} error for order {order_id}: {exc}")
+        finally:
+            db.close()
+
+    # ── 15 minutes elapsed, no resolution ────────────────────────────────────
+    print(f"[PaymentPoller] ⏰ 15 min elapsed for order {order_id} — marking PaymentFailed")
+    db = SessionLocal()
+    try:
+        from app.orders.models import Orders, OrderTrackingStatus
+        order = db.query(Orders).filter(
+            Orders.orderId    == order_id,
+            Orders.deletedInd == False,
+        ).first()
+
+        if order and order.state in {"AwaitingPayment", "Pending", "Payment Pending"}:
+            order.state        = "PaymentFailed"
+            order.modifiedDate = datetime.now(timezone.utc)
+            db.add(order)
+            db.add(OrderTrackingStatus(
+                orderId     = order_id,
+                status      = "PaymentFailed",
+                createdDate = datetime.now(timezone.utc),
+            ))
+            db.execute(text("""
+                UPDATE twam."OrderItems"
+                SET "DeletedInd" = true, "ModifiedDate" = :now
+                WHERE "OrderId" = :oid AND "DeletedInd" = false
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+            db.commit()
+            print(f"[PaymentPoller] ✅ Order {order_id} → PaymentFailed after 15 min timeout")
+        else:
+            print(f"[PaymentPoller] Order {order_id} state='{getattr(order, 'state', 'N/A')}' — no timeout action needed")
+    except Exception as exc:
+        db.rollback()
+        print(f"[PaymentPoller] ❌ Timeout cleanup failed for order {order_id}: {exc}")
+    finally:
+        db.close()
+
+
 # ── Callback ───────────────────────────────────────────────────────────────
 
 @router.get("/Callback",  include_in_schema=True)
@@ -766,7 +932,39 @@ async def payment_callback(
         # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
         # row that was most likely in the cart when the order was placed).
         print(f"[Payment:Callback] STEP 7 — Removing ordered cart items for order {order_id}...")
-        _clear_ordered_cart_items(db, order_id)
+        try:
+            result = db.execute(text("""
+                WITH user_id AS (
+                    SELECT "UserProfileId"
+                    FROM twam."Orders"
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false
+                    LIMIT 1
+                ),
+                carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+            db.commit()
+            print(
+                f"[Payment:Callback] STEP 7 ✅ Cart cleared — "
+                f"{result.rowcount} item(s) removed for order {order_id}"
+            )
+        except Exception as exc:
+            db.rollback()
+            print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
     elif DEFINITIVE_FAILURE:
         # code=2: bank definitively declined — safe to clean up OrderItems
         # so they never bleed into a future invoice.  Cart items are kept so
@@ -1024,7 +1222,6 @@ def admin_confirm_payment(
 
     background_tasks.add_task(_auto_create_ekart_shipment, order_id)
     _send_payment_notification(db, order_id, success=True)
-    _clear_ordered_cart_items(db, order_id)
 
     print(f"[Payment:AdminConfirm] ✅ Order {order_id} manually confirmed by staff {current_user.user_id}")
     return {"success": True, "orderId": order_id, "state": "Confirmed"}
@@ -1115,47 +1312,6 @@ def debug_payment(
 
 # ── Status poll ────────────────────────────────────────────────────────────
 
-def _clear_ordered_cart_items(db: Session, order_id: int) -> int:
-    """
-    Marks cart rows that match this order's items as IsOrdered=true and
-    soft-deletes them, so they no longer appear in the user's cart.
-    Used by both /Callback (card flow) and /Status (UPI Intent poll flow)
-    success paths — must be called once payment is confirmed.
-    """
-    try:
-        result = db.execute(text("""
-            WITH user_id AS (
-                SELECT "UserProfileId"
-                FROM twam."Orders"
-                WHERE "OrderId" = :oid AND "DeletedInd" = false
-                LIMIT 1
-            ),
-            carts_to_clear AS (
-                SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
-                FROM twam."Cart" c
-                INNER JOIN twam."OrderItems" oi
-                    ON oi."OrderId"               = :oid
-                    AND oi."DeletedInd"            = false
-                    AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
-                  AND c."DeletedInd"    = false
-                ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
-            )
-            UPDATE twam."Cart"
-            SET "DeletedInd"   = true,
-                "IsOrdered"    = true,
-                "ModifiedDate" = :now
-            WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
-        """), {"oid": order_id, "now": datetime.now(timezone.utc)})
-        db.commit()
-        print(f"[Payment] Cart cleared — {result.rowcount} item(s) removed for order {order_id}")
-        return result.rowcount
-    except Exception as exc:
-        db.rollback()
-        print(f"[Payment] Cart cleanup FAILED for order {order_id}: {exc}")
-        return 0
-
-
 @router.get("/Status/{order_id}")
 async def get_payment_status(
     order_id: int,
@@ -1168,6 +1324,21 @@ async def get_payment_status(
     # so every poll would return 403 without this wrapper.
     current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
 ):
+    """
+    Frontend polls this every 4 s after a PayG redirect.
+
+    ACTIVE RESOLUTION: If the order is still AwaitingPayment / Pending
+    (i.e. the callback never arrived — user left before redirect, or the
+    Detail API was IP-blocked at callback time), we proactively call the
+    PayG Detail API right here to get the real payment status, update the
+    DB, clear the cart, and queue the Ekart shipment — exactly as the
+    callback handler would have done.
+
+    This means payment is confirmed even when:
+      • The user closes the tab immediately after paying
+      • The user refreshes the page before the PayG redirect completes
+      • The PayG callback URL never reached Azure (network / IP issue)
+    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
@@ -1183,49 +1354,107 @@ async def get_payment_status(
 
     local_state = order.state or "AwaitingPayment"
 
-    # ── UPI Intent / no-callback flows: actively poll PayG ────────────────
-    # Card payments get resolved via /Callback (browser redirect from PayG).
-    # UPI Intent has no browser redirect — the user leaves to a UPI app and
-    # nothing ever hits our server, so order.state stays "AwaitingPayment"
-    # forever unless we actively ask PayG for the live status here.
-    PENDING_STATES = {"AwaitingPayment", "Pending", "Payment Pending"}
-    if local_state in PENDING_STATES:
+    # ── ACTIVE RESOLUTION ────────────────────────────────────────────────
+    # If the order is still unresolved, hit the PayG Detail API now.
+    # States that mean "payment outcome not yet known":
+    UNRESOLVED = {"AwaitingPayment", "Pending", "Payment Pending", "awaitingpayment"}
+
+    if local_state in UNRESOLVED:
+        print(f"[Payment/Status] Order {order_id} is '{local_state}' — probing PayG Detail API...")
         try:
             enriched = _enrich_params_via_detail_api(
-                oid=str(order_id),
-                rid=order.paymentTransactionRefNo or "",
-                order_key_id=order.orderKeyId or "",
-            )
-            response_code = enriched.get("PaymentResponseCode", -1)
-            print(
-                f"[Payment/Status] Live PayG check for order {order_id} → "
-                f"code={response_code!r} (was '{local_state}')"
+                oid          = str(order_id),
+                rid          = order.paymentTransactionRefNo or "",
+                order_key_id = order.orderKeyId or "",
             )
 
-            # PayG codes: 1=Approved, 2=Declined, 4/None=Pending → only act on 1/2
-            if response_code in (1, 2):
+            response_code = int(enriched.get("PaymentResponseCode", -1)) if enriched else -1
+            print(f"[Payment/Status] PayG Detail API returned code={response_code} for order {order_id}")
+
+            if response_code == 1:
+                # ── SUCCESS ──────────────────────────────────────────────
+                # Update order state, log, clear cart, queue shipment
+                _update_order_after_payment(db, order, response_code, enriched)
                 _record_payment_log(
                     db, order_id,
-                    enriched.get("OrderKeyId", order.orderKeyId or ""),
-                    enriched.get("UniqueRequestId", order.paymentTransactionRefNo or ""),
+                    enriched.get("OrderKeyId", ""),
+                    enriched.get("UniqueRequestId", ""),
                     enriched,
                 )
-                _update_order_after_payment(db, order, int(response_code), enriched)
                 db.commit()
-                local_state = order.state
+                local_state = "Confirmed"
+                print(f"[Payment/Status] ✅ Order {order_id} → Confirmed via active poll")
 
-                success = (response_code == 1)
-                _send_payment_notification(db, order_id, success)
-                if success:
-                    _clear_ordered_cart_items(db, order_id)
-                    background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+                # Clear cart items
+                try:
+                    db.execute(text("""
+                        WITH carts_to_clear AS (
+                            SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                            FROM twam."Cart" c
+                            INNER JOIN twam."OrderItems" oi
+                                ON oi."OrderId"               = :oid
+                                AND oi."DeletedInd"            = false
+                                AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                            WHERE c."UserProfileId" = :uid
+                              AND c."DeletedInd"    = false
+                            ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                        )
+                        UPDATE twam."Cart"
+                        SET "DeletedInd"   = true,
+                            "IsOrdered"    = true,
+                            "ModifiedDate" = :now
+                        WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+                    """), {
+                        "oid": order_id,
+                        "uid": order.userProfileId,
+                        "now": datetime.now(timezone.utc),
+                    })
+                    db.commit()
+                    print(f"[Payment/Status] ✅ Cart cleared for order {order_id}")
+                except Exception as ce:
+                    db.rollback()
+                    print(f"[Payment/Status] ⚠️  Cart clear failed (non-fatal): {ce}")
 
-                print(f"[Payment/Status] Order {order_id} resolved → {local_state}")
+                # Queue Ekart shipment + send notification
+                background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+                _send_payment_notification(db, order_id, success=True)
+
+            elif response_code == 2:
+                # ── DEFINITIVE FAILURE ───────────────────────────────────
+                _update_order_after_payment(db, order, response_code, enriched)
+                _record_payment_log(
+                    db, order_id,
+                    enriched.get("OrderKeyId", ""),
+                    enriched.get("UniqueRequestId", ""),
+                    enriched,
+                )
+                # Soft-delete order items
+                db.execute(text("""
+                    UPDATE twam."OrderItems"
+                    SET "DeletedInd" = true, "ModifiedDate" = :now
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false
+                """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+                db.commit()
+                local_state = "PaymentFailed"
+                print(f"[Payment/Status] ❌ Order {order_id} → PaymentFailed via active poll")
+                _send_payment_notification(db, order_id, success=False)
+
+            else:
+                # code=-1 or 0/4 (still pending) — leave as-is, keep polling
+                print(
+                    f"[Payment/Status] ⏳ Order {order_id} still unresolved "
+                    f"(code={response_code}) — frontend will retry"
+                )
+
         except Exception as exc:
-            # Don't fail the poll — just log and return current (still pending) state.
-            print(f"[Payment/Status] Live PayG check FAILED for order {order_id}: {exc}")
+            # Detail API failed (network, IP block, etc.) — return current DB
+            # state and let frontend keep polling; S2S webhook will resolve it
+            print(f"[Payment/Status] ⚠️  Detail API probe failed for order {order_id}: {exc}")
 
-    if local_state == "Confirmed":
+    # ── Already resolved states ──────────────────────────────────────────
+    # If the order was already Confirmed (by a prior poll or the callback),
+    # send the deferred notification in case the callback missed it.
+    elif local_state == "Confirmed":
         try:
             from app.ekart.notifications import send_order_placed_notification
             send_order_placed_notification(db, order_id)
