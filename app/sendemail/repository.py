@@ -62,7 +62,7 @@ def send_email(db: Session, payload: EmailCreate) -> bool:
         if payload.email:
             import base64
             token = base64.b64encode(payload.email.lower().strip().encode()).decode()
-            unsub_url = f"https://onlytwam.com/api/Newsletter/Unsubscribe?token={token}"
+            unsub_url = f"https://www.onlytwam.com/api/Newsletter/Unsubscribe?token={token}"
             msg["List-Unsubscribe"] = f"<{unsub_url}>"
             msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 
