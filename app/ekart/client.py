@@ -159,14 +159,21 @@ class EkartClient:
         if cached:
             return cached
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                cfg.access_token_url,
-                json={"username": cfg.username, "password": cfg.password},
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        print(f"[EkartClient] Fetching new token from {cfg.access_token_url!r}...")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    cfg.access_token_url,
+                    json={"username": cfg.username, "password": cfg.password},
+                    headers={"Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            import traceback
+            print(f"[EkartClient] _get_token RAW exception: {type(e).__name__}: {e!r}")
+            traceback.print_exc()
+            raise
 
         token = data.get("access_token") or data.get("token") or ""
         expires_in = int(data.get("expires_in", 86400))
@@ -224,6 +231,9 @@ class EkartClient:
             )
 
         except Exception as e:
+            import traceback
+            print(f"[EkartClient] create_shipment RAW exception: {type(e).__name__}: {e!r}")
+            traceback.print_exc()
             err = self._extract_error(e)
             print(f"[EkartClient] create_shipment error: {err}")
             return EkartShipmentResponse(success=False, error_message=err)
@@ -1012,12 +1022,26 @@ class EkartClient:
                 msg  = body.get("message") or ""
                 desc = body.get("description") or ""
                 code = body.get("code") or ""
-                return " | ".join(filter(None, [msg, desc, code])) or str(e)
+                combined = " | ".join(filter(None, [msg, desc, code]))
+                return combined or f"HTTP {e.response.status_code} (no message body)"
             except Exception:
                 raw = e.response.text[:500]
                 print(f"[EkartClient] Raw error body: {raw}")
-                return f"HTTP {e.response.status_code}: {raw}"
-        return str(e)
+                return f"HTTP {e.response.status_code}: {raw or '(empty response body)'}"
+
+        # FIX: str(e) can be an empty string for some httpx network errors
+        # (ConnectError, ConnectTimeout, ReadTimeout, etc) — never return "".
+        # Always include the exception TYPE so we can diagnose, even when the
+        # exception itself carries no message.
+        msg = str(e).strip()
+        exc_type = type(e).__name__
+        if httpx and isinstance(e, httpx.RequestError):
+            # Network-level failure before any response was received —
+            # DNS failure, connection refused, timeout, TLS error, etc.
+            url = getattr(getattr(e, "request", None), "url", "unknown URL")
+            return f"{exc_type}: {msg or 'no message'} (request to {url} failed before response)"
+
+        return f"{exc_type}: {msg}" if msg else f"{exc_type} (no error message available)"
 
     # ── Mock Responses ────────────────────────────────────────────────────────
 
