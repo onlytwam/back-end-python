@@ -35,13 +35,6 @@ router = APIRouter(prefix="/api/Payment", tags=["Payment"])
 
 
 # ── Optional-auth dependency ───────────────────────────────────────────────
-# get_current_user raises HTTPException(401/403) when no token is present.
-# Simply typing a parameter as Optional[CurrentUser] does NOT suppress that
-# raise — FastAPI still propagates it.  This wrapper catches any auth
-# exception and returns None instead, which is what we need for the Status
-# endpoint so unauthenticated polls (session lost after PayG redirect) still
-# work.
-
 async def get_current_user_optional(
     request: Request,
     db: Session = Depends(get_db),
@@ -55,7 +48,7 @@ async def get_current_user_optional(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _frontend_url() -> str:
-    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"  #  PayG and causes silent failures
+    return get_setting("frontend_base_url", "NOT_FOUND") or "NOT_FOUND"
 
 
 def _record_payment_log(
@@ -127,20 +120,33 @@ def _send_payment_notification(db: Session, order_id: int, success: bool) -> Non
 def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") -> dict:
     detail: dict = {}
     try:
-        # Prefer OrderKeyId (most reliable) → fall back to UniqueRequestId (rid).
-        # PayG Detail API doc: body = { "OrderKeyId": "...", "MID": "..." }
-        # UniqueRequestId also works but OrderKeyId is the authoritative reference.
         if order_key_id:
-            detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+            try:
+                detail = payg_client.get_payg_order_detail(order_key_id=order_key_id)
+                print(
+                    f"[Payment] Detail API (OrderKeyId) -> code={detail.get('PaymentResponseCode')} "
+                    f"status={detail.get('OrderStatus')}"
+                )
+            except Exception as exc_key:
+                print(f"[Payment] Warning: Detail API failed with OrderKeyId: {exc_key}")
+                if rid:
+                    print(f"[Payment] Retrying with UniqueRequestId={rid!r}...")
+                    detail = payg_client.get_payg_order_detail(unique_request_id=rid)
+                    print(
+                        f"[Payment] Detail API (UniqueRequestId) -> code={detail.get('PaymentResponseCode')} "
+                        f"status={detail.get('OrderStatus')}"
+                    )
+                else:
+                    raise
         elif rid:
             detail = payg_client.get_payg_order_detail(unique_request_id=rid)
+            print(
+                f"[Payment] Detail API (UniqueRequestId) -> code={detail.get('PaymentResponseCode')} "
+                f"status={detail.get('OrderStatus')}"
+            )
         else:
-            print(f"[Payment] ❌ Detail API skipped — no rid or order_key_id available")
+            print(f"[Payment] Detail API skipped -- no rid or order_key_id available")
             return {}
-        print(
-            f"[Payment] Detail API → code={detail.get('PaymentResponseCode')} "
-            f"status={detail.get('OrderStatus')} keyId={detail.get('OrderKeyId')}"
-        )
     except Exception as exc:
         lookup_ref = rid or order_key_id
         print(f"[Payment] ❌ Detail API FAILED for ref={lookup_ref}: {exc}")
@@ -166,53 +172,86 @@ def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") ->
     }
 
 
+def _clear_ordered_cart_items(db: Session, order_id: int, user_profile_id: str = "") -> int:
+    """
+    Marks cart rows that match this order's items as IsOrdered=true and
+    soft-deletes them. Called from all payment success paths.
+    """
+    try:
+        if user_profile_id:
+            result = db.execute(text("""
+                WITH carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = :uid
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+            """), {"oid": order_id, "uid": user_profile_id, "now": datetime.now(timezone.utc)})
+        else:
+            result = db.execute(text("""
+                WITH user_id AS (
+                    SELECT "UserProfileId" FROM twam."Orders"
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false LIMIT 1
+                ),
+                carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+        db.commit()
+        print(f"[Payment] Cart cleared — {result.rowcount} item(s) removed for order {order_id}")
+        return result.rowcount
+    except Exception as exc:
+        db.rollback()
+        print(f"[Payment] Cart cleanup FAILED for order {order_id}: {exc}")
+        return 0
+
+
 # ── AUTO EKART SHIPMENT ────────────────────────────────────────────────────
 
 async def _auto_create_ekart_shipment(order_id: int) -> None:
-    """
-    Runs as a FastAPI background task after successful payment.
-    Creates its OWN DB session — the request session is already closed.
-    Every step is logged so you can pinpoint exactly where it fails.
-    """
     from database import SessionLocal
     db = SessionLocal()
     SEP = "─" * 60
     try:
         print(f"\n{SEP}")
         print(f"[Payment→Ekart] ▶▶▶ START auto-shipment for order={order_id}")
-        print(f"[SEP]")
 
-        # ── STEP 1: Load Ekart config ────────────────────────────────────────
-        print(f"[Payment→Ekart] STEP 1 — Loading Ekart config from ShipmentConfigurations table...")
+        print(f"[Payment→Ekart] STEP 1 — Loading Ekart config...")
         from app.ekart.client import get_ekart_client_for_db, load_ekart_config_from_db
         from app.ekart.schemas import CreateShipmentRequest, EkartAddress, EkartShipmentItem
         from app.ekart.notifications import send_order_shipped_notification
 
         cfg = load_ekart_config_from_db(db)
         if cfg is None:
-            print(
-                f"[Payment→Ekart] STEP 1 ❌ FAILED — No EKart config found in DB.\n"
-                f"   → FIX: Insert a row in shipment.ShipmentConfigurations with\n"
-                f"     deliveryAgent ILIKE 'EKart%', deletedInd=false,\n"
-                f"     stateId=NULL or 'Active' (case-insensitive).\n"
-                f"   → Run GET /api/Ekart/Readiness to see full config status."
-            )
+            print(f"[Payment→Ekart] STEP 1 ❌ No EKart config found in DB.")
             return
 
-        print(
-            f"[Payment→Ekart] STEP 1 ✅ Config loaded | "
-            f"client_id={cfg.client_id!r} | alias={cfg.pickup_alias!r} | "
-            f"complete={cfg.is_complete} | auth_url={cfg.access_token_url!r}"
-        )
-        if not cfg.is_complete:
-            print(
-                f"[Payment→Ekart] STEP 1 ⚠️  Config is INCOMPLETE — missing one of:\n"
-                f"   accessTokenURL, createShipmentURL, userName, or password.\n"
-                f"   Client will run in MOCK mode — no real AWB will be generated."
-            )
+        print(f"[Payment→Ekart] STEP 1 ✅ Config loaded | client_id={cfg.client_id!r} | complete={cfg.is_complete}")
 
-        # ── STEP 2: Fetch order from DB ──────────────────────────────────────
-        print(f"[Payment→Ekart] STEP 2 — Fetching order {order_id} from DB...")
+        print(f"[Payment→Ekart] STEP 2 — Fetching order {order_id}...")
         row = db.execute(text("""
             SELECT
                 o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
@@ -232,13 +271,7 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         """), {"oid": order_id}).fetchone()
 
         if not row:
-            print(
-                f"[Payment→Ekart] STEP 2 ❌ FAILED — Order {order_id} NOT IN DB!\n"
-                f"   → This usually means the frontend called a LOCAL backend (localhost:8000)\n"
-                f"     to place the order, but PayG is calling back to Azure.\n"
-                f"   → FIX: ensure VITE_API_BASE_URL in frontend points to this Azure URL.\n"
-                f"   → Also add http://localhost:5173 to Azure CORS_ORIGINS env var."
-            )
+            print(f"[Payment→Ekart] STEP 2 ❌ Order {order_id} NOT IN DB!")
             return
 
         order = {
@@ -260,39 +293,17 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             "shipping_type_name": row[16] or "Normal",
         }
 
-        print(
-            f"[Payment→Ekart] STEP 2 ✅ Order found | "
-            f"state={order['state']!r} | tracking={order['tracking_id']!r} | "
-            f"total=₹{order['total_amount']} | payment_mode={order['payment_mode']!r} | "
-            f"name={order['name']!r} | phone={order['phone']!r} | "
-            f"city={order['city']!r} | pin={order['pincode']!r} | "
-            f"state_name={order['state_name']!r} | address={order['address_line']!r}"
-        )
+        print(f"[Payment→Ekart] STEP 2 ✅ Order found | state={order['state']!r} | tracking={order['tracking_id']!r}")
 
-        # Warn on missing address fields — Ekart will reject if these are blank
-        missing_addr = []
-        if not order["name"]:         missing_addr.append("consignee name")
-        if not order["phone"]:        missing_addr.append("phone")
-        if not order["address_line"]: missing_addr.append("address_line (ShippingAddressId may be NULL)")
-        if not order["city"]:         missing_addr.append("city")
-        if not order["pincode"]:      missing_addr.append("pincode")
-        if not order["state_name"]:   missing_addr.append("state_name (StateId not set on Address, or State not in mdm.State)")
-        if missing_addr:
-            print(f"[Payment→Ekart] STEP 2 ⚠️  MISSING address fields: {', '.join(missing_addr)}")
-
-        # ── STEP 3: Guard checks ─────────────────────────────────────────────
         print(f"[Payment→Ekart] STEP 3 — Guard checks...")
         if order["tracking_id"]:
-            print(f"[Payment→Ekart] STEP 3 ⚠️  Already has tracking_id={order['tracking_id']!r} — skipping (duplicate callback?)")
+            print(f"[Payment→Ekart] STEP 3 ⚠️  Already has tracking_id — skipping")
             return
-
         if order["state"] in ("Shipped", "Delivered", "Cancelled"):
-            print(f"[Payment→Ekart] STEP 3 ⚠️  Order state is '{order['state']}' — skipping shipment creation")
+            print(f"[Payment→Ekart] STEP 3 ⚠️  Order state is '{order['state']}' — skipping")
             return
+        print(f"[Payment→Ekart] STEP 3 ✅ Guards passed")
 
-        print(f"[Payment→Ekart] STEP 3 ✅ Guards passed — proceeding to create shipment")
-
-        # ── STEP 4: Fetch order items ────────────────────────────────────────
         print(f"[Payment→Ekart] STEP 4 — Fetching order items...")
         item_rows = db.execute(text("""
             SELECT
@@ -308,30 +319,19 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         """), {"oid": order_id}).fetchall()
 
         if not item_rows:
-            print(
-                f"[Payment→Ekart] STEP 4 ❌ FAILED — No OrderItems found for order {order_id}!\n"
-                f"   → OrderItems may not have been committed before this background task ran.\n"
-                f"   → Check twam.OrderItems for OrderId={order_id} and DeletedInd=false."
-            )
+            print(f"[Payment→Ekart] STEP 4 ❌ No OrderItems found for order {order_id}!")
             return
 
         items = [
             EkartShipmentItem(
-                name=r[0] or "Product",
-                sku=r[1],
-                quantity=r[2] or 1,
-                price=float(r[3]) if r[3] else 0,
-                hsn_code=r[4],
+                name=r[0] or "Product", sku=r[1],
+                quantity=r[2] or 1, price=float(r[3]) if r[3] else 0, hsn_code=r[4],
             )
             for r in item_rows
         ]
-        print(
-            f"[Payment→Ekart] STEP 4 ✅ {len(items)} item(s): "
-            + ", ".join(f"{i.name}(qty={i.quantity}, ₹{i.price}, sku={i.sku})" for i in items)
-        )
+        print(f"[Payment→Ekart] STEP 4 ✅ {len(items)} item(s)")
 
-        # ── STEP 5: Surprise gift ────────────────────────────────────────────
-        print(f"[Payment→Ekart] STEP 5 — Checking for surprise gift...")
+        print(f"[Payment→Ekart] STEP 5 — Checking surprise gift...")
         try:
             from app.surprisegift.repository import get_order_gift_snapshot
             gift_snap = get_order_gift_snapshot(db, order_id)
@@ -339,161 +339,89 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                 items.append(EkartShipmentItem(
                     name=gift_snap.giftName,
                     sku=gift_snap.sku or f"GIFT-{gift_snap.giftRuleId}",
-                    quantity=1,
-                    price=0.0,
-                    hsn_code=gift_snap.hsnCode,
+                    quantity=1, price=0.0, hsn_code=gift_snap.hsnCode,
                 ))
-                print(f"[Payment→Ekart] STEP 5 ✅ Physical gift added: '{gift_snap.giftName}' sku={gift_snap.sku!r}")
-            elif gift_snap:
-                print(f"[Payment→Ekart] STEP 5 ℹ️  Gift type={gift_snap.giftType!r} — no extra Ekart item needed")
-            else:
-                print(f"[Payment→Ekart] STEP 5 ℹ️  No surprise gift for this order")
+                print(f"[Payment→Ekart] STEP 5 ✅ Physical gift added: '{gift_snap.giftName}'")
         except Exception as _gexc:
             print(f"[Payment→Ekart] STEP 5 ⚠️  Could not fetch surprise gift (non-fatal): {_gexc}")
 
-        # ── STEP 6: Build Ekart request ──────────────────────────────────────
         print(f"[Payment→Ekart] STEP 6 — Building Ekart shipment request...")
         request = CreateShipmentRequest(
-            order_id=            order["order_id"],
-            order_number=        order["order_number"],
-            consignee_name=      order["name"],
-            consignee_phone=     order["phone"],
+            order_id=order["order_id"], order_number=order["order_number"],
+            consignee_name=order["name"], consignee_phone=order["phone"],
             consignee_address=EkartAddress(
-                name=           order["name"],
-                phone=          order["phone"],
-                address_line1=  order["address_line"],
-                city=           order["city"],
-                state=          order["state_name"],
-                pincode=        order["pincode"],
-                country=        order["country"],
+                name=order["name"], phone=order["phone"],
+                address_line1=order["address_line"], city=order["city"],
+                state=order["state_name"], pincode=order["pincode"], country=order["country"],
             ),
-            payment_mode=        "COD" if order["payment_mode"] == "COD" else "Prepaid",
-            cod_amount=          order["total_amount"] if order["payment_mode"] == "COD" else None,
-            total_amount=        order["total_amount"],
-            items=               items,
-            shipping_type_name=  order.get("shipping_type_name", "Normal"),
-        )
-        print(
-            f"[Payment→Ekart] STEP 6 ✅ Request built | "
-            f"payment_mode={request.payment_mode} | total=₹{request.total_amount} | "
-            f"items={len(items)} | shipping_type={request.shipping_type_name!r}"
+            payment_mode="COD" if order["payment_mode"] == "COD" else "Prepaid",
+            cod_amount=order["total_amount"] if order["payment_mode"] == "COD" else None,
+            total_amount=order["total_amount"], items=items,
+            shipping_type_name=order.get("shipping_type_name", "Normal"),
         )
 
-        # ── STEP 7: Check mock mode ──────────────────────────────────────────
         print(f"[Payment→Ekart] STEP 7 — Initialising Ekart client...")
         client = get_ekart_client_for_db(db)
         print(f"[Payment→Ekart] STEP 7 — Client mode: {'MOCK ⚠️' if client.mock_mode else 'LIVE ✅'}")
-
         if client.mock_mode:
-            print(
-                f"[Payment→Ekart] STEP 7 ❌ MOCK MODE — config missing/incomplete.\n"
-                f"   → Order {order_id} stays in 'Confirmed' state. No AWB written.\n"
-                f"   → FIX: ensure ShipmentConfigurations has clientId, userName, password,\n"
-                f"     accessTokenURL, createShipmentURL, stateId=NULL or 'Active'.\n"
-                f"   → Retry manually: POST /api/Ekart/CreateShipment {{\"order_id\": {order_id}}}"
-            )
+            print(f"[Payment→Ekart] STEP 7 ❌ MOCK MODE — no AWB generated.")
             return
 
-        # ── STEP 8: Call Ekart API ───────────────────────────────────────────
-        print(f"[Payment→Ekart] STEP 8 — Calling Ekart API (PUT /api/v1/package/create)...")
+        print(f"[Payment→Ekart] STEP 8 — Calling Ekart API...")
         result = await client.create_shipment(request)
-
         if not result.success:
-            print(
-                f"[Payment→Ekart] STEP 8 ❌ FAILED — Ekart API rejected the request.\n"
-                f"   Error: {result.error_message}\n"
-                f"   → Order {order_id} stays in 'Confirmed' — no TrackingId written.\n"
-                f"   → Common causes: SWIFT_RESOURCE_NOT_FOUND (pickup alias not registered),\n"
-                f"     invalid pincode, phone must be 10 digits, token expired.\n"
-                f"   → Retry manually: POST /api/Ekart/CreateShipment {{\"order_id\": {order_id}}}"
-            )
-            # Annotate order notes so admin can see the failure reason in the DB
+            print(f"[Payment→Ekart] STEP 8 ❌ FAILED — {result.error_message}")
             try:
                 db.execute(text("""
-                    UPDATE twam."Orders"
-                    SET "Notes" = CONCAT(COALESCE("Notes", ''), :note),
-                        "ModifiedDate" = :now
-                    WHERE "OrderId" = :oid
-                """), {
-                    "note": f"[Ekart auto-shipment FAILED: {(result.error_message or '')[:200]}] ",
-                    "oid": order_id,
-                    "now": datetime.now(timezone.utc),
-                })
+                    UPDATE twam."Orders" SET "Notes" = CONCAT(COALESCE("Notes", ''), :note),
+                    "ModifiedDate" = :now WHERE "OrderId" = :oid
+                """), {"note": f"[Ekart FAILED: {(result.error_message or '')[:200]}] ",
+                       "oid": order_id, "now": datetime.now(timezone.utc)})
                 db.commit()
-                print(f"[Payment→Ekart] STEP 8 ℹ️  Failure reason written to Orders.Notes for order {order_id}")
             except Exception as _ne:
                 db.rollback()
-                print(f"[Payment→Ekart] STEP 8 ⚠️  Could not write Notes: {_ne}")
             return
 
-        print(f"[Payment→Ekart] STEP 8 ✅ Ekart API SUCCESS | AWB={result.awb_number!r} | courier={result.courier_name!r}")
+        print(f"[Payment→Ekart] STEP 8 ✅ AWB={result.awb_number!r}")
 
-        # ── STEP 9: Update DB ────────────────────────────────────────────────
-        print(f"[Payment→Ekart] STEP 9 — Writing AWB={result.awb_number!r} to DB for order {order_id}...")
+        print(f"[Payment→Ekart] STEP 9 — Writing AWB to DB...")
         db.execute(text("""
-            UPDATE twam."Orders"
-            SET "TrackingId"    = :tid,
-                "State"         = 'Processing',
-                "IsShipped"     = true,
-                "DeliveryAgent" = 'EKart',
-                "ModifiedDate"  = :now
+            UPDATE twam."Orders" SET "TrackingId" = :tid, "State" = 'Processing',
+            "IsShipped" = true, "DeliveryAgent" = 'EKart', "ModifiedDate" = :now
             WHERE "OrderId" = :oid
         """), {"tid": result.awb_number, "oid": order_id, "now": datetime.now(timezone.utc)})
-
-        db.add(OrderTrackingStatus(
-            orderId=order_id,
-            status="Processing",
-            createdDate=datetime.now(timezone.utc),
-        ))
+        db.add(OrderTrackingStatus(orderId=order_id, status="Processing",
+                                   createdDate=datetime.now(timezone.utc)))
         db.commit()
-        print(
-            f"[Payment→Ekart] STEP 9 ✅ DB updated — order {order_id} → "
-            f"State=Processing | TrackingId={result.awb_number!r}"
-        )
+        print(f"[Payment→Ekart] STEP 9 ✅ DB updated → Processing | AWB={result.awb_number!r}")
 
-        # ── STEP 9b: Increment ProcessedQuantity for each order item ─────────
-        # Stock formula: available = stockQuantity - processedQuantity + returnedQuantity
-        # We increment ProcessedQuantity here; AvailableQuantity is recomputed in-Python.
-        print(f"[Payment→Ekart] STEP 9b — Updating ProcessedQuantity for order {order_id}...")
+        print(f"[Payment→Ekart] STEP 9b — Updating ProcessedQuantity...")
         try:
             from app.productvariantdetail.repository import increment_processed_quantity
             _now = datetime.now(timezone.utc)
-            # Fetch (pvd_id, sum_qty) for this order
             pvd_rows = db.execute(text("""
                 SELECT "ProductVariantDetailId", SUM("Quantity")::INTEGER AS ordered_qty
-                FROM   twam."OrderItems"
-                WHERE  "OrderId"               = :oid
-                  AND  "DeletedInd"             = false
-                  AND  "ProductVariantDetailId" IS NOT NULL
-                GROUP BY "ProductVariantDetailId"
+                FROM twam."OrderItems" WHERE "OrderId" = :oid AND "DeletedInd" = false
+                AND "ProductVariantDetailId" IS NOT NULL GROUP BY "ProductVariantDetailId"
             """), {"oid": order_id}).fetchall()
-
             updated_count = 0
             for pvd_id_row, qty in pvd_rows:
                 if increment_processed_quantity(db, pvd_id_row, qty, now=_now):
                     updated_count += 1
-
             db.commit()
-            print(
-                f"[Payment→Ekart] STEP 9b ✅ ProcessedQuantity updated for order {order_id} — "
-                f"{updated_count} variant(s) updated"
-            )
+            print(f"[Payment→Ekart] STEP 9b ✅ {updated_count} variant(s) updated")
         except Exception as _se:
             db.rollback()
-            print(
-                f"[Payment→Ekart] STEP 9b ⚠️  Stock update FAILED (non-fatal) "
-                f"for order {order_id}: {_se}"
-            )
+            print(f"[Payment→Ekart] STEP 9b ⚠️  Stock update failed (non-fatal): {_se}")
 
-        # ── STEP 10: Notification ────────────────────────────────────────────
         print(f"[Payment→Ekart] STEP 10 — Sending shipped notification...")
         try:
             send_order_shipped_notification(db, order_id)
-            print(f"[Payment→Ekart] STEP 10 ✅ Shipped notification sent for order {order_id}")
+            print(f"[Payment→Ekart] STEP 10 ✅ Notification sent")
         except Exception as _nex:
             print(f"[Payment→Ekart] STEP 10 ⚠️  Notification failed (non-fatal): {_nex}")
 
-        print(f"[Payment→Ekart] ✅✅✅ COMPLETE — order {order_id} shipment created. AWB={result.awb_number!r}")
+        print(f"[Payment→Ekart] ✅✅✅ COMPLETE — order {order_id} | AWB={result.awb_number!r}")
         print(f"{SEP}\n")
 
     except Exception as exc:
@@ -506,55 +434,59 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
 
 # ── Background payment poller ──────────────────────────────────────────────
 #
-# Started immediately when an order is created and the user is sent to PayG.
-# Polls the PayG Detail API every 5 seconds for up to 15 minutes.
-# Resolves the order (Confirmed or PaymentFailed) regardless of whether the
-# user ever returns to the site — covers tab-close, refresh, app-switch, etc.
-#
-# Called from orders/router.py create_order and guest_order endpoints.
+# FIX: Reduced INITIAL_DELAY from 120s → 30s so card payments resolve faster.
+# FIX: Reduced POLL_INTERVAL from 30s → 10s for quicker resolution.
+# FIX: /Status endpoint now skips Detail API if poller ran within last 12s
+#      to avoid duplicate simultaneous calls flooding PayG.
 
 async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_request_id: str) -> None:
-    """
-    Background task: polls PayG Detail API every 5 s for 15 minutes.
-    Creates its own DB session (request session is already closed).
-    Stops as soon as a definitive result (code 1 or 2) is found.
-    If 15 minutes pass with no result, marks order as PaymentFailed.
-    """
     import asyncio
     from database import SessionLocal
 
-    POLL_INTERVAL  = 5      # seconds between each PayG Detail API call
-    MAX_DURATION   = 900    # 15 minutes total
-    MAX_POLLS      = MAX_DURATION // POLL_INTERVAL  # 180 polls
+    INITIAL_DELAY  = 30     # FIX: was 120 — start checking after 30s (user pays fast)
+    POLL_INTERVAL  = 10     # FIX: was 30  — check every 10s for quicker resolution
+    MAX_DURATION   = 900    # 15 minutes total — unchanged
+    MAX_POLLS      = MAX_DURATION // POLL_INTERVAL  # 90 polls (was 30)
 
-    print(f"[PaymentPoller] ▶ START polling for order={order_id} key={order_key_id!r}")
+    print(f"[PaymentPoller] ▶ START for order={order_id} — waiting {INITIAL_DELAY}s before first poll")
+    await asyncio.sleep(INITIAL_DELAY)
 
     for attempt in range(1, MAX_POLLS + 1):
         await asyncio.sleep(POLL_INTERVAL)
 
         db = SessionLocal()
         try:
-            # ── Check current DB state first (callback may have already resolved it) ──
-            from app.orders.models import Orders
             order = db.query(Orders).filter(
                 Orders.orderId    == order_id,
                 Orders.deletedInd == False,
             ).first()
 
             if not order:
-                print(f"[PaymentPoller] Order {order_id} not found in DB — stopping")
+                print(f"[PaymentPoller] Order {order_id} not found — stopping")
                 return
 
             current_state = (order.state or "").strip()
-
-            # Already resolved by callback or webhook — nothing to do
             RESOLVED = {"Confirmed", "Processing", "Shipped", "Delivered",
                         "PaymentFailed", "Cancelled", "Payment Failed"}
             if current_state in RESOLVED:
-                print(f"[PaymentPoller] ✅ Order {order_id} already resolved → '{current_state}' (attempt {attempt}) — stopping")
+                print(f"[PaymentPoller] ✅ Order {order_id} already '{current_state}' — stopping")
                 return
 
-            # ── Hit PayG Detail API ───────────────────────────────────────
+            # FIX: Skip Detail API call if /Status endpoint already checked recently.
+            # We track this via order.modifiedDate — if it changed in last 12s,
+            # the /Status endpoint already probed PayG and got pending (code=-1).
+            # No point hitting PayG again immediately from the poller too.
+            last_modified = order.modifiedDate
+            if last_modified:
+                lm_aware = last_modified.replace(tzinfo=timezone.utc) if last_modified.tzinfo is None else last_modified
+                seconds_since_check = (datetime.now(timezone.utc) - lm_aware).total_seconds()
+                if seconds_since_check < 12:
+                    print(
+                        f"[PaymentPoller] attempt={attempt}/{MAX_POLLS} | order={order_id} | "
+                        f"skipping — /Status checked {seconds_since_check:.1f}s ago"
+                    )
+                    continue
+
             enriched = _enrich_params_via_detail_api(
                 oid          = str(order_id),
                 rid          = unique_request_id or order.paymentTransactionRefNo or "",
@@ -568,59 +500,22 @@ async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_
             )
 
             if response_code == 1:
-                # ── SUCCESS ──────────────────────────────────────────────
                 _update_order_after_payment(db, order, response_code, enriched)
-                _record_payment_log(
-                    db, order_id,
-                    enriched.get("OrderKeyId", ""),
-                    enriched.get("UniqueRequestId", ""),
-                    enriched,
-                )
+                _record_payment_log(db, order_id,
+                    enriched.get("OrderKeyId", ""), enriched.get("UniqueRequestId", ""), enriched)
                 db.commit()
                 print(f"[PaymentPoller] ✅ Order {order_id} → Confirmed (attempt {attempt})")
-
-                # Clear cart
-                try:
-                    db.execute(text("""
-                        WITH carts_to_clear AS (
-                            SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
-                            FROM twam."Cart" c
-                            INNER JOIN twam."OrderItems" oi
-                                ON oi."OrderId"               = :oid
-                                AND oi."DeletedInd"            = false
-                                AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                            WHERE c."UserProfileId" = :uid
-                              AND c."DeletedInd"    = false
-                            ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
-                        )
-                        UPDATE twam."Cart"
-                        SET "DeletedInd"   = true,
-                            "IsOrdered"    = true,
-                            "ModifiedDate" = :now
-                        WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
-                    """), {"oid": order_id, "uid": order.userProfileId, "now": datetime.now(timezone.utc)})
-                    db.commit()
-                except Exception as ce:
-                    db.rollback()
-                    print(f"[PaymentPoller] ⚠️  Cart clear failed (non-fatal): {ce}")
-
-                # Send notification + create Ekart shipment
+                _clear_ordered_cart_items(db, order_id, order.userProfileId or "")
                 _send_payment_notification(db, order_id, success=True)
                 await _auto_create_ekart_shipment(order_id)
                 return
 
             elif response_code == 2:
-                # ── DEFINITIVE FAILURE ───────────────────────────────────
                 _update_order_after_payment(db, order, response_code, enriched)
-                _record_payment_log(
-                    db, order_id,
-                    enriched.get("OrderKeyId", ""),
-                    enriched.get("UniqueRequestId", ""),
-                    enriched,
-                )
+                _record_payment_log(db, order_id,
+                    enriched.get("OrderKeyId", ""), enriched.get("UniqueRequestId", ""), enriched)
                 db.execute(text("""
-                    UPDATE twam."OrderItems"
-                    SET "DeletedInd" = true, "ModifiedDate" = :now
+                    UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
                     WHERE "OrderId" = :oid AND "DeletedInd" = false
                 """), {"oid": order_id, "now": datetime.now(timezone.utc)})
                 db.commit()
@@ -628,41 +523,33 @@ async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_
                 _send_payment_notification(db, order_id, success=False)
                 return
 
-            # code=-1, 0, 4 → still pending, keep polling
-
         except Exception as exc:
             print(f"[PaymentPoller] ⚠️  attempt={attempt} error for order {order_id}: {exc}")
         finally:
             db.close()
 
-    # ── 15 minutes elapsed, no resolution ────────────────────────────────────
+    # 15 minutes elapsed
     print(f"[PaymentPoller] ⏰ 15 min elapsed for order {order_id} — marking PaymentFailed")
     db = SessionLocal()
     try:
-        from app.orders.models import Orders, OrderTrackingStatus
         order = db.query(Orders).filter(
             Orders.orderId    == order_id,
             Orders.deletedInd == False,
         ).first()
-
         if order and order.state in {"AwaitingPayment", "Pending", "Payment Pending"}:
             order.state        = "PaymentFailed"
             order.modifiedDate = datetime.now(timezone.utc)
             db.add(order)
-            db.add(OrderTrackingStatus(
-                orderId     = order_id,
-                status      = "PaymentFailed",
-                createdDate = datetime.now(timezone.utc),
-            ))
+            db.add(OrderTrackingStatus(orderId=order_id, status="PaymentFailed",
+                                       createdDate=datetime.now(timezone.utc)))
             db.execute(text("""
-                UPDATE twam."OrderItems"
-                SET "DeletedInd" = true, "ModifiedDate" = :now
+                UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
                 WHERE "OrderId" = :oid AND "DeletedInd" = false
             """), {"oid": order_id, "now": datetime.now(timezone.utc)})
             db.commit()
             print(f"[PaymentPoller] ✅ Order {order_id} → PaymentFailed after 15 min timeout")
         else:
-            print(f"[PaymentPoller] Order {order_id} state='{getattr(order, 'state', 'N/A')}' — no timeout action needed")
+            print(f"[PaymentPoller] Order {order_id} state='{getattr(order, 'state', 'N/A')}' — no timeout action")
     except Exception as exc:
         db.rollback()
         print(f"[PaymentPoller] ❌ Timeout cleanup failed for order {order_id}: {exc}")
@@ -680,15 +567,10 @@ async def payment_callback(
     db: Session = Depends(get_db),
 ):
     SEP = "=" * 60
-    # ── STEP 1: Parse incoming params from PayG ───────────────────────────
-    # PayG sends the redirect as a browser GET with query params appended to
-    # the RedirectUrl.  In some configurations it POSTs form data instead.
-    # We merge BOTH query-string params AND body params so we never miss a field.
     params: dict = {}
     print(f"[Payment:Callback] frontend_base_url raw = {get_setting('frontend_base_url', 'NOT_FOUND')}")
     print(f"[Payment:Callback] _frontend_url() = {_frontend_url()}")
     print(f"Helloooooooooooooooooooooooooooooooooooooo")
-    # Always read query-string params (present on both GET and POST)
     params.update(dict(request.query_params))
 
     if request.method == "POST":
@@ -715,11 +597,6 @@ async def payment_callback(
     oid = params.get("oid", "")
     rid = params.get("rid", "")
 
-    # PayG appends payment result fields to the RedirectUrl as query params:
-    #   PaymentResponseCode, OrderKeyId, UniqueRequestId, UserDefined1, HashData, …
-    # We treat params as "complete" when PaymentResponseCode is a real resolved
-    # value (1=approved, 2=declined).  Codes 0/4 (pending) and absent/-1 mean
-    # the payment hasn't settled yet — we still need to call the Detail API.
     payg_response_code_raw = params.get("PaymentResponseCode")
     try:
         payg_response_code_direct = int(payg_response_code_raw) if payg_response_code_raw not in (None, "", "-1") else None
@@ -736,14 +613,6 @@ async def payment_callback(
         f"UserDefined1={params.get('UserDefined1')!r}"
     )
 
-    # ── STEP 2: Enrich from Detail API if PayG didn't give a resolved code ──
-    # If PayG gave us code=1 or code=2 directly in the redirect params → skip.
-    # If Detail API is IP-blocked (403) → log clearly and proceed with code=-1
-    #   (frontend will poll via /Payment/Status and resolve the outcome).
-    #
-    # PayG only sends oid+rid in the redirect URL — no OrderKeyId param.
-    # So we look up the order from DB using oid first, then pass the stored
-    # orderKeyId to the Detail API (more reliable than UniqueRequestId).
     order_key_id_from_cb = params.get("OrderKeyId", "")
     if not order_key_id_from_cb and oid:
         try:
@@ -753,59 +622,31 @@ async def payment_callback(
             ).first()
             if _early_order and _early_order.orderKeyId:
                 order_key_id_from_cb = _early_order.orderKeyId
-                print(f"[Payment:Callback] STEP 2 — Resolved OrderKeyId={order_key_id_from_cb!r} from DB for oid={oid!r}")
+                print(f"[Payment:Callback] STEP 2 — Resolved OrderKeyId={order_key_id_from_cb!r} from DB")
         except Exception as _e:
             print(f"[Payment:Callback] STEP 2 — Could not pre-fetch orderKeyId: {_e}")
 
     if not payg_gave_us_params and (oid or rid or order_key_id_from_cb):
-        print(
-            f"[Payment:Callback] STEP 2 — PaymentResponseCode not resolved ({payg_response_code_raw!r}); "
-            f"calling PayG Detail API (oid={oid!r} rid={rid!r} key={order_key_id_from_cb!r})..."
-        )
+        print(f"[Payment:Callback] STEP 2 — Calling PayG Detail API...")
         enriched = _enrich_params_via_detail_api(oid, rid, order_key_id=order_key_id_from_cb)
         if enriched and enriched.get("PaymentResponseCode") not in (None, "", -1):
             params = enriched
-            print(
-                f"[Payment:Callback] STEP 2 ✅ Detail API resolved | "
-                f"code={params.get('PaymentResponseCode')!r} | status={params.get('OrderStatus')!r}"
-            )
+            print(f"[Payment:Callback] STEP 2 ✅ Detail API resolved | code={params.get('PaymentResponseCode')!r}")
         else:
-            # Detail API failed (likely 403 IP not whitelisted) or returned code=0/4.
-            # CRITICAL: If PayG sent PaymentResponseCode directly in the redirect
-            # params (even as 0 or 4), trust that over the Detail API failure.
             if payg_response_code_direct is not None:
-                print(
-                    f"[Payment:Callback] STEP 2 ⚠️  Detail API failed but PayG gave "
-                    f"code={payg_response_code_direct} directly in redirect — using that"
-                )
-                # params already has the direct code — no change needed
+                print(f"[Payment:Callback] STEP 2 ⚠️  Detail API failed but PayG gave code={payg_response_code_direct} directly")
             else:
-                print(
-                    f"[Payment:Callback] STEP 2 ❌ Detail API returned nothing AND PayG "
-                    f"gave no code in redirect params — code defaults to -1 (UNKNOWN).\n"
-                    f"  If this keeps happening: log into PayG portal and add this\n"
-                    f"  server's public IP to the IP Whitelist so the Detail API works."
-                )
+                print(f"[Payment:Callback] STEP 2 ❌ Detail API failed AND PayG gave no code — code=-1 (UNKNOWN)")
     elif payg_gave_us_params:
-        print(
-            f"[Payment:Callback] STEP 2 — Skipped Detail API — "
-            f"PayG already gave PaymentResponseCode={payg_response_code_raw!r} in redirect params"
-        )
+        print(f"[Payment:Callback] STEP 2 — Skipped Detail API — PayG gave code={payg_response_code_raw!r} directly")
     else:
-        print(
-            f"[Payment:Callback] STEP 2 ❌ Cannot call Detail API — "
-            f"no oid, rid, or OrderKeyId available in params"
-        )
+        print(f"[Payment:Callback] STEP 2 ❌ Cannot call Detail API — no oid/rid/OrderKeyId")
 
-    # ── STEP 3: Find order in DB ──────────────────────────────────────────
     order_id_str  = params.get("UserDefined1") or oid or ""
     order_key_id  = params.get("OrderKeyId", "")
     unique_req_id = params.get("UniqueRequestId", "") or rid
 
-    print(
-        f"[Payment:Callback] STEP 3 — Looking up order | "
-        f"order_id_str={order_id_str!r} | order_key_id={order_key_id!r} | unique_req_id={unique_req_id!r}"
-    )
+    print(f"[Payment:Callback] STEP 3 — Looking up order | order_id_str={order_id_str!r}")
 
     order: Optional[Orders] = None
     if order_id_str:
@@ -820,27 +661,18 @@ async def payment_callback(
 
     if order is None and order_key_id:
         order = db.query(Orders).filter(
-            Orders.orderKeyId  == order_key_id,
-            Orders.deletedInd  == False,
+            Orders.orderKeyId == order_key_id, Orders.deletedInd == False,
         ).first()
-        print(f"[Payment:Callback] STEP 3 — Lookup by orderKeyId={order_key_id!r}: {'FOUND' if order else 'NOT FOUND'}")
+        print(f"[Payment:Callback] STEP 3 — Lookup by orderKeyId: {'FOUND' if order else 'NOT FOUND'}")
 
     if order is None and unique_req_id:
         order = db.query(Orders).filter(
-            Orders.paymentTransactionRefNo == unique_req_id,
-            Orders.deletedInd              == False,
+            Orders.paymentTransactionRefNo == unique_req_id, Orders.deletedInd == False,
         ).first()
-        print(f"[Payment:Callback] STEP 3 — Lookup by uniqueRequestId={unique_req_id!r}: {'FOUND' if order else 'NOT FOUND'}")
+        print(f"[Payment:Callback] STEP 3 — Lookup by uniqueRequestId: {'FOUND' if order else 'NOT FOUND'}")
 
     if order is None:
-        print(
-            f"[Payment:Callback] STEP 3 ❌ ORDER NOT FOUND in this Azure DB!\n"
-            f"   Tried: orderId={order_id_str!r} | orderKeyId={order_key_id!r} | uniqueReqId={unique_req_id!r}\n"
-            f"   ROOT CAUSE: Frontend called a LOCAL backend (localhost:8000) to place the order,\n"
-            f"               but PayG is calling back to this Azure instance — the order is NOT here.\n"
-            f"   FIX 1: Set VITE_API_BASE_URL in frontend/.env.local → this Azure URL.\n"
-            f"   FIX 2: Add http://localhost:5173 to CORS_ORIGINS env var in Azure."
-        )
+        print(f"[Payment:Callback] STEP 3 ❌ ORDER NOT FOUND")
         return RedirectResponse(
             url=f"{_frontend_url()}/user-products/payment-callback?status=error&message=Order+not+found",
             status_code=302,
@@ -848,16 +680,10 @@ async def payment_callback(
 
     order_id = order.orderId
     print(
-        f"[Payment:Callback] STEP 3 ✅ Order found | "
-        f"id={order_id} | number={order.orderNumber!r} | state={order.state!r} | "
-        f"orderKeyId={order.orderKeyId!r} | paymentRef={order.paymentTransactionRefNo!r}"
+        f"[Payment:Callback] STEP 3 ✅ Order found | id={order_id} | "
+        f"number={order.orderNumber!r} | state={order.state!r}"
     )
 
-   # ── STEP 4: Hash verification skipped ────────────────────────────────
-# PayG does not send HashData in the callback redirect.
-# Payment outcome is determined solely by the Detail API response in STEP 2.
-
-    # ── STEP 5: Determine payment outcome ─────────────────────────────────
     try:
         response_code = int(params.get("PaymentResponseCode", -1))
     except (ValueError, TypeError):
@@ -866,187 +692,63 @@ async def payment_callback(
     success = (response_code == 1)
     new_state = payg_client.payment_code_to_order_state(response_code)
     print(
-        f"[Payment:Callback] STEP 5 — Payment outcome | "
-        f"response_code={response_code} | success={success} | new_state={new_state!r} | "
-        f"PaymentMethod={params.get('PaymentMethod')!r} | "
-        f"PaymentTransactionId={params.get('PaymentTransactionId')!r}"
+        f"[Payment:Callback] STEP 5 — outcome | code={response_code} | "
+        f"success={success} | new_state={new_state!r}"
     )
 
-    # ── STEP 6: Update order state in DB ──────────────────────────────────
-    # BUG FIX: Do NOT call _update_order_after_payment when response_code=-1
-    # (unknown — Detail API failed even after retries).  Calling it would set
-    # order.state = "AwaitingPayment" which is fine, but we must not wipe out a
-    # state that may have already been set to "Confirmed" by a prior callback
-    # (duplicate redirect scenario).  When code=-1, leave the order exactly as
-    # it is in the DB and let the frontend polling resolve it.
-    print(f"[Payment:Callback] STEP 6 — Updating order {order_id} state → {new_state!r} in DB...")
+    print(f"[Payment:Callback] STEP 6 — Updating order {order_id}...")
     if response_code == -1:
-        print(
-            f"[Payment:Callback] STEP 6 ℹ️  code=-1 (unknown) — "
-            f"skipping state update; order stays as '{order.state}' until resolved"
-        )
+        print(f"[Payment:Callback] STEP 6 ℹ️  code=-1 — skipping state update")
     else:
         try:
             _update_order_after_payment(db, order, response_code, params)
             _record_payment_log(db, order_id, order_key_id, unique_req_id, params)
             db.commit()
-            print(f"[Payment:Callback] STEP 6 ✅ DB updated → state={new_state!r} for order {order_id}")
+            print(f"[Payment:Callback] STEP 6 ✅ DB updated → {new_state!r}")
         except Exception as exc:
             db.rollback()
-            print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED for order {order_id}: {exc}")
+            print(f"[Payment:Callback] STEP 6 ❌ DB update FAILED: {exc}")
 
-    # ── STEP 7: On success — remove cart items + queue Ekart shipment ────────
-    #
-    # PayG PaymentResponseCode meanings:
-    #   1  → Approved (definitive success)
-    #   2  → Declined (definitive failure — bank rejected)
-    #   0  → Initiated / Pending (payment not settled yet — DO NOT destroy order)
-    #   4  → Payment Pending    (payment not settled yet — DO NOT destroy order)
-    #  -1  → Unknown (Detail API failed or timed out   — DO NOT destroy order)
-    #
-    # ── BUG FIX: Previously the `else` branch ran for ALL non-success codes
-    # (0, 4, -1, 2) and soft-deleted OrderItems.  This destroyed the order
-    # when PayG returned code=0/4 (payment still in-flight) or when the
-    # Detail API itself failed (code=-1, e.g. network timeout, wrong
-    # credentials).  The user then saw "Payment Not Completed / declined by
-    # the bank" even though their money had already left their account.
-    #
-    # The fix: only soft-delete OrderItems when response_code==2, which is
-    # the ONLY code that means the bank definitively rejected the transaction.
-    # For codes 0, 4 (pending) and -1 (unknown), leave the order and its
-    # items intact — the /Payment/Status poll or the Expire endpoint will
-    # clean up if the payment truly never settles.
-    DEFINITIVE_FAILURE = (response_code == 2)  # 2 = bank declined
+    DEFINITIVE_FAILURE = (response_code == 2)
 
     if success:
-        print(
-            f"[Payment:Callback] STEP 7 — Payment SUCCESS ✅ | "
-            f"Queueing _auto_create_ekart_shipment background task for order {order_id}..."
-        )
+        print(f"[Payment:Callback] STEP 7 — SUCCESS ✅ | Queueing Ekart shipment...")
         background_tasks.add_task(_auto_create_ekart_shipment, order_id)
-        print(f"[Payment:Callback] STEP 7 ✅ Background task QUEUED — watch for [Payment→Ekart] logs next")
-
-        # Remove all ordered cart items completely so the cart is clean for the user.
-        # The corrected query uses a CTE to collect exactly the CartIds that
-        # were ordered (by matching PVDID through OrderItems), then deletes only
-        # those rows.  One CartId per PVDID is selected (oldest first, i.e. the
-        # row that was most likely in the cart when the order was placed).
-        print(f"[Payment:Callback] STEP 7 — Removing ordered cart items for order {order_id}...")
-        try:
-            result = db.execute(text("""
-                WITH user_id AS (
-                    SELECT "UserProfileId"
-                    FROM twam."Orders"
-                    WHERE "OrderId" = :oid AND "DeletedInd" = false
-                    LIMIT 1
-                ),
-                carts_to_clear AS (
-                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
-                    FROM twam."Cart" c
-                    INNER JOIN twam."OrderItems" oi
-                        ON oi."OrderId"               = :oid
-                        AND oi."DeletedInd"            = false
-                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
-                      AND c."DeletedInd"    = false
-                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
-                )
-                UPDATE twam."Cart"
-                SET "DeletedInd"   = true,
-                    "IsOrdered"    = true,
-                    "ModifiedDate" = :now
-                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
-            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
-            db.commit()
-            print(
-                f"[Payment:Callback] STEP 7 ✅ Cart cleared — "
-                f"{result.rowcount} item(s) removed for order {order_id}"
-            )
-        except Exception as exc:
-            db.rollback()
-            print(f"[Payment:Callback] STEP 7 ⚠️  Cart removal FAILED (non-fatal) for order {order_id}: {exc}")
+        _clear_ordered_cart_items(db, order_id)
     elif DEFINITIVE_FAILURE:
-        # code=2: bank definitively declined — safe to clean up OrderItems
-        # so they never bleed into a future invoice.  Cart items are kept so
-        # the user can retry with the same products.
-        print(
-            f"[Payment:Callback] STEP 7 — Payment DECLINED by bank (code=2) | "
-            f"Soft-deleting OrderItems for order {order_id}..."
-        )
+        print(f"[Payment:Callback] STEP 7 — DECLINED (code=2) | Soft-deleting OrderItems...")
         try:
             cleanup = db.execute(text("""
-                UPDATE twam."OrderItems"
-                SET    "DeletedInd"   = true,
-                       "ModifiedDate" = :now
-                WHERE  "OrderId"    = :oid
-                  AND  "DeletedInd" = false
+                UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
+                WHERE "OrderId" = :oid AND "DeletedInd" = false
             """), {"oid": order_id, "now": datetime.now(timezone.utc)})
             db.commit()
-            print(
-                f"[Payment:Callback] STEP 7 ✅ Soft-deleted {cleanup.rowcount} OrderItem(s) "
-                f"for declined order {order_id}"
-            )
+            print(f"[Payment:Callback] STEP 7 ✅ Soft-deleted {cleanup.rowcount} OrderItem(s)")
         except Exception as exc:
             db.rollback()
-            print(f"[Payment:Callback] STEP 7 ⚠️  OrderItems cleanup failed for order {order_id}: {exc}")
+            print(f"[Payment:Callback] STEP 7 ⚠️  OrderItems cleanup failed: {exc}")
     else:
-        # code=0 (Initiated), code=4 (Pending), code=-1 (Detail API failed/unknown)
-        # Payment outcome is NOT yet known — preserve order and items intact.
-        # The frontend /Payment/Status poll or the 10-min Expire endpoint will
-        # resolve the order once PayG settles the transaction.
-        print(
-            f"[Payment:Callback] STEP 7 — Payment outcome AMBIGUOUS (code={response_code}) | "
-            f"Preserving order {order_id} and its OrderItems intact — NOT deleting. "
-            f"Frontend status-poll or Expire endpoint will resolve."
-        )
+        print(f"[Payment:Callback] STEP 7 — AMBIGUOUS (code={response_code}) — preserving order intact")
 
-    # ── STEP 8: Send notification ─────────────────────────────────────────
-    # BUG FIX: Previously a failure notification was sent for code=-1 (unknown)
-    # because success=False.  This wrongly told the customer "your payment failed"
-    # even when their money had already been debited.
-    # Rule: only send notifications for DEFINITIVE outcomes.
-    #   code=1  → success notification (order confirmed)
-    #   code=2  → failure notification (bank declined)
-    #   code=0/4/-1 → NO notification yet; the Status poll / admin will resolve it
-    print(f"[Payment:Callback] STEP 8 — Payment notification | response_code={response_code}")
+    print(f"[Payment:Callback] STEP 8 — Notification | code={response_code}")
     if response_code == 1:
         _send_payment_notification(db, order_id, success=True)
-        print(f"[Payment:Callback] STEP 8 ✅ Success notification sent for order {order_id}")
+        print(f"[Payment:Callback] STEP 8 ✅ Success notification sent")
     elif response_code == 2:
         _send_payment_notification(db, order_id, success=False)
-        print(f"[Payment:Callback] STEP 8 ✅ Failure notification sent for order {order_id}")
+        print(f"[Payment:Callback] STEP 8 ✅ Failure notification sent")
     else:
-        print(
-            f"[Payment:Callback] STEP 8 ℹ️  code={response_code} (ambiguous) — "
-            f"skipping notification; will send once Status poll resolves the outcome"
-        )
+        print(f"[Payment:Callback] STEP 8 ℹ️  code={response_code} — skipping notification")
 
-    # ── STEP 9: Redirect user ─────────────────────────────────────────────
-    #
-    # code=1 (success)   → /order-confirm/{id}?payment=success
-    # code=2 (declined)  → /payment-callback?status=failed&reason=declined
-    # code=0/4 (pending) → /order-confirm/{id}?payment=pending   (frontend polls)
-    # code=-1 (unknown)  → /order-confirm/{id}?payment=pending   (frontend polls)
-    #
-    # BUG FIX: Previously codes 0, 4, -1 all redirected to the "Payment Not
-    # Completed" failure page, which destroyed the user's confidence even though
-    # their money may have already left their account.  For ambiguous outcomes
-    # we now redirect to order-confirm with ?payment=pending so the frontend
-    # can poll /Payment/Status/{orderId} every few seconds and resolve the true
-    # outcome without the user seeing a false "declined" screen.
     if success:
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=success"
-
     elif response_code == 2:
-        # Definitive bank decline — safe to show failure page
         reason = params.get("PaymentReasonCode") or "declined"
         redirect_url = (
             f"{_frontend_url()}/user-products/payment-callback"
             f"?status=failed&orderId={order_id}&code={response_code}&reason={reason}"
         )
     else:
-        # code=0, 4, -1: ambiguous — send to order-confirm with pending flag.
-        # The frontend polls /Payment/Status until the outcome is known.
         redirect_url = f"{_frontend_url()}/user-products/order-confirm/{order_id}?payment=pending"
 
     print(f"[Payment:Callback] STEP 9 — Redirecting → {redirect_url}")
@@ -1062,22 +764,6 @@ def debug_settings():
         "env_var": os.getenv("FRONTEND_BASE_URL", "NOT_SET"),
     }
 
-# ── PayG Server-to-Server (S2S) Webhook ───────────────────────────────────────
-#
-# PayG can POST the final payment result directly from their servers to this
-# endpoint SEPARATELY from the browser redirect.  This is more reliable than
-# the browser redirect because:
-#   1. It is not affected by the user closing the browser tab
-#   2. It arrives from PayG's server IP (which can be whitelisted separately)
-#   3. It always carries the final PaymentResponseCode (1 or 2)
-#
-# Configure this URL in the PayG portal:
-#   UAT:  https://uat.payg.in/merchant/#/login → Settings → Webhook URL
-#   Live: https://payg.in/merchant/#/login  → Settings → Webhook URL
-#   Set to: https://<your-backend-domain>/api/Payment/Webhook
-#
-# This endpoint updates the order state and sends the success notification if
-# the callback endpoint missed it (code=-1 scenario).
 
 @router.post("/Webhook", include_in_schema=True)
 async def payment_webhook(
@@ -1085,15 +771,10 @@ async def payment_webhook(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    """
-    PayG server-to-server webhook. PayG POSTs final payment status here.
-    No browser redirect — just update the DB and return 200.
-    """
     SEP = "=" * 60
     print(f"\n{SEP}")
     print(f"[Payment:Webhook] ▶ Received S2S webhook from PayG")
 
-    # Parse body (JSON or form)
     params: dict = {}
     params.update(dict(request.query_params))
     ct = request.headers.get("content-type", "")
@@ -1118,7 +799,6 @@ async def payment_webhook(
     except (ValueError, TypeError):
         response_code = -1
 
-    # Find the order
     order_id_str  = params.get("UserDefined1", "") or params.get("oid", "")
     order_key_id  = params.get("OrderKeyId", "")
     unique_req_id = params.get("UniqueRequestId", "")
@@ -1134,30 +814,24 @@ async def payment_webhook(
             pass
     if order is None and order_key_id:
         order = db.query(Orders).filter(
-            Orders.orderKeyId == order_key_id,
-            Orders.deletedInd == False,
+            Orders.orderKeyId == order_key_id, Orders.deletedInd == False,
         ).first()
     if order is None and unique_req_id:
         order = db.query(Orders).filter(
-            Orders.paymentTransactionRefNo == unique_req_id,
-            Orders.deletedInd             == False,
+            Orders.paymentTransactionRefNo == unique_req_id, Orders.deletedInd == False,
         ).first()
 
     if order is None:
-        print(f"[Payment:Webhook] ❌ Order not found — UserDefined1={order_id_str!r} key={order_key_id!r}")
+        print(f"[Payment:Webhook] ❌ Order not found")
         return {"status": "order_not_found"}
 
-    order_id = order.orderId
+    order_id      = order.orderId
     was_confirmed = (order.state == "Confirmed")
     new_state     = payg_client.payment_code_to_order_state(response_code)
     success       = (response_code == 1)
 
-    print(
-        f"[Payment:Webhook] order={order_id} | code={response_code} | "
-        f"new_state={new_state!r} | was_confirmed={was_confirmed}"
-    )
+    print(f"[Payment:Webhook] order={order_id} | code={response_code} | new_state={new_state!r}")
 
-    # Only update if this is a definitive result (1 or 2) and not already confirmed
     if response_code in (1, 2) and not was_confirmed:
         try:
             _update_order_after_payment(db, order, response_code, params)
@@ -1166,25 +840,20 @@ async def payment_webhook(
             print(f"[Payment:Webhook] ✅ Order {order_id} updated → {new_state!r}")
         except Exception as exc:
             db.rollback()
-            print(f"[Payment:Webhook] ❌ DB update failed for order {order_id}: {exc}")
+            print(f"[Payment:Webhook] ❌ DB update failed: {exc}")
 
-    # Send notification (deferred from callback when code was -1)
     if success and not was_confirmed:
         background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+        _clear_ordered_cart_items(db, order_id)
         _send_payment_notification(db, order_id, success=True)
-        print(f"[Payment:Webhook] ✅ Success notification + Ekart shipment queued for order {order_id}")
+        print(f"[Payment:Webhook] ✅ Success notification + Ekart queued")
     elif response_code == 2 and not was_confirmed:
         _send_payment_notification(db, order_id, success=False)
-        print(f"[Payment:Webhook] ✅ Failure notification sent for order {order_id}")
+        print(f"[Payment:Webhook] ✅ Failure notification sent")
 
     print(f"{SEP}\n")
     return {"status": "ok", "orderId": order_id, "state": new_state}
 
-
-# ── Admin: manually confirm a payment ────────────────────────────────────────
-# For cases where PayG S2S webhook was not configured and the callback failed.
-# Allows support staff to mark an order as Confirmed after verifying payment
-# in the PayG dashboard.
 
 @router.post("/AdminConfirm/{order_id}", include_in_schema=True)
 def admin_confirm_payment(
@@ -1193,10 +862,6 @@ def admin_confirm_payment(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Staff-only: manually confirm a payment that was stuck in AwaitingPayment
-    because the Detail API was IP-blocked and the S2S webhook was not set up.
-    """
     if current_user.role_id not in Roles.STAFF:
         raise HTTPException(403, "Staff only")
 
@@ -1207,13 +872,9 @@ def admin_confirm_payment(
     if not order:
         raise HTTPException(404, "Order not found")
 
-    SAFE_STATES = {"AwaitingPayment", "Pending", "Payment Pending", "AwaitingPayment"}
+    SAFE_STATES = {"AwaitingPayment", "Pending", "Payment Pending"}
     if order.state not in SAFE_STATES:
-        return {
-            "success": False,
-            "message": f"Order is already in state '{order.state}' — no change made",
-            "state": order.state,
-        }
+        return {"success": False, "message": f"Order already in state '{order.state}'", "state": order.state}
 
     order.state        = "Confirmed"
     order.modifiedDate = datetime.now(timezone.utc)
@@ -1221,13 +882,12 @@ def admin_confirm_payment(
     db.commit()
 
     background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+    _clear_ordered_cart_items(db, order_id)
     _send_payment_notification(db, order_id, success=True)
 
     print(f"[Payment:AdminConfirm] ✅ Order {order_id} manually confirmed by staff {current_user.user_id}")
     return {"success": True, "orderId": order_id, "state": "Confirmed"}
 
-
-# ── Debug endpoint (admin only) ────────────────────────────────────────────
 
 @router.get("/Debug/{order_id}")
 def debug_payment(
@@ -1235,11 +895,6 @@ def debug_payment(
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Admin diagnostic: shows whether the order exists in Azure DB, live PayG
-    status, and full Ekart config state. Call this after any test payment to
-    instantly see what went wrong without digging through Azure logs.
-    """
     if current_user.role_id not in Roles.STAFF:
         raise HTTPException(403, "Admin only")
 
@@ -1249,18 +904,8 @@ def debug_payment(
     ).first()
 
     if not order:
-        return {
-            "order_found": False,
-            "diagnosis": (
-                f"Order {order_id} does NOT exist in this Azure backend's DB. "
-                "This means the frontend created the order by calling a LOCAL backend "
-                "(localhost:8000) instead of this Azure instance. "
-                "Fix: create frontend/.env.local with VITE_API_BASE_URL pointing "
-                "to this Azure URL, then add http://localhost:5173 to Azure CORS_ORIGINS."
-            ),
-        }
+        return {"order_found": False, "diagnosis": f"Order {order_id} not in this DB."}
 
-    # Live PayG status
     payg_detail: dict = {}
     payg_error = ""
     if order.paymentTransactionRefNo or order.orderKeyId:
@@ -1272,35 +917,28 @@ def debug_payment(
         except Exception as e:
             payg_error = str(e)
 
-    # Ekart config
     from app.ekart.client import load_ekart_config_from_db
     cfg = load_ekart_config_from_db(db)
-
     tracking_val = getattr(order, "trackingId", None) or getattr(order, "TrackingId", None)
 
     return {
         "order_found": True,
         "order": {
-            "id":             order.orderId,
-            "number":         order.orderNumber,
-            "state":          order.state,
-            "tracking_id":    tracking_val,
+            "id": order.orderId, "number": order.orderNumber,
+            "state": order.state, "tracking_id": tracking_val,
             "payment_method": order.paymentMethod,
-            "ref_no":         order.paymentTransactionRefNo,
-            "order_key_id":   order.orderKeyId,
+            "ref_no": order.paymentTransactionRefNo,
+            "order_key_id": order.orderKeyId,
         },
         "payg_live": {
-            "response_code":  payg_detail.get("PaymentResponseCode"),
-            "order_status":   payg_detail.get("OrderStatus"),
-            "payment_status": payg_detail.get("PaymentStatus"),
-            "amount":         payg_detail.get("OrderAmount"),
-            "error":          payg_error or None,
+            "response_code": payg_detail.get("PaymentResponseCode"),
+            "order_status":  payg_detail.get("OrderStatus"),
+            "amount":        payg_detail.get("OrderAmount"),
+            "error":         payg_error or None,
         },
         "ekart": {
             "config_found":    cfg is not None,
             "config_complete": cfg.is_complete if cfg else False,
-            "pickup_alias":    cfg.pickup_alias if cfg else None,
-            "client_id":       cfg.client_id if cfg else None,
         },
         "settings": {
             "payg_mode":         get_setting("payg_mode"),
@@ -1317,28 +955,8 @@ async def get_payment_status(
     order_id: int,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    # FIX: use get_current_user_optional instead of get_current_user.
-    # get_current_user raises HTTPException when no token is present;
-    # Optional[CurrentUser] on its own does NOT suppress that raise.
-    # After a PayG redirect the browser session/cookie is typically lost,
-    # so every poll would return 403 without this wrapper.
     current_user: Optional[CurrentUser] = Depends(get_current_user_optional),
 ):
-    """
-    Frontend polls this every 4 s after a PayG redirect.
-
-    ACTIVE RESOLUTION: If the order is still AwaitingPayment / Pending
-    (i.e. the callback never arrived — user left before redirect, or the
-    Detail API was IP-blocked at callback time), we proactively call the
-    PayG Detail API right here to get the real payment status, update the
-    DB, clear the cart, and queue the Ekart shipment — exactly as the
-    callback handler would have done.
-
-    This means payment is confirmed even when:
-      • The user closes the tab immediately after paying
-      • The user refreshes the page before the PayG redirect completes
-      • The PayG callback URL never reached Azure (network / IP issue)
-    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
@@ -1346,114 +964,70 @@ async def get_payment_status(
     if not order:
         raise HTTPException(404, "Order not found")
 
-    # Only enforce ownership check if user is authenticated.
-    # Unauthenticated polls are allowed — PayG redirect may lose session.
     if current_user and current_user.role_id not in Roles.STAFF:
         if order.userProfileId != current_user.user_id:
             raise HTTPException(403, "Not authorised")
 
     local_state = order.state or "AwaitingPayment"
-
-    # ── ACTIVE RESOLUTION ────────────────────────────────────────────────
-    # If the order is still unresolved, hit the PayG Detail API now.
-    # States that mean "payment outcome not yet known":
-    UNRESOLVED = {"AwaitingPayment", "Pending", "Payment Pending", "awaitingpayment"}
+    UNRESOLVED  = {"AwaitingPayment", "Pending", "Payment Pending", "awaitingpayment"}
 
     if local_state in UNRESOLVED:
-        print(f"[Payment/Status] Order {order_id} is '{local_state}' — probing PayG Detail API...")
-        try:
-            enriched = _enrich_params_via_detail_api(
-                oid          = str(order_id),
-                rid          = order.paymentTransactionRefNo or "",
-                order_key_id = order.orderKeyId or "",
-            )
-
-            response_code = int(enriched.get("PaymentResponseCode", -1)) if enriched else -1
-            print(f"[Payment/Status] PayG Detail API returned code={response_code} for order {order_id}")
-
-            if response_code == 1:
-                # ── SUCCESS ──────────────────────────────────────────────
-                # Update order state, log, clear cart, queue shipment
-                _update_order_after_payment(db, order, response_code, enriched)
-                _record_payment_log(
-                    db, order_id,
-                    enriched.get("OrderKeyId", ""),
-                    enriched.get("UniqueRequestId", ""),
-                    enriched,
-                )
-                db.commit()
-                local_state = "Confirmed"
-                print(f"[Payment/Status] ✅ Order {order_id} → Confirmed via active poll")
-
-                # Clear cart items
-                try:
-                    db.execute(text("""
-                        WITH carts_to_clear AS (
-                            SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
-                            FROM twam."Cart" c
-                            INNER JOIN twam."OrderItems" oi
-                                ON oi."OrderId"               = :oid
-                                AND oi."DeletedInd"            = false
-                                AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
-                            WHERE c."UserProfileId" = :uid
-                              AND c."DeletedInd"    = false
-                            ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
-                        )
-                        UPDATE twam."Cart"
-                        SET "DeletedInd"   = true,
-                            "IsOrdered"    = true,
-                            "ModifiedDate" = :now
-                        WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
-                    """), {
-                        "oid": order_id,
-                        "uid": order.userProfileId,
-                        "now": datetime.now(timezone.utc),
-                    })
-                    db.commit()
-                    print(f"[Payment/Status] ✅ Cart cleared for order {order_id}")
-                except Exception as ce:
-                    db.rollback()
-                    print(f"[Payment/Status] ⚠️  Cart clear failed (non-fatal): {ce}")
-
-                # Queue Ekart shipment + send notification
-                background_tasks.add_task(_auto_create_ekart_shipment, order_id)
-                _send_payment_notification(db, order_id, success=True)
-
-            elif response_code == 2:
-                # ── DEFINITIVE FAILURE ───────────────────────────────────
-                _update_order_after_payment(db, order, response_code, enriched)
-                _record_payment_log(
-                    db, order_id,
-                    enriched.get("OrderKeyId", ""),
-                    enriched.get("UniqueRequestId", ""),
-                    enriched,
-                )
-                # Soft-delete order items
-                db.execute(text("""
-                    UPDATE twam."OrderItems"
-                    SET "DeletedInd" = true, "ModifiedDate" = :now
-                    WHERE "OrderId" = :oid AND "DeletedInd" = false
-                """), {"oid": order_id, "now": datetime.now(timezone.utc)})
-                db.commit()
-                local_state = "PaymentFailed"
-                print(f"[Payment/Status] ❌ Order {order_id} → PaymentFailed via active poll")
-                _send_payment_notification(db, order_id, success=False)
-
-            else:
-                # code=-1 or 0/4 (still pending) — leave as-is, keep polling
+        # FIX: Skip Detail API if the background poller already checked within
+        # the last 12 seconds — avoids duplicate simultaneous PayG API calls.
+        last_modified = order.modifiedDate
+        skip_probe = False
+        if last_modified:
+            lm_aware = last_modified.replace(tzinfo=timezone.utc) if last_modified.tzinfo is None else last_modified
+            seconds_ago = (datetime.now(timezone.utc) - lm_aware).total_seconds()
+            if seconds_ago < 12:
+                skip_probe = True
                 print(
-                    f"[Payment/Status] ⏳ Order {order_id} still unresolved "
-                    f"(code={response_code}) — frontend will retry"
+                    f"[Payment/Status] Order {order_id} — skipping Detail API probe "
+                    f"(poller checked {seconds_ago:.1f}s ago)"
                 )
 
-        except Exception as exc:
-            # Detail API failed (network, IP block, etc.) — return current DB
-            # state and let frontend keep polling; S2S webhook will resolve it
-            print(f"[Payment/Status] ⚠️  Detail API probe failed for order {order_id}: {exc}")
+        if not skip_probe:
+            print(f"[Payment/Status] Order {order_id} is '{local_state}' — probing PayG Detail API...")
+            try:
+                enriched = _enrich_params_via_detail_api(
+                    oid          = str(order_id),
+                    rid          = order.paymentTransactionRefNo or "",
+                    order_key_id = order.orderKeyId or "",
+                )
 
-    # ── Already resolved states ──────────────────────────────────────────
-    # If the order was already Confirmed (by a prior poll or the callback),
-    # send the deferred notification in case the callback missed it.
+                response_code = int(enriched.get("PaymentResponseCode", -1)) if enriched else -1
+                print(f"[Payment/Status] PayG Detail API returned code={response_code} for order {order_id}")
+
+                if response_code == 1:
+                    _update_order_after_payment(db, order, response_code, enriched)
+                    _record_payment_log(db, order_id,
+                        enriched.get("OrderKeyId", ""), enriched.get("UniqueRequestId", ""), enriched)
+                    db.commit()
+                    local_state = "Confirmed"
+                    print(f"[Payment/Status] ✅ Order {order_id} → Confirmed")
+                    _clear_ordered_cart_items(db, order_id, order.userProfileId or "")
+                    background_tasks.add_task(_auto_create_ekart_shipment, order_id)
+                    _send_payment_notification(db, order_id, success=True)
+
+                elif response_code == 2:
+                    _update_order_after_payment(db, order, response_code, enriched)
+                    _record_payment_log(db, order_id,
+                        enriched.get("OrderKeyId", ""), enriched.get("UniqueRequestId", ""), enriched)
+                    db.execute(text("""
+                        UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
+                        WHERE "OrderId" = :oid AND "DeletedInd" = false
+                    """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+                    db.commit()
+                    local_state = "PaymentFailed"
+                    print(f"[Payment/Status] ❌ Order {order_id} → PaymentFailed")
+                    _send_payment_notification(db, order_id, success=False)
+
+                else:
+                    print(f"[Payment/Status] ⏳ Order {order_id} still pending (code={response_code}) — retry")
+
+            except Exception as exc:
+                print(f"[Payment/Status] ⚠️  Detail API probe failed for order {order_id}: {exc}")
+
     elif local_state == "Confirmed":
         try:
             from app.ekart.notifications import send_order_placed_notification
@@ -1472,80 +1046,48 @@ async def get_payment_status(
     }
 
 
-# ── Payment expiry (frontend timeout) ─────────────────────────────────────
-
 @router.post("/Expire/{order_id}")
 def expire_payment(
     order_id: int,
     db: Session = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """
-    Called by the frontend when the 10-minute payment window expires without
-    a confirmed payment.  Marks the order as 'PaymentFailed' so it is hidden
-    from the user's order list.  Only the order's owner (or staff) may call this.
-
-    Safe to call even if the payment already succeeded — the guard below
-    prevents overwriting a Confirmed/Processing/Delivered state.
-    """
     order = db.query(Orders).filter(
         Orders.orderId    == order_id,
         Orders.deletedInd == False,
     ).first()
-
     if not order:
         raise HTTPException(404, "Order not found")
 
     if current_user.role_id not in Roles.STAFF and order.userProfileId != current_user.user_id:
         raise HTTPException(403, "Not authorised")
 
-    # Only expire orders that are still waiting for payment — do NOT
-    # overwrite a state that PayG has already resolved.
     SAFE_TO_EXPIRE = {"AwaitingPayment", "Pending", "Payment Pending"}
     if order.state not in SAFE_TO_EXPIRE:
-        print(
-            f"[Payment/Expire] Order {order_id} is in state '{order.state}' "
-            f"— not expiring (payment may have succeeded)."
-        )
+        print(f"[Payment/Expire] Order {order_id} is '{order.state}' — not expiring")
         return {"success": False, "state": order.state, "message": "Order already resolved"}
 
     order.state        = "PaymentFailed"
     order.modifiedDate = datetime.now(timezone.utc)
     db.add(order)
-    db.add(OrderTrackingStatus(
-        orderId     = order_id,
-        status      = "PaymentFailed",
-        createdDate = datetime.now(timezone.utc),
-    ))
+    db.add(OrderTrackingStatus(orderId=order_id, status="PaymentFailed",
+                               createdDate=datetime.now(timezone.utc)))
     db.commit()
     print(f"[Payment/Expire] Order {order_id} expired → PaymentFailed")
 
-    # ── FIX: Soft-delete OrderItems from this failed order so they can never
-    # bleed into a subsequent order's item list or invoice display.
-    # Cart items are intentionally left intact (IsOrdered=false) so the user
-    # can retry from their cart — they are re-fetched by CartId on the next
-    # checkout, not by scanning all unordered items.
     try:
         result = db.execute(text("""
-            UPDATE twam."OrderItems"
-            SET    "DeletedInd"   = true,
-                   "ModifiedDate" = :now
-            WHERE  "OrderId"    = :oid
-              AND  "DeletedInd" = false
+            UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
+            WHERE "OrderId" = :oid AND "DeletedInd" = false
         """), {"oid": order_id, "now": datetime.now(timezone.utc)})
         db.commit()
-        print(
-            f"[Payment/Expire] Soft-deleted {result.rowcount} OrderItem(s) "
-            f"for failed order {order_id}"
-        )
+        print(f"[Payment/Expire] Soft-deleted {result.rowcount} OrderItem(s)")
     except Exception as exc:
         db.rollback()
-        print(f"[Payment/Expire] OrderItems cleanup failed for order {order_id}: {exc}")
+        print(f"[Payment/Expire] OrderItems cleanup failed: {exc}")
 
     return {"success": True, "state": "PaymentFailed"}
 
-
-# ── Admin: view / update PayG config ──────────────────────────────────────
 
 class PaygConfigResponse(BaseModel):
     payg_mode:            str
@@ -1577,17 +1119,11 @@ def _mask(v: str) -> str:
 
 @router.get("/OutboundIp")
 def get_outbound_ip():
-    """
-    Returns this server's public outbound IP address.
-    Share this IP with PayG support to get it whitelisted.
-    No auth required — safe to call from browser/Postman.
-    """
     import httpx as _httpx
     results = {}
     for svc, url in [
-        ("amazonaws",  "https://checkip.amazonaws.com"),
-        ("ipify",      "https://api.ipify.org"),
-        ("my-ip.io",   "https://api4.my-ip.io/ip"),
+        ("amazonaws", "https://checkip.amazonaws.com"),
+        ("ipify",     "https://api.ipify.org"),
     ]:
         try:
             r = _httpx.get(url, timeout=5)
@@ -1598,11 +1134,8 @@ def get_outbound_ip():
     return {"outbound_ip": results}
 
 
-@router.get(
-    "/Config",
-    response_model = PaygConfigResponse,
-    dependencies   = [Depends(require_roles(Roles.SUPER_ADMIN))],
-)
+@router.get("/Config", response_model=PaygConfigResponse,
+            dependencies=[Depends(require_roles(Roles.SUPER_ADMIN))])
 def get_payg_config():
     return PaygConfigResponse(
         payg_mode            = get_setting("payg_mode", "uat"),
@@ -1616,39 +1149,20 @@ def get_payg_config():
     )
 
 
-@router.put(
-    "/Config",
-    dependencies = [Depends(require_roles(Roles.SUPER_ADMIN))],
-)
-def update_payg_config(
-    data: PaygConfigUpdate,
-    db: Session = Depends(get_db),
-):
+@router.put("/Config", dependencies=[Depends(require_roles(Roles.SUPER_ADMIN))])
+def update_payg_config(data: PaygConfigUpdate, db: Session = Depends(get_db)):
     from app.common.models import AppSettings
-
     updates = {k: v for k, v in data.model_dump().items() if v is not None}
     now = datetime.now(timezone.utc)
-
     for key, value in updates.items():
-        row = (
-            db.query(AppSettings)
-            .filter(AppSettings.key == key, AppSettings.deletedInd == False)
-            .first()
-        )
+        row = (db.query(AppSettings)
+               .filter(AppSettings.key == key, AppSettings.deletedInd == False).first())
         if row:
-            row.value        = value
+            row.value = value
             row.modifiedDate = now
         else:
-            db.add(AppSettings(
-                key          = key,
-                value        = value,
-                description  = f"PayG setting: {key}",
-                isActive     = True,
-                createdDate  = now,
-                modifiedDate = now,
-                deletedInd   = False,
-            ))
-
+            db.add(AppSettings(key=key, value=value, description=f"PayG: {key}",
+                               isActive=True, createdDate=now, modifiedDate=now, deletedInd=False))
     db.commit()
     reload_settings(db)
     return {"success": True, "updated": list(updates.keys())}
