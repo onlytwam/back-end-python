@@ -197,19 +197,17 @@ def _build_upi_intent_auth_header() -> str:
 def _build_detail_auth_header() -> str:
     """
     Auth header for DETAIL API.
-    Format: Basic base64(auth_key:auth_token)
-
-    PayG's Detail endpoint uses a SHORTER auth format — only key:token,
-    WITHOUT merchant_key_id and mid appended. Using the Create format
-    (4 parts) on the Detail endpoint returns HTTP 400 code 9020
-    'Invalid Authorization' on every single call.
+    Format: Basic base64(auth_key:auth_token:M:mid)
+    CONFIRMED by PayG support — same literal "M" format as CreateIntent,
+    NOT the merchantKeyId used by the standard Create API.
     """
-    auth_key   = _strip_0x(_cfg("payg_auth_key"))
-    auth_token = _strip_0x(_cfg("payg_auth_token"))
+    auth_key   = _cfg("payg_auth_key")
+    auth_token = _cfg("payg_auth_token")
+    mid        = _cfg("payg_mid")
 
-    print(f"[PayG] Detail auth header built (key:token format)")
+    print(f"[PayG] Detail auth: key='{auth_key[:4]}...' token='{auth_token[:4]}...' mid='{mid}' (M literal)")
 
-    raw     = f"{auth_key}:{auth_token}"
+    raw     = f"{auth_key}:{auth_token}:M:{mid}"
     encoded = base64.b64encode(raw.encode("utf-8")).decode("utf-8")
     return f"Basic {encoded}"
 
@@ -568,11 +566,13 @@ def get_payg_order_detail(
 
     ref = order_key_id or unique_request_id
 
-    # PayG Detail API authenticates via MID in the request body only.
-    # No Authorization header should be sent — PayG returns 400/9020 if
-    # any Authorization header is present, regardless of format.
+    # PayG confirmed: Detail API uses the same key:token:M:mid format as
+    # CreateIntent (literal "M", not the merchantKeyId used by Create).
+    # Previously no Authorization header was sent here, which produced
+    # HTTP 500 on every call.
     headers = {
-        "Content-Type": "application/json",
+        "Authorization": _build_detail_auth_header(),
+        "Content-Type":  "application/json",
     }
 
     detail_url   = _get_detail_url()
