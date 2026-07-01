@@ -172,7 +172,74 @@ def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") ->
     }
 
 
-def _clear_ordered_cart_items(db: Session, order_id: int, user_profile_id: str = "") -> int:
+def _send_ekart_failure_alert(db: Session, order: dict, items: list, error_message: str) -> None:
+    """
+    Sends an immediate email to customer support when payment succeeded but
+    automatic Ekart shipment creation failed. Includes every field needed to
+    manually create the shipment via the Ekart portal (Single Order Creation
+    form), so support staff can act without digging through the DB.
+    """
+    from app.sendemail.repository import send_email
+    from app.sendemail.schemas import EmailCreate
+    from app.shared.email_template import twam_email, info_box, items_table, section_divider
+
+    support_email = get_setting("SUPPORT_EMAIL", "customersupport@onlytwam.com")
+
+    item_rows_html = items_table([
+        {"name": i.name, "quantity": i.quantity, "price": i.price,
+         "size": None, "color": None}
+        for i in items
+    ]) if items else "<p>⚠️ No order items found — check OrderItems table manually.</p>"
+
+    content = (
+        f'''<p style="margin:0 0 16px;color:#c0392b;font-weight:600;">
+          ⚠️ Payment succeeded but Ekart shipment creation FAILED automatically.
+          Manual shipment creation is required.</p>'''
+        + info_box([
+            ("Order Number",  f"#{order['order_number']}"),
+            ("Order ID",      str(order['order_id'])),
+            ("Total Amount",  f"₹{order['total_amount']:.2f}"),
+            ("Payment Mode",  order.get('payment_mode', 'Prepaid')),
+            ("Error",         error_message),
+        ], accent="#c0392b")
+        + section_divider()
+        + '''<p style="margin:16px 0 8px;font-weight:600;">Consignee Details (for Ekart Single Order Creation form):</p>'''
+        + info_box([
+            ("First/Last Name", order.get('name', '')),
+            ("Phone",            order.get('phone', '')),
+            ("Address Line 1",   order.get('address_line', '')),
+            ("City",              order.get('city', '')),
+            ("State",             order.get('state_name', '')),
+            ("Pincode",           order.get('pincode', '')),
+            ("Country",           order.get('country', 'India')),
+        ])
+        + '''<p style="margin:16px 0 8px;font-weight:600;">Order Items (SKU / Name / Qty / Price / HSN):</p>'''
+        + item_rows_html
+        + f'''<p style="margin:16px 0 0;font-size:13px;color:#9B7080;">
+          Once you create the shipment manually on the Ekart portal and get the
+          AWB/tracking ID (e.g. LUAP0001179225), enter it in the Admin →
+          Failed Shipments page to mark this order as shipped and trigger the
+          customer's tracking email automatically.</p>'''
+    )
+
+    body = twam_email(
+        title   = f"⚠️ Manual Ekart Shipment Needed — Order #{order['order_number']}",
+        content = content,
+    )
+
+    try:
+        send_email(db, EmailCreate(
+            name="Customer Support",
+            email=support_email,
+            subject=f"[ACTION NEEDED] Ekart shipment failed — Order #{order['order_number']}",
+            message=body,
+        ))
+        print(f"[Payment→Ekart] ✅ Failure alert email sent to {support_email} for order {order['order_id']}")
+    except Exception as exc:
+        print(f"[Payment→Ekart] ❌ Failure alert email FAILED for order {order['order_id']}: {exc}")
+
+
+
     """
     Marks cart rows that match this order's items as IsOrdered=true and
     soft-deletes them. Called from all payment success paths.
@@ -380,6 +447,15 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                 db.commit()
             except Exception as _ne:
                 db.rollback()
+
+            # Alert customer support immediately with everything needed to
+            # manually create the shipment on the Ekart portal (same fields
+            # used for automatic creation), so they don't have to dig through
+            # the DB or admin panel.
+            try:
+                _send_ekart_failure_alert(db, order, items, result.error_message or "Unknown error")
+            except Exception as _aexc:
+                print(f"[Payment→Ekart] STEP 8 ⚠️  Failure-alert email failed (non-fatal): {_aexc}")
             return
 
         print(f"[Payment→Ekart] STEP 8 ✅ AWB={result.awb_number!r}")
@@ -443,10 +519,10 @@ async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_
     import asyncio
     from database import SessionLocal
 
-    INITIAL_DELAY  = 30     # FIX: was 120 — start checking after 30s (user pays fast)
-    POLL_INTERVAL  = 10     # FIX: was 30  — check every 10s for quicker resolution
-    MAX_DURATION   = 900    # 15 minutes total — unchanged
-    MAX_POLLS      = MAX_DURATION // POLL_INTERVAL  # 90 polls (was 30)
+    INITIAL_DELAY  = 30     # start checking after 30s (user pays fast)
+    POLL_INTERVAL  = 10     # check every 10s for quicker resolution
+    MAX_DURATION   = 1800   # 30 minutes total — order is deleted if unresolved after this
+    MAX_POLLS      = MAX_DURATION // POLL_INTERVAL  # 180 polls
 
     print(f"[PaymentPoller] ▶ START for order={order_id} — waiting {INITIAL_DELAY}s before first poll")
     await asyncio.sleep(INITIAL_DELAY)
@@ -528,8 +604,12 @@ async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_
         finally:
             db.close()
 
-    # 15 minutes elapsed
-    print(f"[PaymentPoller] ⏰ 15 min elapsed for order {order_id} — marking PaymentFailed")
+    # 30 minutes elapsed with NO response from PayG at all — treat as if
+    # the order was never paid for. Hard-delete it (not soft-delete) so it
+    # never appears anywhere, since PayG gave us zero information about it.
+    # If PayG DOES eventually respond (success or failure) at any point
+    # before this, the order is updated and resolved above — never deleted.
+    print(f"[PaymentPoller] ⏰ 30 min elapsed with no PayG response for order {order_id} — deleting order")
     db = SessionLocal()
     try:
         order = db.query(Orders).filter(
@@ -537,22 +617,24 @@ async def _poll_payment_until_resolved(order_id: int, order_key_id: str, unique_
             Orders.deletedInd == False,
         ).first()
         if order and order.state in {"AwaitingPayment", "Pending", "Payment Pending"}:
-            order.state        = "PaymentFailed"
-            order.modifiedDate = datetime.now(timezone.utc)
-            db.add(order)
-            db.add(OrderTrackingStatus(orderId=order_id, status="PaymentFailed",
-                                       createdDate=datetime.now(timezone.utc)))
+            order_id_to_delete = order.orderId
+            # Hard delete — order items first (FK), then the order itself.
             db.execute(text("""
-                UPDATE twam."OrderItems" SET "DeletedInd" = true, "ModifiedDate" = :now
-                WHERE "OrderId" = :oid AND "DeletedInd" = false
-            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+                DELETE FROM twam."OrderItems" WHERE "OrderId" = :oid
+            """), {"oid": order_id_to_delete})
+            db.execute(text("""
+                DELETE FROM twam."OrderTrackingStatus" WHERE "OrderId" = :oid
+            """), {"oid": order_id_to_delete})
+            db.execute(text("""
+                DELETE FROM twam."Orders" WHERE "OrderId" = :oid
+            """), {"oid": order_id_to_delete})
             db.commit()
-            print(f"[PaymentPoller] ✅ Order {order_id} → PaymentFailed after 15 min timeout")
+            print(f"[PaymentPoller] ✅ Order {order_id} hard-deleted after 30 min with no PayG response")
         else:
-            print(f"[PaymentPoller] Order {order_id} state='{getattr(order, 'state', 'N/A')}' — no timeout action")
+            print(f"[PaymentPoller] Order {order_id} state='{getattr(order, 'state', 'N/A')}' — already resolved, not deleting")
     except Exception as exc:
         db.rollback()
-        print(f"[PaymentPoller] ❌ Timeout cleanup failed for order {order_id}: {exc}")
+        print(f"[PaymentPoller] ❌ Timeout deletion failed for order {order_id}: {exc}")
     finally:
         db.close()
 

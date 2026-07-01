@@ -269,6 +269,137 @@ def _get_order_items_for_shipment(db: Session, order_id: int) -> list:
     return items
 
 
+# ── Admin: Failed Shipments list ───────────────────────────────────────────
+#
+# "Failed" = payment succeeded (order state is past AwaitingPayment, i.e.
+# Confirmed/Processing/etc) but no TrackingId has been written yet — meaning
+# the automatic _auto_create_ekart_shipment background task either failed
+# or hasn't run. These need manual intervention by support staff.
+
+@router.get("/FailedShipments")
+def list_failed_shipments(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_admin_user),
+):
+    """
+    Lists orders where payment succeeded but Ekart shipment creation has not
+    completed (no TrackingId yet). Admin uses this page to either retry
+    auto-creation or manually enter a tracking ID created via the Ekart portal.
+    """
+    rows = db.execute(text("""
+        SELECT
+            o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
+            o."PaymentMethod", o."CreatedDate", o."Notes",
+            a."Name", a."Phone", a."AddressLine", a."City",
+            a."PinCode", s."StateName",
+            p."EmailId"
+        FROM twam."Orders" o
+        LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
+        LEFT JOIN mdm."State" s    ON s."StateId"   = a."StateId"
+        LEFT JOIN twam."People" p  ON p."UserProfileId" = o."UserProfileId"
+        WHERE o."DeletedInd" = false
+          AND o."TrackingId" IS NULL
+          AND o."State" NOT IN ('AwaitingPayment', 'Pending', 'Payment Pending',
+                                 'PaymentFailed', 'Cancelled')
+        ORDER BY o."CreatedDate" DESC
+    """)).fetchall()
+
+    results = []
+    for r in rows:
+        order_id = r[0]
+        items = _get_order_items_for_shipment(db, order_id)
+        results.append({
+            "orderId":       order_id,
+            "orderNumber":   r[1] or str(order_id),
+            "totalAmount":   float(r[2]) if r[2] else 0,
+            "state":         r[3],
+            "paymentMethod": r[4],
+            "createdDate":   r[5],
+            "failureNotes":  r[6],
+            "consignee": {
+                "name":    r[7],
+                "phone":   r[8],
+                "address": r[9],
+                "city":    r[10],
+                "pincode": r[11],
+                "state":   r[12] or "",
+            },
+            "email": r[13],
+            "items": [
+                {"name": i.name, "sku": i.sku, "quantity": i.quantity,
+                 "price": i.price, "hsnCode": i.hsn_code}
+                for i in items
+            ],
+        })
+
+    return {"count": len(results), "failedShipments": results}
+
+
+@router.get("/ResolvedShipments")
+def list_resolved_shipments(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_admin_user),
+):
+    """
+    Orders that previously failed shipment creation but have since been resolved
+    (TrackingId is now present and state is Processing/Shipped/Delivered).
+    Shown in the Resolved tab of the Failed Shipments admin page.
+    """
+    rows = db.execute(text("""
+        SELECT
+            o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
+            o."PaymentMethod", o."CreatedDate", o."Notes",
+            o."TrackingId",
+            a."Name", a."Phone", a."AddressLine", a."City",
+            a."PinCode", s."StateName",
+            p."EmailId"
+        FROM twam."Orders" o
+        LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
+        LEFT JOIN mdm."State" s    ON s."StateId"   = a."StateId"
+        LEFT JOIN twam."People" p  ON p."UserProfileId" = o."UserProfileId"
+        WHERE o."DeletedInd" = false
+          AND o."TrackingId" IS NOT NULL
+          AND o."Notes" ILIKE '%Ekart%FAILED%'
+        ORDER BY o."ModifiedDate" DESC
+        LIMIT 100
+    """)).fetchall()
+
+    from app.shared.app_settings import get_setting as _gs
+    tracking_base = _gs("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track") or "https://app.elite.ekartlogistics.in/track"
+
+    results = []
+    for r in rows:
+        order_id   = r[0]
+        tracking_id = r[7]
+        items = _get_order_items_for_shipment(db, order_id)
+        results.append({
+            "orderId":       order_id,
+            "orderNumber":   r[1] or str(order_id),
+            "totalAmount":   float(r[2]) if r[2] else 0,
+            "state":         r[3],
+            "paymentMethod": r[4],
+            "createdDate":   r[5],
+            "failureNotes":  r[6],
+            "trackingId":    tracking_id,
+            "trackingUrl":   f"{tracking_base.rstrip('/')}/{tracking_id}" if tracking_id else None,
+            "consignee": {
+                "name":    r[8],
+                "phone":   r[9],
+                "address": r[10],
+                "city":    r[11],
+                "pincode": r[12],
+                "state":   r[13] or "",
+            },
+            "email": r[14],
+            "items": [
+                {"name": i.name, "sku": i.sku, "quantity": i.quantity,
+                 "price": i.price, "hsnCode": i.hsn_code}
+                for i in items
+            ],
+        })
+
+    return {"count": len(results), "resolvedShipments": results}
+
 
 def _build_return_address_from_db(db: Session) -> EkartAddress:
     try:
@@ -375,8 +506,13 @@ async def create_shipment(
 
     if inp.manual_tracking_id:
         tracking_id  = inp.manual_tracking_id
-        tracking_url = None
-        print(f"[Ekart:CreateShipment] ℹ️  Using manual tracking_id={tracking_id!r}")
+        # Construct the full tracking URL the same way send_order_shipped_notification
+        # does, so the admin UI can show/copy it immediately after manual entry.
+        # Confirmed format: https://app.elite.ekartlogistics.in/track/{tracking_id}
+        from app.shared.app_settings import get_setting as _get_setting
+        _tracking_base = _get_setting("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track") or "https://app.elite.ekartlogistics.in/track"
+        tracking_url = f"{_tracking_base.rstrip('/')}/{tracking_id}"
+        print(f"[Ekart:CreateShipment] ℹ️  Using manual tracking_id={tracking_id!r} → {tracking_url}")
     else:
         items   = _get_order_items_for_shipment(db, inp.order_id)
         if not items:

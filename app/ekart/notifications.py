@@ -839,6 +839,50 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
             subject=f"Order Confirmed! #{order['order_number']} — {company}", message=body,
         ))
 
+        # Also notify customer support so the team has visibility on every
+        # confirmed order without digging through the admin panel.
+        # Support body includes the customer's email address explicitly so they
+        # can identify who ordered without opening the admin panel.
+        try:
+            support_content = (
+                greeting(order["customer_name"])
+                + f'''<p style="margin:0 0 16px;">A new order has been confirmed.</p>'''
+                + info_box([
+                    ("Customer Name",  order["customer_name"]),
+                    ("Customer Email", order["customer_email"]),
+                    ("Customer Phone", order.get("customer_phone", "—")),
+                    ("Order Number",   f"#{order['order_number']}"),
+                    ("Order Date",     datetime.now().strftime("%d %b %Y")),
+                    ("Status",         "Confirmed ✓"),
+                ], accent="#2E8B57")
+                + items_table(it)
+                + totals_block(subtotal,
+                               order.get("delivery_charge") or 0,
+                               order.get("total_amount") or 0,
+                               order.get("coupon_amount") or 0)
+                + section_divider()
+                + info_box([
+                    ("Ship To", order.get("customer_name", "")),
+                    ("Address", ", ".join(filter(None, [
+                        order.get("address_line"), order.get("locality"),
+                        order.get("city"), order.get("pincode"),
+                    ]))),
+                    ("Phone",   order.get("customer_phone", "")),
+                ])
+            )
+            support_body = twam_email(
+                title   = f"[Order Confirmed] #{order['order_number']} — {order['customer_name']}",
+                content = support_content,
+            )
+            send_email(db, EmailCreate(
+                name="Customer Support",
+                email=support,
+                subject=f"[Order Confirmed] #{order['order_number']} — {order['customer_name']} ({order['customer_email']})",
+                message=support_body,
+            ))
+        except Exception as exc:
+            print(f"[Notifications] Support copy of order-confirmed email failed for order {order_id}: {exc}")
+
     if order["customer_phone"]:
         delivery_address = " ".join(filter(None, [
             order["address_line"], order["city"], order["pincode"]
@@ -1104,6 +1148,35 @@ def send_order_shipped_notification(db: Session, order_id: int) -> bool:
             name=order["customer_name"], email=order["customer_email"],
             subject=f"Your Order is On Its Way! #{order['order_number']}", message=body,
         ))
+
+        # Notify customer support — separate body that explicitly shows the
+        # customer's name, email and phone so support can identify the user.
+        try:
+            support_shipped_content = (
+                greeting("Customer Support Team")
+                + f'''<p style="margin:0 0 16px;">A shipment has been created for the following order.</p>'''
+                + info_box([
+                    ("Customer Name",  order["customer_name"]),
+                    ("Customer Email", order["customer_email"] or "—"),
+                    ("Customer Phone", order.get("customer_phone", "—")),
+                    ("Order Number",   f"#{order['order_number']}"),
+                    ("Tracking ID",    order["tracking_id"] or "Processing…"),
+                    ("Tracking URL",   tracking_url or "—"),
+                ], accent="#2E8B57")
+                + (cta_button("Track Package", tracking_url) if tracking_url else "")
+            )
+            support_shipped_body = twam_email(
+                title   = f"[Order Shipped] #{order['order_number']} — {order['customer_name']}",
+                content = support_shipped_content,
+            )
+            send_email(db, EmailCreate(
+                name="Customer Support",
+                email=support,
+                subject=f"[Order Shipped] #{order['order_number']} — {order['customer_name']} ({order['customer_email'] or 'no email'}) — AWB {order['tracking_id'] or 'Processing'}",
+                message=support_shipped_body,
+            ))
+        except Exception as exc:
+            print(f"[Notifications] Support copy of shipped email failed for order {order_id}: {exc}")
 
     if order["customer_phone"]:
         _notify(
