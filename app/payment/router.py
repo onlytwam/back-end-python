@@ -83,73 +83,7 @@ def _record_payment_log(
         print(f"[Payment] OrderRefund log failed for order {order_id}: {exc}")
 
 
-def _clear_ordered_cart_items(
-    db: Session,
-    order_id: int,
-    user_profile_id: str = "",
-) -> None:
-    """
-    Marks the Cart rows that correspond to a successfully-paid order as
-    IsOrdered=true so they disappear from the user's active cart, without
-    deleting them (keeps history / lets "Buy it again" work later).
-
-    Cart rows aren't directly linked to Orders/OrderItems by a foreign key,
-    so we match on ProductVariantDetailId (+ UserProfileId when known) for
-    the variants that were actually part of this order, restricted to rows
-    that aren't already ordered/deleted.
-
-    Called from multiple success paths (callback, webhook, poller,
-    admin-confirm) with or without an explicit user_profile_id — if it's
-    not supplied we resolve it from the Orders row itself.
-    """
-    try:
-        uid = (user_profile_id or "").strip()
-        if not uid:
-            order_row = db.execute(
-                text('SELECT "UserProfileId" FROM twam."Orders" WHERE "OrderId" = :oid'),
-                {"oid": order_id},
-            ).first()
-            uid = (order_row[0] if order_row else "") or ""
-
-        pvd_rows = db.execute(
-            text(
-                'SELECT DISTINCT "ProductVariantDetailId" '
-                'FROM twam."OrderItems" '
-                'WHERE "OrderId" = :oid AND "DeletedInd" = false '
-                'AND "ProductVariantDetailId" IS NOT NULL'
-            ),
-            {"oid": order_id},
-        ).fetchall()
-        pvd_ids = [r[0] for r in pvd_rows]
-
-        if not pvd_ids:
-            print(f"[Payment] _clear_ordered_cart_items: no OrderItems PVDIDs for order={order_id} — nothing to clear")
-            return
-
-        params = {"pvdids": list(pvd_ids), "now": datetime.now(timezone.utc)}
-        query = (
-            'UPDATE twam."Cart" SET "IsOrdered" = true, "ModifiedDate" = :now '
-            'WHERE "ProductVariantDetailId" = ANY(:pvdids) '
-            'AND "DeletedInd" = false '
-            'AND ("IsOrdered" IS NULL OR "IsOrdered" = false)'
-        )
-        if uid:
-            query += ' AND "UserProfileId" = :uid'
-            params["uid"] = uid
-
-        result = db.execute(text(query), params)
-        db.commit()
-        print(
-            f"[Payment] ✅ _clear_ordered_cart_items: order={order_id} uid={uid or '(unknown)'} "
-            f"pvdids={pvd_ids} → {result.rowcount} Cart row(s) marked IsOrdered"
-        )
-    except Exception as exc:
-        db.rollback()
-        print(f"[Payment] ⚠️  _clear_ordered_cart_items failed for order={order_id}: {exc}")
-
-
 def _update_order_after_payment(
-
     db: Session,
     order: Orders,
     response_code: int,
@@ -236,6 +170,63 @@ def _enrich_params_via_detail_api(oid: str, rid: str, order_key_id: str = "") ->
         "MID":                     get_setting("payg_mid"),
         "OrderAmount":             str(detail.get("OrderAmount", "")),
     }
+
+
+def _clear_ordered_cart_items(db: Session, order_id: int, user_profile_id: str = "") -> int:
+    """
+    Marks cart rows that match this order's items as IsOrdered=true and
+    soft-deletes them. Called from all payment success paths.
+    """
+    try:
+        if user_profile_id:
+            result = db.execute(text("""
+                WITH carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = :uid
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+            """), {"oid": order_id, "uid": user_profile_id, "now": datetime.now(timezone.utc)})
+        else:
+            result = db.execute(text("""
+                WITH user_id AS (
+                    SELECT "UserProfileId" FROM twam."Orders"
+                    WHERE "OrderId" = :oid AND "DeletedInd" = false LIMIT 1
+                ),
+                carts_to_clear AS (
+                    SELECT DISTINCT ON (c."ProductVariantDetailId") c."CartId"
+                    FROM twam."Cart" c
+                    INNER JOIN twam."OrderItems" oi
+                        ON oi."OrderId"               = :oid
+                        AND oi."DeletedInd"            = false
+                        AND c."ProductVariantDetailId" = oi."ProductVariantDetailId"
+                    WHERE c."UserProfileId" = (SELECT "UserProfileId" FROM user_id)
+                      AND c."DeletedInd"    = false
+                    ORDER BY c."ProductVariantDetailId", c."CreatedDate" ASC
+                )
+                UPDATE twam."Cart"
+                SET "DeletedInd"   = true,
+                    "IsOrdered"    = true,
+                    "ModifiedDate" = :now
+                WHERE "CartId" IN (SELECT "CartId" FROM carts_to_clear)
+            """), {"oid": order_id, "now": datetime.now(timezone.utc)})
+        db.commit()
+        print(f"[Payment] Cart cleared — {result.rowcount} item(s) removed for order {order_id}")
+        return result.rowcount
+    except Exception as exc:
+        db.rollback()
+        print(f"[Payment] Cart cleanup FAILED for order {order_id}: {exc}")
+        return 0
 
 
 def _send_ekart_failure_alert(db: Session, order: dict, items: list, error_message: str) -> None:
