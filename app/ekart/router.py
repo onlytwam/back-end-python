@@ -286,45 +286,66 @@ def list_failed_shipments(
     completed (no TrackingId yet). Admin uses this page to either retry
     auto-creation or manually enter a tracking ID created via the Ekart portal.
     """
-    rows = db.execute(text("""
+    # Use ORM query to avoid raw SQL column casing issues with TrackingId
+    from app.orders.models import Orders as OrderModel
+    order_rows = (
+        db.query(OrderModel)
+        .filter(
+            OrderModel.deletedInd == False,
+            (OrderModel.trackingId == None) | (OrderModel.trackingId == ""),
+            OrderModel.state.notin_([
+                "AwaitingPayment", "Pending", "Payment Pending",
+                "PaymentFailed", "Cancelled",
+            ]),
+        )
+        .order_by(OrderModel.createdDate.desc())
+        .all()
+    )
+
+    # Now fetch address/state/email via a single raw query per order (or join)
+    order_ids = [o.orderId for o in order_rows]
+    if not order_ids:
+        return {"count": 0, "failedShipments": []}
+
+    placeholders = ", ".join(str(oid) for oid in order_ids)
+    detail_rows = db.execute(text(f"""
         SELECT
-            o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
-            o."PaymentMethod", o."CreatedDate", o."Notes",
+            o."OrderId",
             a."Name", a."Phone", a."AddressLine", a."City",
             a."PinCode", s."StateName",
-            p."EmailId"
+            p."EmailId",
+            o."Notes", o."PaymentMethod", o."TotalAmount",
+            o."State", o."CreatedDate"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
         LEFT JOIN mdm."State" s    ON s."StateId"   = a."StateId"
         LEFT JOIN twam."People" p  ON p."UserProfileId" = o."UserProfileId"
-        WHERE o."DeletedInd" = false
-          AND o."TrackingId" IS NULL
-          AND o."State" NOT IN ('AwaitingPayment', 'Pending', 'Payment Pending',
-                                 'PaymentFailed', 'Cancelled')
-        ORDER BY o."CreatedDate" DESC
+        WHERE o."OrderId" IN ({placeholders})
     """)).fetchall()
 
+    detail_map = {r[0]: r for r in detail_rows}
+
     results = []
-    for r in rows:
-        order_id = r[0]
-        items = _get_order_items_for_shipment(db, order_id)
+    for o in order_rows:
+        r = detail_map.get(o.orderId)
+        items = _get_order_items_for_shipment(db, o.orderId)
         results.append({
-            "orderId":       order_id,
-            "orderNumber":   r[1] or str(order_id),
-            "totalAmount":   float(r[2]) if r[2] else 0,
-            "state":         r[3],
-            "paymentMethod": r[4],
-            "createdDate":   r[5],
-            "failureNotes":  r[6],
+            "orderId":       o.orderId,
+            "orderNumber":   o.orderNumber or str(o.orderId),
+            "totalAmount":   float(r[10]) if r and r[10] else 0,
+            "state":         o.state,
+            "paymentMethod": r[9] if r else None,
+            "createdDate":   o.createdDate,
+            "failureNotes":  r[8] if r else None,
             "consignee": {
-                "name":    r[7],
-                "phone":   r[8],
-                "address": r[9],
-                "city":    r[10],
-                "pincode": r[11],
-                "state":   r[12] or "",
+                "name":    r[1] if r else None,
+                "phone":   r[2] if r else None,
+                "address": r[3] if r else None,
+                "city":    r[4] if r else None,
+                "pincode": r[5] if r else None,
+                "state":   r[6] if r else "",
             },
-            "email": r[13],
+            "email": r[7] if r else None,
             "items": [
                 {"name": i.name, "sku": i.sku, "quantity": i.quantity,
                  "price": i.price, "hsnCode": i.hsn_code}
@@ -345,52 +366,70 @@ def list_resolved_shipments(
     (TrackingId is now present and state is Processing/Shipped/Delivered).
     Shown in the Resolved tab of the Failed Shipments admin page.
     """
-    rows = db.execute(text("""
+    from app.orders.models import Orders as OrderModel
+    from app.shared.app_settings import get_setting as _gs
+    tracking_base = _gs("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track") or "https://app.elite.ekartlogistics.in/track"
+
+    order_rows = (
+        db.query(OrderModel)
+        .filter(
+            OrderModel.deletedInd == False,
+            OrderModel.trackingId != None,
+            OrderModel.trackingId != "",
+        )
+        .order_by(OrderModel.modifiedDate.desc())
+        .limit(100)
+        .all()
+    )
+
+    # Filter to only those that had a Notes failure marker
+    order_rows = [o for o in order_rows if o.notes and "Ekart" in (o.notes or "") and "FAILED" in (o.notes or "")]
+
+    order_ids = [o.orderId for o in order_rows]
+    if not order_ids:
+        return {"count": 0, "resolvedShipments": []}
+
+    placeholders = ", ".join(str(oid) for oid in order_ids)
+    detail_rows = db.execute(text(f"""
         SELECT
-            o."OrderId", o."OrderNumber", o."TotalAmount", o."State",
-            o."PaymentMethod", o."CreatedDate", o."Notes",
-            o."TrackingId",
+            o."OrderId",
             a."Name", a."Phone", a."AddressLine", a."City",
             a."PinCode", s."StateName",
-            p."EmailId"
+            p."EmailId",
+            o."Notes", o."PaymentMethod", o."TotalAmount", o."State"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
         LEFT JOIN mdm."State" s    ON s."StateId"   = a."StateId"
         LEFT JOIN twam."People" p  ON p."UserProfileId" = o."UserProfileId"
-        WHERE o."DeletedInd" = false
-          AND o."TrackingId" IS NOT NULL
-          AND o."Notes" ILIKE '%Ekart%FAILED%'
-        ORDER BY o."ModifiedDate" DESC
-        LIMIT 100
+        WHERE o."OrderId" IN ({placeholders})
     """)).fetchall()
 
-    from app.shared.app_settings import get_setting as _gs
-    tracking_base = _gs("TRACKING_BASE_URL", "https://app.elite.ekartlogistics.in/track") or "https://app.elite.ekartlogistics.in/track"
+    detail_map = {r[0]: r for r in detail_rows}
 
     results = []
-    for r in rows:
-        order_id   = r[0]
-        tracking_id = r[7]
-        items = _get_order_items_for_shipment(db, order_id)
+    for o in order_rows:
+        r = detail_map.get(o.orderId)
+        tracking_id = o.trackingId
+        items = _get_order_items_for_shipment(db, o.orderId)
         results.append({
-            "orderId":       order_id,
-            "orderNumber":   r[1] or str(order_id),
-            "totalAmount":   float(r[2]) if r[2] else 0,
-            "state":         r[3],
-            "paymentMethod": r[4],
-            "createdDate":   r[5],
-            "failureNotes":  r[6],
+            "orderId":       o.orderId,
+            "orderNumber":   o.orderNumber or str(o.orderId),
+            "totalAmount":   float(r[10]) if r and r[10] else 0,
+            "state":         o.state,
+            "paymentMethod": r[9] if r else None,
+            "createdDate":   o.createdDate,
+            "failureNotes":  r[8] if r else None,
             "trackingId":    tracking_id,
             "trackingUrl":   f"{tracking_base.rstrip('/')}/{tracking_id}" if tracking_id else None,
             "consignee": {
-                "name":    r[8],
-                "phone":   r[9],
-                "address": r[10],
-                "city":    r[11],
-                "pincode": r[12],
-                "state":   r[13] or "",
+                "name":    r[1] if r else None,
+                "phone":   r[2] if r else None,
+                "address": r[3] if r else None,
+                "city":    r[4] if r else None,
+                "pincode": r[5] if r else None,
+                "state":   r[6] if r else "",
             },
-            "email": r[14],
+            "email": r[7] if r else None,
             "items": [
                 {"name": i.name, "sku": i.sku, "quantity": i.quantity,
                  "price": i.price, "hsnCode": i.hsn_code}
