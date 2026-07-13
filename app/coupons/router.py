@@ -741,3 +741,254 @@ def _parse_date(value):
         except ValueError:
             continue
     return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BRAND COUPON ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/AdminList", summary="Unified coupon list for admin Coupon List page")
+def admin_coupons_list(
+    status:     Optional[str] = Query(None),   # all | active | used | inactive
+    search:     Optional[str] = Query(None),
+    page_index: int = Query(1, alias="Page.Index", ge=1),
+    page_size:  int = Query(30, alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    return repository.get_admin_coupons_list(
+        db,
+        status     = status,
+        search     = search,
+        page_index = page_index,
+        page_size  = page_size,
+    )
+
+
+@router.get("/Brand", summary="List brand coupons (admin)")
+def list_brand_coupons(
+    brand_id:   Optional[int] = Query(None),
+    status:     Optional[str] = Query(None),  # "active" | "used" | "inactive" | None=all
+    page_index: int = Query(1, alias="Page.Index", ge=1),
+    page_size:  int = Query(20, alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    result = repository.get_brand_coupons(
+        db, brand_id=brand_id, status=status,
+        page_index=page_index, page_size=page_size,
+    )
+    return {
+        "list":  [_brand_coupon_dict(c) for c in result["list"]],
+        "count": result["count"],
+    }
+
+
+@router.get("/Brand/UsageDetails", summary="Brand coupon usage — who used which code (admin)")
+def brand_coupon_usage_details(
+    brand_id:   Optional[int] = Query(None),
+    page_index: int = Query(1, alias="Page.Index", ge=1),
+    page_size:  int = Query(50, alias="Page.Size",  ge=1),
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    return repository.get_brand_coupon_usage_details(
+        db, brand_id=brand_id, page_index=page_index, page_size=page_size,
+    )
+
+
+@router.post("/Brand/Single", summary="Create a single brand coupon (admin)")
+def create_single_brand_coupon(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Body: { couponCode, couponName, brandId, discount, startDate?, endDate? }
+    Creates one single-use brand coupon.
+    """
+    try:
+        c = repository.create_brand_coupon(
+            db,
+            coupon_code  = payload["couponCode"],
+            coupon_name  = payload.get("couponName", ""),
+            brand_id     = int(payload["brandId"]),
+            discount     = int(payload["discount"]),
+            start_date   = _parse_date(payload.get("startDate")),
+            end_date     = _parse_date(payload.get("endDate")),
+            created_by   = getattr(current_user, "user_id", None),
+        )
+        return {"success": True, "coupon": _brand_coupon_dict(c)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/Brand/BulkUpload", summary="Bulk upload brand coupons from Excel (admin)")
+async def bulk_upload_brand_coupons(
+    file:        UploadFile = File(...),
+    couponName:  str        = Query(...),
+    brandId:     int        = Query(...),
+    discount:    int        = Query(...),
+    startDate:   Optional[str] = Query(None),
+    endDate:     Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Accepts an Excel file with a single column of coupon codes (no header needed,
+    or header row is auto-skipped if first cell is not a valid code).
+    Query params: couponName, brandId, discount, startDate?, endDate?
+    """
+    content = await file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+    ws = wb.active
+    codes = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        val = row[0] if row else None
+        if val is None:
+            continue
+        code = str(val).strip().upper()
+        # Skip obvious header rows
+        if i == 0 and code in ("CODE", "COUPON CODE", "COUPONCODE", "CODES"):
+            continue
+        if code:
+            codes.append(code)
+    wb.close()
+
+    if not codes:
+        raise HTTPException(400, "No valid coupon codes found in uploaded file")
+
+    inserted, skipped = repository.bulk_create_brand_coupons(
+        db,
+        codes        = codes,
+        coupon_name  = couponName,
+        brand_id     = brandId,
+        discount     = discount,
+        start_date   = _parse_date(startDate),
+        end_date     = _parse_date(endDate),
+        created_by   = getattr(current_user, "user_id", None),
+    )
+    return {
+        "success":  True,
+        "inserted": inserted,
+        "skipped":  skipped,
+        "message":  f"{inserted} coupon(s) created, {skipped} skipped (already existed or blank)",
+    }
+
+
+@router.get("/Brand/Template", summary="Download Excel template for brand coupon bulk upload")
+def brand_coupon_template(_: dict = Depends(get_current_user)):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Brand Coupons"
+    ws.column_dimensions["A"].width = 22
+    bold_font = Font(bold=True, color="FFFFFF")
+    fill = PatternFill("solid", fgColor="6B0F2A")
+    ws["A1"] = "Coupon Code"
+    ws["A1"].font = bold_font
+    ws["A1"].fill = fill
+    # Sample rows
+    for sample in ["BRAND001", "BRAND002", "BRAND003"]:
+        ws.append([sample])
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=brand_coupon_template.xlsx"},
+    )
+
+
+@router.post("/Brand/Validate", summary="Validate a brand coupon (checkout)")
+def validate_brand_coupon(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Body: { couponCode, brandId, userProfileId }
+    Used at checkout to check if a brand coupon is valid for the current cart.
+    Returns: { valid, couponId, discount, brandId, message }
+    """
+    result = repository.validate_brand_coupon(
+        db,
+        coupon_code     = payload.get("couponCode", ""),
+        brand_id        = int(payload.get("brandId", 0)),
+        user_profile_id = payload.get("userProfileId", ""),
+    )
+    return result
+
+
+@router.post("/Brand/MarkUsed", summary="Mark a brand coupon used after successful order")
+def mark_brand_coupon_used(
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    """
+    Body: { couponId, userProfileId, orderId? }
+    Call after createOrder succeeds when a brand coupon was applied.
+    """
+    try:
+        repository.mark_brand_coupon_used(
+            db,
+            coupon_id       = int(payload["couponId"]),
+            user_profile_id = payload["userProfileId"],
+            order_id        = payload.get("orderId"),
+        )
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.delete("/Brand/{coupon_id}", summary="Delete a brand coupon (admin)")
+def delete_brand_coupon(
+    coupon_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(get_current_user),
+):
+    from datetime import datetime, timezone
+    from .models import Coupons
+    c = db.query(Coupons).filter(
+        Coupons.couponId == coupon_id,
+        Coupons.couponType == "brand_specific",
+        Coupons.deletedInd == False,
+    ).first()
+    if not c:
+        raise HTTPException(404, "Brand coupon not found")
+    c.deletedInd   = True
+    c.modifiedDate = datetime.now(timezone.utc)
+    db.add(c)
+    db.commit()
+    return {"success": True}
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def _brand_coupon_dict(c) -> dict:
+    return {
+        "couponId":   c.couponId,
+        "couponCode": c.couponCode,
+        "couponName": c.couponName,
+        "brandId":    c.brandId,
+        "discount":   c.discount,
+        "startDate":  c.startDate.isoformat() if c.startDate else None,
+        "endDate":    c.endDate.isoformat()   if c.endDate   else None,
+        "isActive":   c.isActive,
+        "isUsed":     c.isUsed,
+        "isSingleUse": c.isSingleUse,
+        "createdDate": c.createdDate.isoformat() if c.createdDate else None,
+    }
+
+
+def _parse_date(v):
+    if not v:
+        return None
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromisoformat(v).replace(tzinfo=timezone.utc)
+    except Exception:
+        try:
+            return datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
