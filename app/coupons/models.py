@@ -30,6 +30,14 @@ class Coupons(Base):
     # NEW: links this row to a bulk-assignment batch
     batchId         = Column("BatchId",         BigInteger, nullable=True, index=True)
 
+    # BRAND COUPON fields
+    # brandId: links coupon to a brand — only applicable to products of this brand
+    brandId         = Column("BrandId",         Integer,   nullable=True, index=True)
+    # isSingleUse: once ANY user uses this code, it becomes invalid for all others
+    isSingleUse     = Column("IsSingleUse",     Boolean,   nullable=True, default=False)
+    # isUsed: set to True the first time this single-use coupon is redeemed
+    isUsed          = Column("IsUsed",          Boolean,   nullable=True, default=False)
+
 
 class CouponUsage(Base):
     __tablename__ = "CouponUsage"
