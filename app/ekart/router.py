@@ -314,7 +314,7 @@ def list_failed_shipments(
             a."Name", a."Phone", a."AddressLine", a."City",
             a."PinCode", s."StateName",
             p."EmailId",
-            o."Notes", o."PaymentMethod", o."TotalAmount",
+            o."PaymentMethod", o."TotalAmount",
             o."State", o."CreatedDate"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
@@ -332,11 +332,11 @@ def list_failed_shipments(
         results.append({
             "orderId":       o.orderId,
             "orderNumber":   o.orderNumber or str(o.orderId),
-            "totalAmount":   float(r[10]) if r and r[10] else 0,
+            "totalAmount":   float(r[9]) if r and r[9] else 0,
             "state":         o.state,
-            "paymentMethod": r[9] if r else None,
+            "paymentMethod": r[8] if r else None,
             "createdDate":   o.createdDate,
-            "failureNotes":  r[8] if r else None,
+            "failureNotes":  None,
             "consignee": {
                 "name":    r[1] if r else None,
                 "phone":   r[2] if r else None,
@@ -396,7 +396,7 @@ def list_resolved_shipments(
             a."Name", a."Phone", a."AddressLine", a."City",
             a."PinCode", s."StateName",
             p."EmailId",
-            o."Notes", o."PaymentMethod", o."TotalAmount", o."State"
+            o."PaymentMethod", o."TotalAmount", o."State"
         FROM twam."Orders" o
         LEFT JOIN twam."Address" a ON a."AddressId" = o."ShippingAddressId"
         LEFT JOIN mdm."State" s    ON s."StateId"   = a."StateId"
@@ -414,11 +414,11 @@ def list_resolved_shipments(
         results.append({
             "orderId":       o.orderId,
             "orderNumber":   o.orderNumber or str(o.orderId),
-            "totalAmount":   float(r[10]) if r and r[10] else 0,
+            "totalAmount":   float(r[9]) if r and r[9] else 0,
             "state":         o.state,
-            "paymentMethod": r[9] if r else None,
+            "paymentMethod": r[8] if r else None,
             "createdDate":   o.createdDate,
-            "failureNotes":  r[8] if r else None,
+            "failureNotes":  None,
             "trackingId":    tracking_id,
             "trackingUrl":   f"{tracking_base.rstrip('/')}/{tracking_id}" if tracking_id else None,
             "consignee": {
