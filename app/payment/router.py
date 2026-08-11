@@ -259,7 +259,8 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                    o."TrackingId", o."PaymentMethod", o."DeliveryCharge",
                    a."Name", a."Phone", a."AddressLine", a."City",
                    a."PinCode", s."StateName", c."CountryName",
-                   p."EmailId", o."ShippingTypeId", st."ShippingTypeName"
+                   p."EmailId", o."ShippingTypeId", st."ShippingTypeName",
+                   o."ShippingAddressId"
             FROM twam."Orders" o
             LEFT JOIN twam."Address" a   ON a."AddressId"     = o."ShippingAddressId"
             LEFT JOIN mdm."State" s      ON s."StateId"       = a."StateId"
@@ -284,6 +285,7 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
             "state_name": row[12] or "", "pincode": row[11] or "",
             "country": row[13] or "India", "email": row[14],
             "shipping_type_name": row[16] or "Normal",
+            "shipping_address_id": row[17],
         }
         print(f"[Payment→Ekart] STEP 2 ✅ Order found | state={order['state']!r} | tracking={order['tracking_id']!r}")
 
@@ -371,6 +373,36 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
                                    createdDate=datetime.now(timezone.utc)))
         db.commit()
         print(f"[Payment→Ekart] STEP 9 ✅ DB updated → Processing | AWB={result.awb_number!r}")
+
+        try:
+            from app.shipment.models import Shipment
+            qty = sum([i.quantity for i in items])
+            ship = Shipment(
+                orderId             = order_id,
+                orderNumber         = order["order_number"],
+                consigneeName       = order["name"],
+                paymentMode         = order["payment_mode"],
+                totalAmount         = order["total_amount"],
+                taxValue            = 0,
+                taxableAmount       = order["total_amount"],
+                codAmount           = order["total_amount"] if order["payment_mode"] == "COD" else 0,
+                quantity            = qty,
+                weight              = 0.5,
+                length              = 20,
+                height              = 10,
+                width               = 15,
+                dropAddressId       = order["shipping_address_id"],
+                isSameReturnAddress = True,
+                trackingId          = result.awb_number,
+                createdDate         = datetime.now(timezone.utc),
+                deletedInd          = False,
+            )
+            db.add(ship)
+            db.commit()
+            print(f"[Payment→Ekart] STEP 9a ✅ Shipment table record created")
+        except Exception as _e:
+            db.rollback()
+            print(f"[Payment→Ekart] STEP 9a ⚠️ Failed to insert shipment record: {_e}")
 
         try:
             from app.productvariantdetail.repository import increment_processed_quantity
