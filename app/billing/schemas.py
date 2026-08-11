@@ -25,6 +25,12 @@ class InventoryItem(BaseModel):
 
     model_config = {"from_attributes": True}
 
+class AssignStockIn(BaseModel):
+    stockId: str
+    storeId: Optional[int] = None
+    warehouseId: Optional[int] = None
+    quantity: int
+
 
 
 # ── Product lookup ────────────────────────────────────────────────────────────
@@ -67,6 +73,12 @@ class WarehouseOut(BaseModel):
     isActive:      bool
 
     model_config = {"from_attributes": True}
+
+class WarehouseCreate(BaseModel):
+    warehouseName: str
+    address:       Optional[str] = None
+    contactPhone:  Optional[str] = None
+    isActive:      bool = True
 
 
 # ── Create bill ───────────────────────────────────────────────────────────────

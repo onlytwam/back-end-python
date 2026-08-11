@@ -27,6 +27,7 @@ class Roles:
     PRODUCT_MANAGER   = 4
     ORDER_MANAGER     = 5
     CUSTOMER_SUPPORT  = 6
+    WAREHOUSE_MANAGER = 7
 
     NAMES = {
         1: "Super Admin",
@@ -35,10 +36,11 @@ class Roles:
         4: "Store Manager",
         5: "Order Manager",
         6: "Customer Support",
+        7: "Warehouse Manager",
     }
 
-    STAFF = {1, 3, 4, 5, 6, }
-    ALL   = {1, 2, 3, 4, 5, 6,}
+    STAFF = {1, 3, 4, 5, 6, 7}
+    ALL   = {1, 2, 3, 4, 5, 6, 7}
 
 
 # ── Bearer extractor ───────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ from app.auth.dependencies                import get_current_user          # ←
 from app.auth.schemas                     import CurrentUser               # ← ADD THIS
 from .schemas                             import (
     InventoryItem, ProductLookupOut, CreateBillIn, CreateBillOut,
-    WarehouseOut, StoreOut,                                                # ← ADD StoreOut
+    WarehouseOut, StoreOut, AssignStockIn, WarehouseCreate
 )
 
 router = APIRouter(prefix="/api/v2/Billing", tags=["Billing v2 / Multi-Channel"])
@@ -130,10 +130,12 @@ def list_inventory(
 ):
     q = db.query(Inventory)
 
-    if current_user.role_id == SUPER_ADMIN_ROLE_ID and current_user.store_id is None:
-        q = q.filter(Inventory.StoreId.isnot(None))
-    else:
+    if current_user.role_id in (SUPER_ADMIN_ROLE_ID, 3) and current_user.store_id is None and current_user.warehouse_id is None:
+        pass # Inventory Managers and Super Admins can see everything if they don't have a specific location
+    elif current_user.store_id:
         q = q.filter(Inventory.StoreId == current_user.store_id)
+    elif current_user.warehouse_id:
+        q = q.filter(Inventory.WarehouseId == current_user.warehouse_id)
 
     rows = q.order_by(Inventory.StockId).all()
 
@@ -381,3 +383,69 @@ def list_warehouse_inventory(
         )
         for inv in rows
     ]
+
+
+# ── ENDPOINT 5  — Create warehouse ───────────────────────────────────────────
+
+@router.post(
+    "/warehouses",
+    response_model=WarehouseOut,
+    summary="Create a new warehouse (Inventory Manager)",
+)
+def create_warehouse(
+    payload:      WarehouseCreate,
+    db:           Session     = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.role_id not in (SUPER_ADMIN_ROLE_ID, 3):
+        raise HTTPException(403, detail="Only Inventory Managers can create warehouses.")
+
+    wh = Warehouse(
+        WarehouseName=payload.warehouseName,
+        Address=payload.address,
+        ContactPhone=payload.contactPhone,
+        IsActive=payload.isActive
+    )
+    db.add(wh)
+    db.commit()
+    db.refresh(wh)
+    return wh
+
+# ── ENDPOINT 6  — Assign stock ───────────────────────────────────────────────
+
+@router.post(
+    "/inventory/assign",
+    summary="Assign stock to a Store or Warehouse (Inventory Manager)",
+)
+def assign_stock(
+    payload:      AssignStockIn,
+    db:           Session     = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.role_id not in (SUPER_ADMIN_ROLE_ID, 3):
+        raise HTTPException(403, detail="Only Inventory Managers can assign stock.")
+
+    if not payload.storeId and not payload.warehouseId:
+        raise HTTPException(400, detail="Must provide storeId or warehouseId.")
+    if payload.storeId and payload.warehouseId:
+        raise HTTPException(400, detail="Provide either storeId or warehouseId, not both.")
+    
+    cleaned_id = payload.stockId.strip().upper()
+    
+    inv = _get_inventory_row(db, cleaned_id, store_id=payload.storeId, warehouse_id=payload.warehouseId, lock=True)
+    if not inv:
+        inv = Inventory(
+            StockId=cleaned_id,
+            StoreId=payload.storeId,
+            WarehouseId=payload.warehouseId,
+            Quantity=payload.quantity,
+            ReservedQty=0
+        )
+        db.add(inv)
+    else:
+        inv.Quantity += payload.quantity
+        inv.ModifiedDate = datetime.now(timezone.utc)
+        
+    db.commit()
+    db.refresh(inv)
+    return {"message": "Stock assigned successfully", "inventoryId": inv.InventoryId, "quantity": inv.Quantity}
