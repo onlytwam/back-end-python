@@ -303,7 +303,7 @@ def _get_order_details(db: Session, order_id: int) -> Optional[dict]:
 
 def _get_order_items(db: Session, order_id: int) -> list:
     rows = db.execute(text("""
-        SELECT p."Name", oi."Quantity", oi."Price", pv."Color", s."SizeLabel"
+        SELECT p."Name", oi."Quantity", oi."Price", pv."Color", s."SizeLabel", pvd."StockId"
         FROM twam."OrderItems" oi
         LEFT JOIN twam."Products" p ON p."ProductId" = oi."ProductId"
         LEFT JOIN twam."ProductVariantDetail" pvd
@@ -316,7 +316,7 @@ def _get_order_items(db: Session, order_id: int) -> list:
     """), {"order_id": order_id}).fetchall()
     return [
         {"name": r[0] or "Product", "quantity": r[1] or 1,
-         "price": float(r[2]) if r[2] else 0, "color": r[3], "size": r[4]}
+         "price": float(r[2]) if r[2] else 0, "color": r[3], "size": r[4], "stock_id": r[5]}
         for r in rows
     ]
 
@@ -806,6 +806,8 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
         subtotal = sum(i["price"] * i["quantity"] for i in items)
         it = [{"name": i["name"], "quantity": i["quantity"], "price": i["price"],
                "size": i.get("size"), "color": i.get("color")} for i in items]
+        support_it = [{"name": i["name"], "quantity": i["quantity"], "price": i["price"],
+               "size": i.get("size"), "color": i.get("color"), "stock_id": i.get("stock_id")} for i in items]
         content = (
             greeting(order["customer_name"])
             + f'''<p style="margin:0 0 16px;">Your order has been confirmed.
@@ -855,7 +857,7 @@ def send_order_placed_notification(db: Session, order_id: int) -> bool:
                     ("Order Date",     datetime.now().strftime("%d %b %Y")),
                     ("Status",         "Confirmed ✓"),
                 ], accent="#2E8B57")
-                + items_table(it)
+                + items_table(support_it)
                 + totals_block(subtotal,
                                order.get("delivery_charge") or 0,
                                order.get("total_amount") or 0,
@@ -1152,6 +1154,9 @@ def send_order_shipped_notification(db: Session, order_id: int) -> bool:
         # Notify customer support — separate body that explicitly shows the
         # customer's name, email and phone so support can identify the user.
         try:
+            items = _get_order_items(db, order_id)
+            support_it = [{"name": i["name"], "quantity": i["quantity"], "price": i["price"],
+                   "size": i.get("size"), "color": i.get("color"), "stock_id": i.get("stock_id")} for i in items]
             support_shipped_content = (
                 greeting("Customer Support Team")
                 + f'''<p style="margin:0 0 16px;">A shipment has been created for the following order.</p>'''
@@ -1163,6 +1168,7 @@ def send_order_shipped_notification(db: Session, order_id: int) -> bool:
                     ("Tracking ID",    order["tracking_id"] or "Processing…"),
                     ("Tracking URL",   tracking_url or "—"),
                 ], accent="#2E8B57")
+                + items_table(support_it)
                 + (cta_button("Track Package", tracking_url) if tracking_url else "")
             )
             support_shipped_body = twam_email(
@@ -1393,6 +1399,36 @@ def send_order_cancelled_notification(
             subject=f"{email_heading} — #{order['order_number']}",
             message=body,
         ))
+
+        try:
+            items = _get_order_items(db, order_id)
+            support_it = [{"name": i["name"], "quantity": i["quantity"], "price": i["price"],
+                   "size": i.get("size"), "color": i.get("color"), "stock_id": i.get("stock_id")} for i in items]
+            
+            support_cancelled_content = (
+                greeting("Customer Support Team")
+                + f'''<p style="margin:0 0 16px;">An order has been cancelled by {cancelled_by.value}.</p>'''
+                + info_box([
+                    ("Customer Name",  order["customer_name"]),
+                    ("Customer Email", order["customer_email"] or "—"),
+                    ("Customer Phone", order.get("customer_phone", "—")),
+                    ("Order Number",   f"#{order['order_number']}"),
+                    ("Reason",         reason or "None"),
+                ], accent="#c0392b")
+                + items_table(support_it)
+            )
+            support_cancelled_body = twam_email(
+                title   = f"[Order Cancelled] #{order['order_number']} — {order['customer_name']}",
+                content = support_cancelled_content,
+            )
+            send_email(db, EmailCreate(
+                name="Customer Support",
+                email=support,
+                subject=f"[Order Cancelled] #{order['order_number']} — {order['customer_name']} ({order['customer_email'] or 'no email'})",
+                message=support_cancelled_body,
+            ))
+        except Exception as exc:
+            print(f"[Notifications] Support copy of cancelled email failed for order {order_id}: {exc}")
 
     if order["customer_phone"]:
         _notify(

@@ -51,6 +51,7 @@ class ProductVariantDetailUpdate(BaseModel):
     cgst:               Optional[float] = None
     sgst:               Optional[float] = None
     state:              Optional[str]   = None
+    stockId:            Optional[str]   = None
     cupSizeId:          Optional[int]   = None
     isLowStock:         Optional[bool]  = None
     isOutOfStock:       Optional[bool]  = None
