@@ -294,6 +294,7 @@ def update_variant_detail(db: Session, pvd_id: int, data) -> Optional[int]:
         "cgst":            tax_info["cgst"],
         "sgst":            tax_info["sgst"],
         "state":           data.state,
+        "stockId":         data.stockId,
         "cupSizeId":       data.cupSizeId,
         "amendmentQuantity": data.amendmentQuantity,
         "modifiedBy":      data.modifiedBy,
