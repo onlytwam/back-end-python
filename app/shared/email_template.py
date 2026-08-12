@@ -268,6 +268,7 @@ def items_table(items: list[dict]) -> str:
         if item.get("size"):     details.append(f"Size: {item['size']}")
         if item.get("color"):    details.append(f"Color: {item['color']}")
         if item.get("cup_size"): details.append(f"Cup: {item['cup_size']}")
+        if item.get("stock_id"): details.append(f"Stock: #{item['stock_id']}")
         det = (
             f'<br/><span style="font-size:11px;color:{_MUTED};">{" | ".join(details)}</span>'
             if details else ""
