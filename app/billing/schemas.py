@@ -131,3 +131,9 @@ class StoreOut(BaseModel):
     pinCode:   str = ""
 
     model_config = {"from_attributes": True}
+class WarehouseUpdate(BaseModel):
+    warehouseName: Optional[str] = None
+    address:       Optional[str] = None
+    isActive:      Optional[bool] = None
+    loginEmail:    Optional[str] = None
+    loginPassword: Optional[str] = None
