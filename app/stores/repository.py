@@ -3,6 +3,8 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc, text
 from .models import Stores
+from app.auth.repository import create_identity_user
+from app.auth.schemas import RegisterUserRequest
 
 def _enrich(db: Session, r: Stores) -> dict:
     country_name = None
@@ -47,6 +49,19 @@ def create(db: Session, data) -> int:
         userProfileId=data.userProfileId, createdDate=datetime.now(timezone.utc), deletedInd=False
     )
     db.add(entity); db.commit(); db.refresh(entity)
+    
+    if getattr(data, 'loginEmail', None) and getattr(data, 'loginPassword', None):
+        req = RegisterUserRequest(
+            firstName=getattr(data, 'loginFirstName', 'Store'),
+            lastName=getattr(data, 'loginLastName', 'Manager'),
+            emailId=data.loginEmail,
+            password=data.loginPassword,
+            phoneNumber=getattr(data, 'loginPhone', ''),
+            roleId=4,
+            storeId=entity.storeId
+        )
+        create_identity_user(db, req)
+
     return entity.storeId
 
 def update(db: Session, data) -> Optional[int]:

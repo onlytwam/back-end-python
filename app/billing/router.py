@@ -409,6 +409,21 @@ def create_warehouse(
     db.add(wh)
     db.commit()
     db.refresh(wh)
+    
+    if getattr(payload, 'loginEmail', None) and getattr(payload, 'loginPassword', None):
+        from app.auth.repository import create_identity_user
+        from app.auth.schemas import RegisterUserRequest
+        req = RegisterUserRequest(
+            firstName=getattr(payload, 'loginFirstName', 'Warehouse'),
+            lastName=getattr(payload, 'loginLastName', 'Manager'),
+            emailId=payload.loginEmail,
+            password=payload.loginPassword,
+            phoneNumber=getattr(payload, 'loginPhone', ''),
+            roleId=4, # Store/Warehouse Manager
+            warehouseId=wh.WarehouseId
+        )
+        create_identity_user(db, req)
+
     return wh
 
 # ── ENDPOINT 6  — Assign stock ───────────────────────────────────────────────
@@ -449,3 +464,100 @@ def assign_stock(
     db.commit()
     db.refresh(inv)
     return {"message": "Stock assigned successfully", "inventoryId": inv.InventoryId, "quantity": inv.Quantity}
+@router.get("/inventory/matrix")
+def get_inventory_matrix(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    search: str = Query(""),
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.role_id not in (SUPER_ADMIN_ROLE_ID, 3):
+        raise HTTPException(403, detail="Not authorized")
+        
+    from sqlalchemy import text
+    # Get all active stores
+    stores = db.execute(text('SELECT "StoreId", "StoreName" FROM twam."Stores" WHERE "DeletedInd" = false AND "IsActive" = true')).fetchall()
+    
+    # Get all active warehouses
+    warehouses = db.execute(text('SELECT "WarehouseId", "WarehouseName" FROM billing."Warehouse" WHERE "DeletedInd" = false AND "IsActive" = true')).fetchall()
+    
+    # Build query for products
+    sql = """
+        SELECT 
+            pvd."ProductVariantDetailId", p."ProductName", p."ProductCode", 
+            c."ColorName", s."SizeName", pvd."StockId", pvd."AvailableQuantity"
+        FROM product."ProductVariantDetail" pvd
+        JOIN product."ProductVariant" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
+        JOIN product."Products" p ON p."ProductId" = pv."ProductId"
+        LEFT JOIN mdm."ProductColor" c ON c."ColorId" = pv."ColorId"
+        LEFT JOIN mdm."Size" s ON s."SizeId" = pvd."SizeId"
+        WHERE pvd."DeletedInd" = false
+    """
+    
+    params = {}
+    if search:
+        sql += ' AND (p."ProductName" ILIKE :s OR pvd."StockId" ILIKE :s OR p."ProductCode" ILIKE :s)'
+        params['s'] = "%{search}%"
+        
+    sql += ' ORDER BY p."ProductName" LIMIT :limit OFFSET :offset'
+    params['limit'] = size
+    params['offset'] = (page - 1) * size
+    
+    rows = db.execute(text(sql), params).fetchall()
+    
+    count_sql = """
+        SELECT COUNT(*)
+        FROM product."ProductVariantDetail" pvd
+        JOIN product."ProductVariant" pv ON pv."ProductVariantId" = pvd."ProductVariantId"
+        JOIN product."Products" p ON p."ProductId" = pv."ProductId"
+        WHERE pvd."DeletedInd" = false
+    """
+    if search:
+        count_sql += ' AND (p."ProductName" ILIKE :s OR pvd."StockId" ILIKE :s OR p."ProductCode" ILIKE :s)'
+        
+    total = db.execute(text(count_sql), params).scalar()
+    
+    # Get all inventory allocations for these variants
+    variant_ids = [r[0] for r in rows]
+    allocations = {}
+    if variant_ids:
+        placeholders = ','.join([str(i) for i in variant_ids])
+        inv_rows = db.execute(text(f"""
+            SELECT "ProductVariantDetailId", "StoreId", "WarehouseId", "Quantity"
+            FROM billing."Inventory"
+            WHERE "ProductVariantDetailId" IN ({placeholders})
+        """)).fetchall()
+        
+        for inv in inv_rows:
+            vid = inv[0]
+            if vid not in allocations:
+                allocations[vid] = {"stores": {}, "warehouses": {}}
+            if inv[1]: # StoreId
+                allocations[vid]["stores"][inv[1]] = inv[3]
+            if inv[2]: # WarehouseId
+                allocations[vid]["warehouses"][inv[2]] = inv[3]
+                
+    list_res = []
+    for r in rows:
+        vid = r[0]
+        a = allocations.get(vid, {"stores": {}, "warehouses": {}})
+        list_res.append({
+            "productVariantDetailId": vid,
+            "productName": r[1],
+            "productCode": r[2],
+            "colorName": r[3],
+            "sizeName": r[4],
+            "stockId": r[5],
+            "totalAvailable": r[6],
+            "stores": a["stores"],
+            "warehouses": a["warehouses"]
+        })
+        
+    return {
+        "count": total,
+        "stores": [{"id": s[0], "name": s[1]} for s in stores],
+        "warehouses": [{"id": w[0], "name": w[1]} for w in warehouses],
+        "list": list_res
+    }
+
