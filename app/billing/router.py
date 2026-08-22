@@ -593,3 +593,24 @@ def update_warehouse(
     return wh
 
 
+
+@router.delete(
+    "/warehouses/{warehouse_id}",
+    status_code=204,
+    summary="Delete a warehouse (hard delete)",
+)
+def delete_warehouse(
+    warehouse_id: int,
+    db:           Session     = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.role_id not in (SUPER_ADMIN_ROLE_ID, 3):
+        raise HTTPException(403, detail="Only Inventory Managers can delete warehouses.")
+
+    wh = db.query(Warehouse).filter(Warehouse.WarehouseId == warehouse_id).first()
+    if not wh:
+        raise HTTPException(404, detail="Warehouse not found.")
+        
+    db.delete(wh)
+    db.commit()
+    return None
