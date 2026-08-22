@@ -611,6 +611,14 @@ def delete_warehouse(
     if not wh:
         raise HTTPException(404, detail="Warehouse not found.")
         
+    from app.auth.models import People
+    if getattr(wh, 'LoginEmail', None):
+        user = db.query(People).filter(People.Email == wh.LoginEmail).first()
+        if user:
+            db.delete(user)
+            
     db.delete(wh)
     db.commit()
     return None
+
+
