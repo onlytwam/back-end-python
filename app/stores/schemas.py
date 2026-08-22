@@ -14,6 +14,8 @@ class StoresCreate(BaseModel):
     mapLink: Optional[str] = None
     state: Optional[str] = None
     isActive: bool = True
+    loginEmail: Optional[str] = None
+    loginPassword: Optional[str] = None
     userProfileId: Optional[str] = None
     loginEmail: Optional[str] = None
     loginPassword: Optional[str] = None
@@ -34,6 +36,8 @@ class StoresUpdate(BaseModel):
     mapLink: Optional[str] = None
     state: Optional[str] = None
     isActive: bool = True
+    loginEmail: Optional[str] = None
+    loginPassword: Optional[str] = None
 
 class StoresResponse(BaseModel):
     storeId: int
@@ -49,6 +53,8 @@ class StoresResponse(BaseModel):
     mapLink: Optional[str] = None
     state: Optional[str] = None
     isActive: Optional[bool] = None
+    loginEmail: Optional[str] = None
+    loginPassword: Optional[str] = None
     userProfileId: Optional[str] = None
     createdDate: Optional[datetime] = None
     class Config:
@@ -58,3 +64,4 @@ class StoresListResponse(BaseModel):
     count: int
     list: List[StoresResponse]
     parameters: Optional[Any] = None
+

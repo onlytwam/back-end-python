@@ -18,6 +18,8 @@ class Stores(Base):
     mapLink = Column("MapLink", String, nullable=True)
     state = Column("State", String, nullable=True)
     isActive = Column("IsActive", Boolean, default=True)
+    loginEmail = Column("LoginEmail", String, nullable=True)
+    loginPassword = Column("LoginPassword", String, nullable=True)
     userProfileId = Column("UserProfileId", String, nullable=True)
     createdDate = Column("CreatedDate", DateTime(timezone=True), nullable=True)
     modifiedDate = Column("ModifiedDate", DateTime(timezone=True), nullable=True)

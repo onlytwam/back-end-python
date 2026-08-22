@@ -406,6 +406,8 @@ def create_warehouse(
         ContactPhone=payload.contactPhone,
         IsActive=payload.isActive
     )
+    if getattr(payload, 'loginEmail', None): wh.LoginEmail = payload.loginEmail
+    if getattr(payload, 'loginPassword', None): wh.LoginPassword = payload.loginPassword
     db.add(wh)
     db.commit()
     db.refresh(wh)
@@ -582,9 +584,12 @@ def update_warehouse(
     if payload.warehouseName is not None: wh.WarehouseName = payload.warehouseName
     if payload.address is not None: wh.Address = payload.address
     if payload.isActive is not None: wh.IsActive = payload.isActive
+    if getattr(payload, 'loginEmail', None): wh.LoginEmail = payload.loginEmail
+    if getattr(payload, 'loginPassword', None): wh.LoginPassword = payload.loginPassword
 
     # Handle login credentials if provided (we can't update user easily without identity API, but if it's there we would)
     db.commit()
     db.refresh(wh)
     return wh
+
 
