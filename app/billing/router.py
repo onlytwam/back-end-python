@@ -20,7 +20,7 @@ from app.auth.dependencies                import get_current_user          # ←
 from app.auth.schemas                     import CurrentUser               # ← ADD THIS
 from .schemas                             import (
     InventoryItem, ProductLookupOut, CreateBillIn, CreateBillOut,
-    WarehouseOut, StoreOut, AssignStockIn, WarehouseCreate
+    WarehouseOut, StoreOut, AssignStockIn, WarehouseCreate, WarehouseUpdate
 )
 
 router = APIRouter(prefix="/api/v2/Billing", tags=["Billing v2 / Multi-Channel"])
@@ -560,4 +560,31 @@ def get_inventory_matrix(
         "warehouses": [{"id": w[0], "name": w[1]} for w in warehouses],
         "list": list_res
     }
+
+@router.put(
+    "/warehouses/{warehouse_id}",
+    response_model=WarehouseOut,
+    summary="Update a warehouse",
+)
+def update_warehouse(
+    warehouse_id: int,
+    payload:      WarehouseUpdate,
+    db:           Session     = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    if current_user.role_id not in (SUPER_ADMIN_ROLE_ID, 3):
+        raise HTTPException(403, detail="Only Inventory Managers can update warehouses.")
+
+    wh = db.query(Warehouse).filter(Warehouse.WarehouseId == warehouse_id).first()
+    if not wh:
+        raise HTTPException(404, detail="Warehouse not found.")
+
+    if payload.warehouseName is not None: wh.WarehouseName = payload.warehouseName
+    if payload.address is not None: wh.Address = payload.address
+    if payload.isActive is not None: wh.IsActive = payload.isActive
+
+    # Handle login credentials if provided (we can't update user easily without identity API, but if it's there we would)
+    db.commit()
+    db.refresh(wh)
+    return wh
 
