@@ -75,6 +75,8 @@ class WarehouseOut(BaseModel):
     address:       Optional[str]
     contactPhone:  Optional[str]
     isActive:      bool
+    loginEmail:    Optional[str] = None
+    loginPassword: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -82,7 +84,9 @@ class WarehouseCreate(BaseModel):
     warehouseName: str
     address:       Optional[str] = None
     contactPhone:  Optional[str] = None
-    isActive:      bool = True
+    isActive:      bool
+    loginEmail:    Optional[str] = None
+    loginPassword: Optional[str] = None = True
     loginEmail:    Optional[str] = None
     loginPassword: Optional[str] = None
     loginFirstName: Optional[str] = None
@@ -137,3 +141,4 @@ class WarehouseUpdate(BaseModel):
     isActive:      Optional[bool] = None
     loginEmail:    Optional[str] = None
     loginPassword: Optional[str] = None
+

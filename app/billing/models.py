@@ -17,6 +17,8 @@ class Warehouse(Base):
     Address       = Column(Text)
     ContactPhone  = Column(String(20))
     IsActive      = Column(Boolean, default=True, nullable=False)
+    LoginEmail    = Column(String(255), nullable=True)
+    LoginPassword = Column(String(255), nullable=True)
     CreatedDate   = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     ModifiedDate  = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
 
