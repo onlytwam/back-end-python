@@ -15,6 +15,11 @@ class StoresCreate(BaseModel):
     state: Optional[str] = None
     isActive: bool = True
     userProfileId: Optional[str] = None
+    loginEmail: Optional[str] = None
+    loginPassword: Optional[str] = None
+    loginFirstName: Optional[str] = None
+    loginLastName: Optional[str] = None
+    loginPhone: Optional[str] = None
 
 class StoresUpdate(BaseModel):
     storeId: int

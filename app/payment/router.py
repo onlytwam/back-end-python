@@ -296,11 +296,12 @@ async def _auto_create_ekart_shipment(order_id: int) -> None:
         print(f"[Payment→Ekart] STEP 3 ✅ Guards passed")
 
         item_rows = db.execute(text("""
-            SELECT p."Name", COALESCE(p."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
+            SELECT p."Name", COALESCE(pvd."StockId", p."ProductCode", CAST(oi."ProductId" AS TEXT)) AS sku,
                    oi."Quantity", oi."Price", thc."HSNCode"
             FROM twam."OrderItems" oi
             LEFT JOIN twam."Products" p         ON p."ProductId"         = oi."ProductId"
             LEFT JOIN twam."ProductVariants" pv ON pv."ProductVariantId" = oi."ProductVariantId"
+            LEFT JOIN twam."ProductVariantDetail" pvd ON pvd."ProductVariantDetailId" = oi."ProductVariantDetailId"
             LEFT JOIN mdm."TaxHSNCode" thc      ON thc."TaxHSNCodeId"    = p."TaxHSNCodeId"
             WHERE oi."OrderId" = :oid AND oi."DeletedInd" = false
         """), {"oid": order_id}).fetchall()

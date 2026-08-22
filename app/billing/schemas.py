@@ -22,6 +22,10 @@ class InventoryItem(BaseModel):
     locationType: str
     quantity:     int
     available:    int
+    productName:  Optional[str] = None
+    productCode:  Optional[str] = None
+    colorName:    Optional[str] = None
+    sizeName:     Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -79,6 +83,11 @@ class WarehouseCreate(BaseModel):
     address:       Optional[str] = None
     contactPhone:  Optional[str] = None
     isActive:      bool = True
+    loginEmail:    Optional[str] = None
+    loginPassword: Optional[str] = None
+    loginFirstName: Optional[str] = None
+    loginLastName: Optional[str] = None
+    loginPhone:    Optional[str] = None
 
 
 # ── Create bill ───────────────────────────────────────────────────────────────
