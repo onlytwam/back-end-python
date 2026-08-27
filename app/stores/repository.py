@@ -20,7 +20,9 @@ def _enrich(db: Session, r: Stores) -> dict:
         "address": r.address, "phone": r.phone, "email": r.email,
         "isPickUpAvailable": r.isPickUpAvailable, "mapLink": r.mapLink,
         "state": r.state, "isActive": r.isActive, "userProfileId": r.userProfileId,
-        "createdDate": r.createdDate, "loginEmail": getattr(r, "loginEmail", None), "loginPassword": getattr(r, "loginPassword", None)
+        "createdDate": r.createdDate,
+        "loginEmail": getattr(r, "loginEmail", None),
+        "loginPassword": getattr(r, "loginPassword", None)
     }
 
 def get_all(db: Session, filters, order_ascending, order_property, page_index, page_size):
@@ -46,7 +48,8 @@ def create(db: Session, data) -> int:
         pinCode=data.pinCode, address=data.address, phone=data.phone,
         email=data.email, isPickUpAvailable=data.isPickUpAvailable,
         mapLink=data.mapLink, state=data.state, isActive=data.isActive,
-        userProfileId=data.userProfileId, createdDate=datetime.now(timezone.utc), deletedInd=False, loginEmail=getattr(data, 'loginEmail', None), loginPassword=getattr(data, 'loginPassword', None)
+        userProfileId=data.userProfileId, createdDate=datetime.now(timezone.utc), deletedInd=False, 
+        loginEmail=getattr(data, 'loginEmail', None), loginPassword=getattr(data, 'loginPassword', None)
     )
     db.add(entity); db.commit(); db.refresh(entity)
     
@@ -67,26 +70,53 @@ def create(db: Session, data) -> int:
 def update(db: Session, data) -> Optional[int]:
     entity = db.query(Stores).filter(Stores.storeId == data.storeId).first()
     if not entity: return None
-    entity.storeName = data.storeName; entity.country = data.country
-    entity.city = data.city; entity.pinCode = data.pinCode; entity.address = data.address
-    entity.phone = data.phone; entity.email = data.email
-    entity.isPickUpAvailable = data.isPickUpAvailable; entity.mapLink = data.mapLink
-    entity.state = data.state; entity.isActive = data.isActive
+    
+    if data.storeName is not None: entity.storeName = data.storeName
+    if data.country is not None: entity.country = data.country
+    if data.city is not None: entity.city = data.city
+    if data.pinCode is not None: entity.pinCode = data.pinCode
+    if data.address is not None: entity.address = data.address
+    if data.phone is not None: entity.phone = data.phone
+    if data.email is not None: entity.email = data.email
+    if data.isPickUpAvailable is not None: entity.isPickUpAvailable = data.isPickUpAvailable
+    if data.mapLink is not None: entity.mapLink = data.mapLink
+    if data.state is not None: entity.state = data.state
+    
+    from app.auth.models import People
+    
     if getattr(data, 'loginEmail', None): entity.loginEmail = data.loginEmail
     if getattr(data, 'loginPassword', None): entity.loginPassword = data.loginPassword
+    
+    user = None
+    if getattr(entity, 'loginEmail', None):
+        user = db.query(People).filter(People.Email == entity.loginEmail).first()
+        
+    if data.isActive is not None: 
+        entity.isActive = data.isActive
+        if user:
+            user.IsActive = data.isActive
+            
+    if getattr(data, 'loginPassword', None) is not None and getattr(entity, 'loginEmail', None):
+        from app.auth.security import get_password_hash
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == entity.loginEmail).first()
+        if identity:
+            identity.PasswordHash = get_password_hash(data.loginPassword)
+    
     entity.modifiedDate = datetime.now(timezone.utc)
-    db.commit(); return entity.storeId
+    db.commit()
+    return entity.storeId
 
 def delete(db: Session, store_id: int) -> bool:
     entity = db.query(Stores).filter(Stores.storeId == store_id).first()
     if not entity: return False
-    entity.deletedInd = True; if getattr(data, 'loginEmail', None): entity.loginEmail = data.loginEmail
-    if getattr(data, 'loginPassword', None): entity.loginPassword = data.loginPassword
-    entity.modifiedDate = datetime.now(timezone.utc)
-    db.commit(); return True
-
-
-
-
-
-
+    
+    from app.auth.models import People
+    if getattr(entity, 'loginEmail', None):
+        user = db.query(People).filter(People.Email == entity.loginEmail).first()
+        if user:
+            db.delete(user)
+            
+    db.delete(entity)
+    db.commit()
+    return True

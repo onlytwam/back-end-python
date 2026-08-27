@@ -426,7 +426,15 @@ def create_warehouse(
         )
         create_identity_user(db, req)
 
-    return wh
+    return WarehouseOut(
+        warehouseId   = wh.WarehouseId,
+        warehouseName = wh.WarehouseName,
+        address       = wh.Address,
+        contactPhone  = wh.ContactPhone,
+        isActive      = wh.IsActive,
+        loginEmail    = wh.LoginEmail,
+        loginPassword = wh.LoginPassword
+    )
 
 # ── ENDPOINT 6  — Assign stock ───────────────────────────────────────────────
 
@@ -581,16 +589,39 @@ def update_warehouse(
     if not wh:
         raise HTTPException(404, detail="Warehouse not found.")
 
+    from app.auth.models import People
+    
     if payload.warehouseName is not None: wh.WarehouseName = payload.warehouseName
     if payload.address is not None: wh.Address = payload.address
-    if payload.isActive is not None: wh.IsActive = payload.isActive
     if getattr(payload, 'loginEmail', None): wh.LoginEmail = payload.loginEmail
     if getattr(payload, 'loginPassword', None): wh.LoginPassword = payload.loginPassword
+    
+    user = None
+    if getattr(wh, 'LoginEmail', None):
+        user = db.query(People).filter(People.Email == wh.LoginEmail).first()
 
-    # Handle login credentials if provided (we can't update user easily without identity API, but if it's there we would)
+    if payload.isActive is not None: 
+        wh.IsActive = payload.isActive
+        if user:
+            user.IsActive = payload.isActive
+            
+    if getattr(payload, 'loginPassword', None) is not None and getattr(wh, 'LoginEmail', None):
+        from app.auth.security import get_password_hash
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == wh.LoginEmail).first()
+        if identity:
+            identity.PasswordHash = get_password_hash(payload.loginPassword)
     db.commit()
     db.refresh(wh)
-    return wh
+    return WarehouseOut(
+        warehouseId   = wh.WarehouseId,
+        warehouseName = wh.WarehouseName,
+        address       = wh.Address,
+        contactPhone  = wh.ContactPhone,
+        isActive      = wh.IsActive,
+        loginEmail    = wh.LoginEmail,
+        loginPassword = wh.LoginPassword
+    )
 
 
 
