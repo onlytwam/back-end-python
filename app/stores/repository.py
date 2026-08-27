@@ -91,17 +91,21 @@ def update(db: Session, data) -> Optional[int]:
     if getattr(entity, 'loginEmail', None):
         user = db.query(People).filter(People.emailId == entity.loginEmail).first()
         
+    identity = None
+    if getattr(entity, 'loginEmail', None):
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == entity.loginEmail).first()
+
     if data.isActive is not None: 
         entity.isActive = data.isActive
         if user:
             user.isActive = data.isActive
-            
-    if getattr(data, 'loginPassword', None) is not None and getattr(entity, 'loginEmail', None):
-        from app.auth.security import get_password_hash
-        from app.auth.models import IdentityUser
-        identity = db.query(IdentityUser).filter(IdentityUser.Email == entity.loginEmail).first()
         if identity:
-            identity.PasswordHash = get_password_hash(data.loginPassword)
+            identity.IsActive = data.isActive
+            
+    if getattr(data, 'loginPassword', None) is not None and identity:
+        from app.auth.security import get_password_hash
+        identity.PasswordHash = get_password_hash(data.loginPassword)
     
     entity.modifiedDate = datetime.now(timezone.utc)
     db.commit()
