@@ -104,8 +104,9 @@ def update(db: Session, data) -> Optional[int]:
             identity.IsActive = data.isActive
             
     if getattr(data, 'loginPassword', None) is not None and identity:
-        from app.auth.security import _aspnet_hash_password
-        identity.PasswordHash = _aspnet_hash_password(data.loginPassword)
+        from app.auth.security import _aspnet_hash_password, generate_sha256_hash_with_salt, _get_password_cipher
+        twam_hash = generate_sha256_hash_with_salt(data.loginPassword, _get_password_cipher())
+        identity.PasswordHash = _aspnet_hash_password(twam_hash)
     
     entity.modifiedDate = datetime.now(timezone.utc)
     db.commit()
