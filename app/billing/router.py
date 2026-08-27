@@ -605,9 +605,12 @@ def update_warehouse(
         if user:
             user.IsActive = payload.isActive
             
-    if getattr(payload, 'loginPassword', None) is not None and user:
+    if getattr(payload, 'loginPassword', None) is not None and getattr(wh, 'LoginEmail', None):
         from app.auth.security import get_password_hash
-        user.PasswordHash = get_password_hash(payload.loginPassword)
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == wh.LoginEmail).first()
+        if identity:
+            identity.PasswordHash = get_password_hash(payload.loginPassword)
     db.commit()
     db.refresh(wh)
     return WarehouseOut(
