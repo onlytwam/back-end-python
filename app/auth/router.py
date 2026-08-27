@@ -554,6 +554,13 @@ async def token(
                 "failed_count":       _MAX_FAILED_ATTEMPTS,
                 "max_attempts":       _MAX_FAILED_ATTEMPTS,
             })
+        elif result.error == "deactivated":
+            raise HTTPException(status_code=400, detail={
+                "error":              "deactivated",
+                "message":            "Account is deactivated.",
+                "failed_count":       0,
+                "max_attempts":       _MAX_FAILED_ATTEMPTS,
+            })
         elif result.error == "locked_out":
             raise HTTPException(status_code=400, detail={
                 "error":              "locked_out",
