@@ -613,8 +613,8 @@ def update_warehouse(
             identity.IsActive = payload.isActive
             
     if getattr(payload, 'loginPassword', None) is not None and identity:
-        from app.auth.security import get_password_hash
-        identity.PasswordHash = get_password_hash(payload.loginPassword)
+        from app.auth.security import _aspnet_hash_password
+        identity.PasswordHash = _aspnet_hash_password(payload.loginPassword)
     db.commit()
     db.refresh(wh)
     return WarehouseOut(
@@ -648,9 +648,14 @@ def delete_warehouse(
         
     from app.people.models import People
     if getattr(wh, 'LoginEmail', None):
-        user = db.query(People).filter(People.Email == wh.LoginEmail).first()
+        user = db.query(People).filter(People.emailId == wh.LoginEmail).first()
         if user:
             db.delete(user)
+            
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == wh.LoginEmail).first()
+        if identity:
+            db.delete(identity)
             
     db.delete(wh)
     db.commit()

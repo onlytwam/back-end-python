@@ -104,8 +104,8 @@ def update(db: Session, data) -> Optional[int]:
             identity.IsActive = data.isActive
             
     if getattr(data, 'loginPassword', None) is not None and identity:
-        from app.auth.security import get_password_hash
-        identity.PasswordHash = get_password_hash(data.loginPassword)
+        from app.auth.security import _aspnet_hash_password
+        identity.PasswordHash = _aspnet_hash_password(data.loginPassword)
     
     entity.modifiedDate = datetime.now(timezone.utc)
     db.commit()
@@ -117,9 +117,14 @@ def delete(db: Session, store_id: int) -> bool:
     
     from app.people.models import People
     if getattr(entity, 'loginEmail', None):
-        user = db.query(People).filter(People.Email == entity.loginEmail).first()
+        user = db.query(People).filter(People.emailId == entity.loginEmail).first()
         if user:
             db.delete(user)
+            
+        from app.auth.models import IdentityUser
+        identity = db.query(IdentityUser).filter(IdentityUser.Email == entity.loginEmail).first()
+        if identity:
+            db.delete(identity)
             
     db.delete(entity)
     db.commit()
