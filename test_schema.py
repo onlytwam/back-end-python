@@ -1,0 +1,5 @@
+from database import SessionLocal
+from sqlalchemy import text
+db = SessionLocal()
+res = db.execute(text("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'twam' AND table_name = 'Stores';")).fetchall()
+print(res)

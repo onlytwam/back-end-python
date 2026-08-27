@@ -84,9 +84,7 @@ class WarehouseCreate(BaseModel):
     warehouseName: str
     address:       Optional[str] = None
     contactPhone:  Optional[str] = None
-    isActive:      bool
-    loginEmail:    Optional[str] = None
-    loginPassword: Optional[str] = None = True
+    isActive:      bool = True
     loginEmail:    Optional[str] = None
     loginPassword: Optional[str] = None
     loginFirstName: Optional[str] = None
