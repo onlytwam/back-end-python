@@ -589,7 +589,7 @@ def update_warehouse(
     if not wh:
         raise HTTPException(404, detail="Warehouse not found.")
 
-    from app.auth.models import People
+    from app.people.models import People
     
     if payload.warehouseName is not None: wh.WarehouseName = payload.warehouseName
     if payload.address is not None: wh.Address = payload.address
@@ -642,7 +642,7 @@ def delete_warehouse(
     if not wh:
         raise HTTPException(404, detail="Warehouse not found.")
         
-    from app.auth.models import People
+    from app.people.models import People
     if getattr(wh, 'LoginEmail', None):
         user = db.query(People).filter(People.Email == wh.LoginEmail).first()
         if user:
@@ -651,5 +651,6 @@ def delete_warehouse(
     db.delete(wh)
     db.commit()
     return None
+
 
 

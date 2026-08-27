@@ -82,7 +82,7 @@ def update(db: Session, data) -> Optional[int]:
     if data.mapLink is not None: entity.mapLink = data.mapLink
     if data.state is not None: entity.state = data.state
     
-    from app.auth.models import People
+    from app.people.models import People
     
     if getattr(data, 'loginEmail', None): entity.loginEmail = data.loginEmail
     if getattr(data, 'loginPassword', None): entity.loginPassword = data.loginPassword
@@ -111,7 +111,7 @@ def delete(db: Session, store_id: int) -> bool:
     entity = db.query(Stores).filter(Stores.storeId == store_id).first()
     if not entity: return False
     
-    from app.auth.models import People
+    from app.people.models import People
     if getattr(entity, 'loginEmail', None):
         user = db.query(People).filter(People.Email == entity.loginEmail).first()
         if user:
@@ -120,3 +120,4 @@ def delete(db: Session, store_id: int) -> bool:
     db.delete(entity)
     db.commit()
     return True
+
