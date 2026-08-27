@@ -584,7 +584,7 @@ def authenticate_user(db: Session, username: str, encrypted_password: str) -> Au
 
     if not user.IsActive:
 
-        return AuthResult(False, "locked_out")
+        return AuthResult(False, "deactivated")
 
 
 
