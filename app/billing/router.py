@@ -598,12 +598,12 @@ def update_warehouse(
     
     user = None
     if getattr(wh, 'LoginEmail', None):
-        user = db.query(People).filter(People.Email == wh.LoginEmail).first()
+        user = db.query(People).filter(People.emailId == wh.LoginEmail).first()
 
     if payload.isActive is not None: 
         wh.IsActive = payload.isActive
         if user:
-            user.IsActive = payload.isActive
+            user.isActive = payload.isActive
             
     if getattr(payload, 'loginPassword', None) is not None and getattr(wh, 'LoginEmail', None):
         from app.auth.security import get_password_hash

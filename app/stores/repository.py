@@ -89,12 +89,12 @@ def update(db: Session, data) -> Optional[int]:
     
     user = None
     if getattr(entity, 'loginEmail', None):
-        user = db.query(People).filter(People.Email == entity.loginEmail).first()
+        user = db.query(People).filter(People.emailId == entity.loginEmail).first()
         
     if data.isActive is not None: 
         entity.isActive = data.isActive
         if user:
-            user.IsActive = data.isActive
+            user.isActive = data.isActive
             
     if getattr(data, 'loginPassword', None) is not None and getattr(entity, 'loginEmail', None):
         from app.auth.security import get_password_hash
