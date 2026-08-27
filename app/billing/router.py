@@ -81,7 +81,6 @@ def list_warehouses(
 ):
     rows = (
         db.query(Warehouse)
-        .filter(Warehouse.IsActive == True)
         .order_by(Warehouse.WarehouseName)
         .all()
     )
@@ -92,6 +91,8 @@ def list_warehouses(
             address       = wh.Address,
             contactPhone  = wh.ContactPhone,
             isActive      = wh.IsActive,
+            loginEmail    = wh.LoginEmail,
+            loginPassword = wh.LoginPassword
         )
         for wh in rows
     ]
