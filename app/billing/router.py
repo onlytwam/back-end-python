@@ -615,8 +615,10 @@ def update_warehouse(
             
     if getattr(payload, 'loginPassword', None) is not None and identity:
         from app.auth.security import _aspnet_hash_password, generate_sha256_hash_with_salt, _get_password_cipher
+        import uuid
         twam_hash = generate_sha256_hash_with_salt(payload.loginPassword, _get_password_cipher())
         identity.PasswordHash = _aspnet_hash_password(twam_hash)
+        identity.SecurityStamp = str(uuid.uuid4())
     db.commit()
     db.refresh(wh)
     return WarehouseOut(

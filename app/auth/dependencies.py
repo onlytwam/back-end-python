@@ -77,29 +77,47 @@ async def get_current_user(
                 detail="Session ended. Please log in again.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+            
+        try:
+            payload = decode_token(token)
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Your session has expired. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except jwt.InvalidTokenError as e:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Invalid authentication token: {str(e)[:100]}",
+            )
+
+        email_id = payload.get("email_id") or payload.get("email")
+        if not email_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Token missing required claim: email_id",
+            )
+
+        from app.auth.models import IdentityUser
+        user = db.query(IdentityUser).filter(IdentityUser.Email == email_id).first()
+        if not user or user.DeletedInd or not user.IsActive:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is deactivated or deleted.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        token_stamp = payload.get("SecurityStamp")
+        if token_stamp and user.SecurityStamp and token_stamp != user.SecurityStamp:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Credentials changed. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     finally:
         db.close()
-
-    try:
-        payload = decode_token(token)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Your session has expired. Please log in again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Invalid authentication token: {str(e)[:100]}",
-        )
-
-    email_id = payload.get("email_id") or payload.get("email")
-    if not email_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token missing required claim: email_id",
-        )
 
     role_id_raw = payload.get("RoleId") or payload.get("roleId") or 0
     try:

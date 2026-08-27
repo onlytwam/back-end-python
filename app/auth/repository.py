@@ -824,6 +824,8 @@ def build_token_claims(db: Session, user: IdentityUser) -> dict:
 
         "sid":                session,
 
+        "SecurityStamp":      user.SecurityStamp or "",
+
         "email":              user.Email or "",
 
         "email_id":           user.Email or "",
